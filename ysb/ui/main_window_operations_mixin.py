@@ -5259,6 +5259,11 @@ class MainWindowOperationsMixin:
                 return sorted(int(k) for k in (getattr(self, "data", {}) or {}).keys())
             except Exception:
                 return list(range(len(getattr(self, "paths", []) or [])))
+        try:
+            if hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode():
+                return [int(getattr(self, "maker_database_idx", 0) or 0)]
+        except Exception:
+            pass
         return [int(getattr(self, "idx", 0) or 0)]
 
     def _text_find_match(self, text, query, *, case_sensitive=False, whole=False, regex=False):
@@ -7187,7 +7192,7 @@ class MainWindowOperationsMixin:
                     maker_translation_settings = load_maker_translation_settings(getattr(self, "project_dir", None))
                 except Exception:
                     maker_translation_settings = None
-            source_col = 4 if db_mode else self._table_text_column()
+            source_col = self._table_text_column()
             for row in range(1, self.tab.rowCount()):
                 data_index = row - 1
                 if db_mode:
@@ -7306,7 +7311,12 @@ class MainWindowOperationsMixin:
         # 번역 결과 반영은 분석/인페인팅과 같은 확정 작업 경계다.
         # 이전 편집 상태로 Ctrl+Z 되는 것을 막기 위해 별도 Undo 기록을 만들지 않는다.
         maker_mode = True if db_mode else self._is_maker_text_table_mode()
-        trans_col = 5 if db_mode else self._table_translation_column()
+        # DB mode uses the same Maker table shape as map/event pages:
+        # ID / status / speaker / type / event / source / translation / memo.
+        # A previous hardcoded DB column wrote translation results into the source
+        # column, and the later DB UI commit could overwrite self.data with the old
+        # translation column value.  Always ask the table layout helper instead.
+        trans_col = self._table_translation_column()
         self.tab.blockSignals(True)
         try:
             token_maps = list(getattr(self, "_translation_maker_token_maps", []) or [])
@@ -7361,7 +7371,20 @@ class MainWindowOperationsMixin:
 
         try:
             if maker_mode:
-                changed_unified = self.apply_unified_translation_memory(scope="all", show_message=False, auto=True)
+                if db_mode:
+                    try:
+                        auto_unify_pages = sorted(int(x) for x in (db_touched_page_indices or {int(getattr(self, "_translation_database_idx", getattr(self, "maker_database_idx", 0)) or 0)}))
+                    except Exception:
+                        auto_unify_pages = [int(getattr(self, "_translation_database_idx", getattr(self, "maker_database_idx", 0)) or 0)]
+                    changed_unified = self.apply_unified_translation_memory(
+                        scope="selected",
+                        show_message=False,
+                        auto=True,
+                        page_indices=auto_unify_pages,
+                        page_label="데이터베이스",
+                    )
+                else:
+                    changed_unified = self.apply_unified_translation_memory(scope="all", show_message=False, auto=True)
                 if changed_unified:
                     self.log(f"🧩 통일 번역 자동 적용: 동일 원문 {changed_unified}개 정리")
         except Exception:

@@ -88,6 +88,11 @@ DEFAULT_MAKER_PREVIEW_SETTINGS: Dict[str, Any] = {
     "text_color": "#FFFFFF",
     "outline_color": "#202020",
     "window_opacity": 205,
+    # Explicit game settings saved by the user from the Game Settings dialog.
+    # Project-open runtime refresh must not overwrite these choices with stale
+    # auto-detected/default game values.
+    "game_settings_user_saved": False,
+    "game_settings_saved_at": "",
     "debug_overlay": False,
     "show_map_grid": False,
     "show_event_positions": False,
@@ -976,9 +981,17 @@ def build_maker_runtime_profile(project_dir: str | os.PathLike[str], game_root: 
     return saved_profile
 
 
-def maker_preview_settings_from_runtime_profile(profile: Dict[str, Any], base_settings: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    """Convert runtime profile to existing preview settings schema."""
-    st = dict(base_settings or {})
+def maker_preview_settings_from_runtime_profile(profile: Dict[str, Any], base_settings: Dict[str, Any] | None = None, *, preserve_user_game_settings: bool = True) -> Dict[str, Any]:
+    """Convert runtime profile to existing preview settings schema.
+
+    Runtime profile refresh is useful for first import and manual re-detection,
+    but after the user changes Game Settings the saved font choices become the
+    editor's source of truth.  Otherwise project-open refresh can read an older
+    System.json/CSS/default profile and overwrite the saved combo values, making
+    the font appear reset after restart.
+    """
+    base_settings = dict(base_settings or {})
+    st = dict(base_settings)
     profile = dict(profile or {})
     screen = profile.get("screen") if isinstance(profile.get("screen"), dict) else {}
     font = profile.get("font") if isinstance(profile.get("font"), dict) else {}
@@ -1024,6 +1037,25 @@ def maker_preview_settings_from_runtime_profile(profile: Dict[str, Any], base_se
     for dst, src in (("name_padding_x", "padding_x"), ("name_padding_y", "padding_y"), ("name_min_width", "min_width"), ("name_min_height", "min_height"), ("name_overlap", "overlap")):
         if name.get(src) is not None:
             st[dst] = int(name.get(src) or 0)
+
+    if preserve_user_game_settings and bool(base_settings.get("game_settings_user_saved")):
+        for key in (
+            "main_font_filename",
+            "number_font_filename",
+            "fallback_fonts",
+            "font_family",
+            "font_path",
+            "main_font_fingerprint",
+            "number_font_fingerprint",
+            "font_size",
+            "line_height",
+            "message_padding",
+            "window_opacity",
+            "game_settings_user_saved",
+            "game_settings_saved_at",
+        ):
+            if key in base_settings:
+                st[key] = base_settings.get(key)
     return normalize_maker_preview_settings(st)
 
 def detect_maker_screen_preview_settings(game_root: str | os.PathLike[str], engine_info: MakerEngineInfo | Dict[str, Any] | None = None, base_settings: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -1233,6 +1265,8 @@ def normalize_maker_preview_settings(settings: Dict[str, Any] | None = None) -> 
     out["outline_width"] = _clamp_int(base.get("outline_width"), 3, 0, 20)
     out["outline_qt_scale"] = _clamp_int(base.get("outline_qt_scale"), DEFAULT_MAKER_PREVIEW_SETTINGS["outline_qt_scale"], 25, 125)
     out["window_opacity"] = _clamp_int(base.get("window_opacity"), DEFAULT_MAKER_PREVIEW_SETTINGS["window_opacity"], 0, 255)
+    out["game_settings_user_saved"] = bool(base.get("game_settings_user_saved", DEFAULT_MAKER_PREVIEW_SETTINGS.get("game_settings_user_saved", False)))
+    out["game_settings_saved_at"] = str(base.get("game_settings_saved_at") or DEFAULT_MAKER_PREVIEW_SETTINGS.get("game_settings_saved_at") or "")
     out["debug_overlay"] = bool(base.get("debug_overlay", DEFAULT_MAKER_PREVIEW_SETTINGS["debug_overlay"]))
     out["show_map_grid"] = bool(base.get("show_map_grid", DEFAULT_MAKER_PREVIEW_SETTINGS.get("show_map_grid", False)))
     out["show_event_positions"] = bool(base.get("show_event_positions", DEFAULT_MAKER_PREVIEW_SETTINGS.get("show_event_positions", False)))
@@ -8033,6 +8067,12 @@ def apply_maker_game_font_settings(project_dir: str | os.PathLike[str], settings
     settings["main_font_filename"] = main_font
     settings["number_font_filename"] = number_font
     settings["engine_id"] = engine_id
+    settings["game_settings_user_saved"] = True
+    try:
+        from datetime import datetime as _dt
+        settings["game_settings_saved_at"] = _dt.now().isoformat(timespec="seconds")
+    except Exception:
+        settings["game_settings_saved_at"] = str(settings.get("game_settings_saved_at") or "")
     if main_font:
         settings["font_family"] = Path(main_font).stem
         main_font_path = Path(str(available.get(main_font, {}).get("path") or maker_fonts_dir(project_dir_p) / main_font))
@@ -8075,8 +8115,12 @@ def apply_maker_game_font_settings(project_dir: str | os.PathLike[str], settings
                     _apply_maker_game_title_sidecars(project_dir_p, str(system.get("gameTitle") or ""))
                 except Exception:
                     pass
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                append_maker_preview_diagnostic(project_dir_p, "game_font_system_json_write_failed", {"error": str(e), "system_path": str(system_path)})
+            except Exception:
+                pass
+            raise MakerProjectError(f"System.json에 게임 폰트 설정을 저장하지 못했습니다: {e}")
 
     if main_font:
         css_path = _maker_gamefont_css_path(project_dir_p)

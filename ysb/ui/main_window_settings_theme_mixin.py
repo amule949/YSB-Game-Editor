@@ -2379,6 +2379,16 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                 merged.update({"main_font_filename": str(mv_main.currentData() or ""), "number_font_filename": str(mv_main.currentData() or ""), "font_size": mv_size.value(), "line_height": mv_line.value(), "message_padding": mv_padding.value()})
             try:
                 fixed = apply_maker_game_font_settings(project_dir, merged)
+                try:
+                    store = getattr(self, "project_store", None)
+                    if store is not None:
+                        ui_state = getattr(store, "ui_state", {}) or {}
+                        if not isinstance(ui_state, dict):
+                            ui_state = {}
+                        ui_state["maker_preview_settings"] = dict(fixed)
+                        store.ui_state = ui_state
+                except Exception:
+                    pass
                 touched_title_pages = self._set_maker_title_in_program_data(le_title.text().strip())
                 apply_maker_preview_settings_to_data(getattr(self, "data", {}) or {}, fixed)
                 if touched_title_pages:
@@ -2392,7 +2402,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                     except Exception:
                         pass
                 self._refresh_maker_preview_after_settings(fixed)
-                self.log(f"🎮 게임 설정 저장: {le_title.text().strip() or '-'}")
+                self.log(f"🎮 게임 설정 저장: {le_title.text().strip() or '-'} / main={fixed.get('main_font_filename') or '-'} / number={fixed.get('number_font_filename') or '-'}")
                 font_changed = (str(merged.get("main_font_filename") or "") != old_main_font) or (str(merged.get("number_font_filename") or "") != old_number_font)
                 font_changed = font_changed or (str(fixed.get("main_font_fingerprint") or "") != str(old.get("main_font_fingerprint") or ""))
                 dlg.accept()
