@@ -3238,6 +3238,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
             else:
                 mapping[original] = value or original
         changed = 0
+        touched_pages = set()
         try:
             self.commit_current_page_ui_to_data()
         except Exception:
@@ -3285,6 +3286,25 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                     legacy_meta["speaker_confidence"] = 1.0
                     row["maker_meta"] = legacy_meta
                 changed += 1
+                try:
+                    touched_pages.add(int(page_idx))
+                except Exception:
+                    pass
+        if touched_pages:
+            try:
+                # 화자 번역도 실제 게임 클론 JSON에 즉시 반영한다.
+                # project.json에만 저장되면 표에는 보이지만 게임 적용 파일에는 빠질 수 있다.
+                self.apply_maker_writeback_to_clone(
+                    mark_dirty=False,
+                    log_result=False,
+                    backup=False,
+                    page_indices=sorted(touched_pages),
+                )
+            except Exception as e:
+                try:
+                    self.log(f"⚠️ 화자 번역 게임 JSON 반영 실패: {e}")
+                except Exception:
+                    pass
         try:
             self.ref_tab()
             self.update_maker_preview_selection_from_table()
@@ -3307,7 +3327,11 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
             self.start_work_cache_from_current(mark_dirty=True)
         except Exception:
             pass
-        self.log(f"👤 화자 번역 적용: {changed}개 대사 갱신")
+        try:
+            page_count = len(touched_pages or [])
+        except Exception:
+            page_count = 0
+        self.log(f"👤 화자 번역 적용: {changed}개 대사 갱신 / 게임 JSON 반영 맵 {page_count}개")
 
     def open_maker_character_prompts_dialog(self):
         """옵션 > 쯔꾸르 캐릭터 프롬프트 관리.
