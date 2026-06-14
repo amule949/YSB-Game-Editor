@@ -208,10 +208,16 @@ class ApiSettings:
     custom_translation_base_url: str = ""
     custom_translation_model: str = ""
     custom_translation_preset_name: str = "Custom Compatible"
+    lm_studio_base_url: str = "http://localhost:1234/v1"
+    lm_studio_model: str = ""
+    lm_studio_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
     deepseek_model: str = "deepseek-v4-flash"
     google_translate_model: str = "google_translate_basic_v2"
     gemini_model: str = "gemini-2.5-flash-lite"
+    gemini_delayed_api_key: str = ""
+    gemini_delayed_model: str = "gemini-2.5-flash-lite"
+    gemini_delayed_mode: str = "flex"
 
     # Translation chunk sizes
     # 상단 툴바에서는 숨기고, API 관리 > 번역 탭에서 제공자별로 관리한다.
@@ -221,7 +227,9 @@ class ApiSettings:
     deepseek_chunk_size: int = 50
     google_translate_chunk_size: int = 50
     gemini_chunk_size: int = 50
+    gemini_delayed_chunk_size: int = 50
     custom_translation_chunk_size: int = 50
+    lm_studio_chunk_size: int = 20
 
     # Inpainting API
     # replicate_api_token은 구버전 캐시 호환용으로만 유지한다.
@@ -283,6 +291,7 @@ class ApiSettingsStore:
                     "google_translate_chunk_size": 50,
                     "gemini_chunk_size": 10,
                     "custom_translation_chunk_size": 20,
+                    "lm_studio_chunk_size": 20,
                 }
                 for _key, _legacy in legacy_chunk_defaults.items():
                     try:
@@ -372,14 +381,23 @@ def apply_settings_to_config(settings: ApiSettings):
         Config.DEEPSEEK_API_KEY = settings.deepseek_api_key.strip()
         Config.GOOGLE_TRANSLATE_API_KEY = settings.google_translate_api_key.strip()
         Config.GEMINI_API_KEY = settings.gemini_api_key.strip()
+        Config.GEMINI_DELAYED_API_KEY = settings.gemini_delayed_api_key.strip()
         Config.CUSTOM_TRANSLATION_API_KEY = settings.custom_translation_api_key.strip()
         Config.CUSTOM_TRANSLATION_BASE_URL = settings.custom_translation_base_url.strip()
         Config.CUSTOM_TRANSLATION_MODEL = settings.custom_translation_model.strip()
         Config.CUSTOM_TRANSLATION_PRESET_NAME = settings.custom_translation_preset_name.strip() or "Custom Compatible"
+        Config.LM_STUDIO_BASE_URL = (settings.lm_studio_base_url.strip() or "http://localhost:1234/v1").rstrip("/")
+        Config.LM_STUDIO_MODEL = settings.lm_studio_model.strip()
+        # LM Studio's OpenAI-compatible server normally does not require an API key.
+        # The OpenAI Python client still needs a non-empty token string, so the
+        # engine will use a harmless local dummy key when this field is blank.
+        Config.LM_STUDIO_API_KEY = settings.lm_studio_api_key.strip()
         Config.OPENAI_TRANSLATION_MODEL = settings.openai_model.strip() or "gpt-4o-mini"
         Config.DEEPSEEK_TRANSLATION_MODEL = settings.deepseek_model.strip() or "deepseek-v4-flash"
         Config.GOOGLE_TRANSLATE_MODEL = settings.google_translate_model.strip() or "google_translate_basic_v2"
         Config.GEMINI_TRANSLATION_MODEL = settings.gemini_model.strip() or "gemini-2.5-flash-lite"
+        Config.GEMINI_DELAYED_TRANSLATION_MODEL = settings.gemini_delayed_model.strip() or "gemini-2.5-flash-lite"
+        Config.GEMINI_DELAYED_MODE = (settings.gemini_delayed_mode or "flex").strip().lower() or "flex"
 
         # Inpainting
         Config.INPAINT_PROVIDER = (settings.selected_inpaint_provider or "replicate_lama").strip() or "replicate_lama"
@@ -527,9 +545,31 @@ class ApiSettingsDialog(QDialog):
                 ],
             },
             {
+                "provider": "gemini_deferred",
+                "title": "Gemini Flex / Batch",
+                "description": "일반 번역 진행창 대신 청크 현황 창을 사용합니다. 완료된 청크는 즉시 반영되고, 실패한 청크만 다시 시도할 수 있습니다. 작업 중에는 다른 프로젝트 작업을 할 수 없습니다.",
+                "fields": [
+                    ("요청 방식", "gemini_delayed_mode", False, "Flex API", "combo", [("Flex API", "flex"), ("Batch API", "batch")]),
+                    ("Model", "gemini_delayed_model", False, "gemini-2.5-flash-lite"),
+                    ("묶음 수", "gemini_delayed_chunk_size", False, 50, "spin", (1, 100)),
+                    ("API Key", "gemini_delayed_api_key", True, "Google AI Studio Gemini API Key"),
+                ],
+            },
+            {
+                "provider": "lm_studio",
+                "title": "LM Studio / Local OpenAI-Compatible",
+                "description": "LM Studio의 Developer 서버를 켠 뒤 사용할 수 있습니다. 기본 주소는 http://localhost:1234/v1 입니다. 모델은 LM Studio에서 먼저 다운로드/로드해야 합니다. API Key는 보통 비워도 됩니다.",
+                "fields": [
+                    ("Base URL", "lm_studio_base_url", False, "http://localhost:1234/v1"),
+                    ("Model", "lm_studio_model", False, "LM Studio에서 로드한 모델명"),
+                    ("묶음 수", "lm_studio_chunk_size", False, 20, "spin", (1, 100)),
+                    ("API Key", "lm_studio_api_key", True, "비워도 됨 / optional"),
+                ],
+            },
+            {
                 "provider": "custom",
                 "title": "Custom / OpenAI-Compatible",
-                "description": "OpenAI Chat Completions 호환 API만 사용할 수 있습니다. Base URL, Model, API Key를 입력하세요.\n호환 예시: OpenRouter, Groq, xAI Grok, Together, LM Studio, vLLM, Ollama OpenAI 호환 서버",
+                "description": "OpenAI Chat Completions 호환 API만 사용할 수 있습니다. Base URL, Model, API Key를 입력하세요.\n호환 예시: OpenRouter, Groq, xAI Grok, Together, vLLM, Ollama OpenAI 호환 서버",
                 "fields": [
                     ("Preset Name", "custom_translation_preset_name", False, "OpenRouter / Groq / xAI"),
                     ("Base URL", "custom_translation_base_url", False, "https://api.x.ai/v1"),
@@ -730,7 +770,7 @@ class ApiSettingsDialog(QDialog):
     def toggle_key_visibility(self, checked: bool):
         secret_keys = [
             "openai_api_key", "deepseek_api_key", "google_translate_api_key",
-            "gemini_api_key", "custom_translation_api_key"
+            "gemini_api_key", "gemini_delayed_api_key", "custom_translation_api_key", "lm_studio_api_key"
         ]
         for key in secret_keys:
             for edit in self.edits.get(key, []):
@@ -811,19 +851,27 @@ class ApiSettingsDialog(QDialog):
             deepseek_api_key=self._first_edit_text("deepseek_api_key"),
             google_translate_api_key=self._first_edit_text("google_translate_api_key"),
             gemini_api_key=self._first_edit_text("gemini_api_key"),
+            gemini_delayed_api_key=self._first_edit_text("gemini_delayed_api_key"),
             custom_translation_api_key=self._first_edit_text("custom_translation_api_key"),
             custom_translation_base_url=self._first_edit_text("custom_translation_base_url"),
             custom_translation_model=self._first_edit_text("custom_translation_model"),
             custom_translation_preset_name=self._first_edit_text("custom_translation_preset_name") or "Custom Compatible",
+            lm_studio_base_url=self._first_edit_text("lm_studio_base_url") or "http://localhost:1234/v1",
+            lm_studio_model=self._first_edit_text("lm_studio_model"),
+            lm_studio_api_key=self._first_edit_text("lm_studio_api_key"),
             openai_model=self._first_edit_text("openai_model") or "gpt-4o-mini",
             deepseek_model=self._first_edit_text("deepseek_model") or "deepseek-v4-flash",
             google_translate_model=self._first_edit_text("google_translate_model") or "google_translate_basic_v2",
             gemini_model=self._first_edit_text("gemini_model") or "gemini-2.5-flash-lite",
+            gemini_delayed_model=self._first_edit_text("gemini_delayed_model") or "gemini-2.5-flash-lite",
+            gemini_delayed_mode=self._first_edit_text("gemini_delayed_mode") or "flex",
             openai_chunk_size=int(self._first_edit_text("openai_chunk_size") or 50),
             deepseek_chunk_size=int(self._first_edit_text("deepseek_chunk_size") or 50),
             google_translate_chunk_size=int(self._first_edit_text("google_translate_chunk_size") or 50),
             gemini_chunk_size=int(self._first_edit_text("gemini_chunk_size") or 50),
+            gemini_delayed_chunk_size=int(self._first_edit_text("gemini_delayed_chunk_size") or 50),
             custom_translation_chunk_size=int(self._first_edit_text("custom_translation_chunk_size") or 50),
+            lm_studio_chunk_size=int(self._first_edit_text("lm_studio_chunk_size") or 20),
             # 구버전 캐시 호환: 인페인팅 값은 더 이상 UI에서 노출하지 않고 기존 값을 유지한다.
             replicate_api_token=self.settings.replicate_api_token,
             lama_replicate_api_token=self.settings.lama_replicate_api_token or self.settings.replicate_api_token,

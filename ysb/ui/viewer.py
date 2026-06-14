@@ -1317,7 +1317,43 @@ class MuleImageViewer(QGraphicsView):
             except Exception:
                 pass
 
-        self.scene.clear()
+        # 쯔꾸르 미리보기의 메시지/이름/대사 텍스트 박스는 배경 프리뷰의
+        # 부속물이 아니라 별도의 고정 UI 레이어다.  따라서 Maker 페이지에서
+        # base image만 다시 깔 때 scene.clear()로 전체를 날리면 안 된다.
+        # 고정 대화 레이어는 보존하고, 배경/임시 프리뷰/마스크 등만 제거한다.
+        preserve_maker_dialogue = False
+        try:
+            main = getattr(self, "main", None)
+            preserve_maker_dialogue = bool(
+                main is not None
+                and hasattr(main, "_is_current_maker_page")
+                and main._is_current_maker_page()
+                and bool(getattr(main, "_maker_dialogue_overlay_preserve_enabled", False))
+            )
+        except Exception:
+            preserve_maker_dialogue = False
+        if preserve_maker_dialogue:
+            try:
+                for _item in list(self.scene.items()):
+                    try:
+                        if _item.data(0) == "maker_dialogue_overlay":
+                            continue
+                    except Exception:
+                        pass
+                    try:
+                        _item.setVisible(False)
+                        self.scene.removeItem(_item)
+                    except Exception:
+                        continue
+                try:
+                    if hasattr(getattr(self, "main", None), "audit_boundary_event"):
+                        self.main.audit_boundary_event("MAKER_SET_IMAGE_PRESERVED_DIALOGUE_OVERLAY", reason="set_image", throttle_ms=200)
+                except Exception:
+                    pass
+            except Exception:
+                self.scene.clear()
+        else:
+            self.scene.clear()
         self.user_mask_item = None
         self.final_paint_item = None
         self.final_paint_above_item = None

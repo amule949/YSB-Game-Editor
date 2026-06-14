@@ -18,7 +18,8 @@ from ysb.tools.maker_project import (
     load_maker_translation_settings,
     normalize_maker_database_translation_result,
     prepare_maker_translation_payload,
-    restore_maker_translation_text,
+    restore_maker_translation_text_checked,
+    apply_maker_translations_to_game,
 )
 
 
@@ -102,6 +103,9 @@ class UniversalBatchWorker(QThread):
             self.maker_translation_settings = load_maker_translation_settings(self.project_dir) if self.project_dir else None
         except Exception:
             self.maker_translation_settings = None
+        self.maker_control_code_auto_apply_enabled = bool(
+            getattr(main_window, "maker_control_code_auto_apply_enabled", True)
+        )
 
         self.batch_log_path = make_log_path(f"batch_{self.mode or 'unknown'}")
         append_log(
@@ -207,7 +211,12 @@ class UniversalBatchWorker(QThread):
         if maker_mode:
             texts = []
             for item in target_items:
-                payload = prepare_maker_translation_payload(item, self.maker_character_prompts, self.maker_translation_settings)
+                payload = prepare_maker_translation_payload(
+                    item,
+                    self.maker_character_prompts,
+                    self.maker_translation_settings,
+                    auto_restore_control_codes=self.maker_control_code_auto_apply_enabled,
+                )
                 texts.append(payload.get("text", ""))
                 contexts.append(payload.get("context", ""))
                 token_maps.append(payload.get("control_map", []))
@@ -226,15 +235,33 @@ class UniversalBatchWorker(QThread):
         )
         trans = self.engine.translate_text_batch(texts, provider=self.provider, contexts=contexts)
         trans = list(trans or [])
-        append_log(self.batch_log_path, "TRANSLATE RESPONSE", index=page_idx, response_count=len(trans), memory=memory_text())
+        append_log(self.batch_log_path, "TRANSLATE RESPONSE", index=page_idx, response_count=len(trans), running=self.is_running, memory=memory_text())
+
+        # 사용자가 일괄 번역 취소를 확인한 뒤 현재 맵의 API 응답이 늦게 돌아온 경우,
+        # 그 맵은 "도중 취소"로 보고 결과를 UI에 emit하지 않는다. 이미 finished_item으로
+        # UI에 반영된 이전 맵만 유지된다.
+        if not self.is_running:
+            append_log(self.batch_log_path, "TRANSLATE RESPONSE IGNORED AFTER CANCEL", index=page_idx, response_count=len(trans), memory=memory_text())
+            self.progress.emit(f"{prefix} 번역 응답 폐기: 취소된 맵")
+            return
 
         if len(trans) != len(target_items):
             raise ValueError(f"번역 개수 불일치: 요청 {len(target_items)}개 / 응답 {len(trans)}개")
 
+        control_auto_stats = {"applied": 0, "applied_raw": 0, "fallback_edge": 0, "failed_plain": 0}
         for item, t, token_map in zip(target_items, trans, token_maps):
             translated_text = str(t) if t is not None else ""
             if maker_mode and is_maker_text_item(item):
-                translated_text = restore_maker_translation_text(translated_text, token_map)
+                translated_text, control_status, _control_detail = restore_maker_translation_text_checked(
+                    translated_text,
+                    token_map,
+                    item.get("text", ""),
+                )
+                if control_status in control_auto_stats:
+                    control_auto_stats[control_status] += 1
+                    item["maker_control_code_auto_status"] = control_status
+                else:
+                    item.pop("maker_control_code_auto_status", None)
                 try:
                     unit = item.get("maker_text_unit") if isinstance(item.get("maker_text_unit"), dict) else {}
                     if str((unit or {}).get("source_kind") or "").strip().lower() == "database":
@@ -243,6 +270,23 @@ class UniversalBatchWorker(QThread):
                     pass
                 item["maker_status"] = "번역완료" if translated_text.strip() else "미번역"
             item["translated_text"] = translated_text
+
+        if any(control_auto_stats.values()):
+            append_log(
+                self.batch_log_path,
+                "CONTROL CODE AUTO APPLY",
+                index=page_idx,
+                **control_auto_stats,
+            )
+            if control_auto_stats["failed_plain"]:
+                message_key = "⚠️ 제어코드 자동 반영 실패 {count}개: 안전을 위해 순수 번역문으로 유지"
+                try:
+                    message = self.main.tr_ui(message_key).format(
+                        count=int(control_auto_stats["failed_plain"])
+                    )
+                except Exception:
+                    message = message_key.format(count=int(control_auto_stats["failed_plain"]))
+                self.progress.emit(f"{prefix} {message}")
 
         self._emit_finished_item_and_wait(page_idx, {"data": new_data, "_batch_status": "done", "_batch_message": ""})
         append_log(self.batch_log_path, "TRANSLATE PAYLOAD APPLIED", index=page_idx, data_count=len(new_data or []), memory=memory_text())
@@ -274,6 +318,9 @@ class UniversalBatchWorker(QThread):
             try:
                 self._translate_page(page_idx, self.paths[page_idx], order_idx, total)
             except Exception as e:
+                if not self.is_running:
+                    append_log(self.batch_log_path, "PAGE EXCEPTION IGNORED AFTER CANCEL", index=page_idx, error=repr(e), memory=memory_text())
+                    break
                 append_log(self.batch_log_path, "PAGE EXCEPTION", index=page_idx, error=repr(e), memory=memory_text())
                 append_block(self.batch_log_path, "TRACEBACK", exception_text(e))
                 self.progress.emit(f"[{order_idx + 1}/{total}] ❌ 에러: {e}")
@@ -350,40 +397,90 @@ class InpaintWorker(QThread):
 
 class TranslationWorker(QThread):
     progress = pyqtSignal(str, int, int)
+    chunk_ready = pyqtSignal(int, object)
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
     canceled = pyqtSignal(object)
 
-    def __init__(self, engine, texts, provider="openai", chunk_size=50, contexts=None):
+    def __init__(
+        self,
+        engine,
+        texts,
+        provider="openai",
+        chunk_size=50,
+        contexts=None,
+        apply_error_message="번역 청크 결과 적용에 실패했습니다.",
+    ):
         super().__init__()
         self.engine = engine
-        self.texts = [str(t or "") for t in (texts or [])]
-        self.contexts = [str(c or "") for c in (contexts or [])] if contexts is not None else None
+        # The main window is locked while this worker is active, so an already
+        # normalized list can safely be shared instead of duplicated.  This is
+        # important for very large translation jobs where keeping another full
+        # copy of every source/context string needlessly doubles memory use.
+        if isinstance(texts, list) and all(isinstance(t, str) for t in texts):
+            self.texts = texts
+        else:
+            self.texts = [str(t or "") for t in (texts or [])]
+        if contexts is None:
+            self.contexts = None
+        elif isinstance(contexts, list) and all(isinstance(c, str) for c in contexts):
+            self.contexts = contexts
+        else:
+            self.contexts = [str(c or "") for c in (contexts or [])]
         if self.contexts is not None and len(self.contexts) != len(self.texts):
             fixed = []
             for i in range(len(self.texts)):
                 fixed.append(self.contexts[i] if i < len(self.contexts) else "")
             self.contexts = fixed
         self.provider = provider or "openai"
+        self.apply_error_message = str(apply_error_message or "번역 청크 결과 적용에 실패했습니다.")
         try:
             self.chunk_size = max(1, min(int(chunk_size or 50), 100))
         except Exception:
             self.chunk_size = 50
         self.cancel_requested = False
+        self._chunk_applied_event = threading.Event()
+        self._waiting_chunk_start = None
+        self._chunk_apply_ok = True
+        self._chunk_apply_error = ""
+        self._applied_count = 0
+
+    def mark_chunk_applied(self, chunk_start=None, ok=True, error=""):
+        """Acknowledge one UI-side chunk application without blocking Qt."""
+        try:
+            if (
+                chunk_start is not None
+                and self._waiting_chunk_start is not None
+                and int(chunk_start) != int(self._waiting_chunk_start)
+            ):
+                return
+        except Exception:
+            pass
+        self._chunk_apply_ok = bool(ok)
+        self._chunk_apply_error = str(error or "")
+        self._chunk_applied_event.set()
+
+    def _wait_until_chunk_applied(self, chunk_start):
+        self._waiting_chunk_start = int(chunk_start)
+        try:
+            while not self.cancel_requested and not self._chunk_applied_event.wait(0.05):
+                pass
+        finally:
+            self._waiting_chunk_start = None
 
     def stop(self):
         self.cancel_requested = True
+        self._chunk_applied_event.set()
 
     def run(self):
         total = len(self.texts)
-        results = []
         try:
             if total <= 0:
-                self.finished.emit([])
+                self.finished.emit({"streamed": True, "total": 0, "applied": 0})
                 return
             for start in range(0, total, self.chunk_size):
                 if self.cancel_requested:
-                    self.canceled.emit(results)
+                    self.canceled.emit({"applied": self._applied_count, "total": total})
                     return
                 end = min(total, start + self.chunk_size)
                 self.progress.emit(f"번역 중: {start + 1}-{end} / {total}", start, total)
@@ -396,15 +493,66 @@ class TranslationWorker(QThread):
                     contexts=context_chunk,
                 )
                 translated = list(translated or [])
+                if self.cancel_requested:
+                    self.canceled.emit({"applied": self._applied_count, "total": total})
+                    return
                 if len(translated) < len(chunk):
                     translated.extend(chunk[len(translated):])
                 elif len(translated) > len(chunk):
                     translated = translated[:len(chunk)]
-                results.extend(translated)
+
+                # Never accumulate all translated chunks in this worker.  Emit
+                # exactly one chunk, wait in the worker thread until the UI has
+                # applied it, then release the result before requesting the next
+                # chunk.  The UI event loop remains free throughout this wait.
+                self._chunk_apply_ok = True
+                self._chunk_apply_error = ""
+                self._chunk_applied_event.clear()
+                self.chunk_ready.emit(start, translated)
+                self._wait_until_chunk_applied(start)
+                if self.cancel_requested:
+                    self.canceled.emit({"applied": self._applied_count, "total": total})
+                    return
+                if not self._chunk_apply_ok:
+                    self.error.emit(self._chunk_apply_error or self.apply_error_message)
+                    return
+                self._applied_count += len(translated)
+                translated.clear()
                 self.progress.emit(f"번역 완료: {end} / {total}", end, total)
                 if self.cancel_requested:
-                    self.canceled.emit(results)
+                    self.canceled.emit({"applied": self._applied_count, "total": total})
                     return
-            self.finished.emit(results)
+            self.finished.emit({"streamed": True, "total": total, "applied": self._applied_count})
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+
+class MakerWritebackWorker(QThread):
+    """Apply edited Maker project data to the cloned game JSON without blocking UI."""
+
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, project_dir, data_snapshot, page_indices=None, backup=False):
+        super().__init__()
+        self.project_dir = str(project_dir or "")
+        self.data_snapshot = data_snapshot or {}
+        self.page_indices = list(page_indices) if page_indices is not None else None
+        self.backup = bool(backup)
+
+    def run(self):
+        try:
+            self.progress.emit("작업용 게임 JSON에 수정 내용을 반영하는 중...")
+            summary = apply_maker_translations_to_game(
+                self.project_dir,
+                self.data_snapshot,
+                page_indices=self.page_indices,
+                backup=self.backup,
+            )
+            if not isinstance(summary, dict):
+                summary = {"summary": summary}
+            self.finished.emit(summary)
         except Exception as e:
             self.error.emit(str(e))

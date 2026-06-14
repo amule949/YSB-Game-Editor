@@ -42,13 +42,13 @@ TKTOOL_PHASE2_SHORTCUT_KEYS = {
     "work_open_current_project_folder", "work_translate", "work_text_find",
     "work_text_replace", "work_unify_translations", "work_extract_text", "work_import_translation",
     "work_clear_translation", "work_page_prev", "work_page_next", "work_page_list", "work_page_full_name",
-    "work_restore_edge_control_codes_current", "batch_restore_edge_control_codes",
+    "work_restore_edge_control_codes_current", "work_toggle_maker_control_code_auto_apply", "batch_restore_edge_control_codes",
     "batch_translate", "batch_extract_text", "edit_undo", "edit_redo", "paint_undo", "paint_redo", "text_linebreak",
 }
 TKTOOL_PHASE2_MACRO_ACTION_KEYS = {
     "work_translate", "batch_translate", "work_text_find", "work_text_replace",
     "work_unify_translations", "work_extract_text", "work_import_translation", "work_clear_translation", "work_restore_edge_control_codes_current",
-    "batch_restore_edge_control_codes", "batch_extract_text", "project_save",
+    "work_toggle_maker_control_code_auto_apply", "batch_restore_edge_control_codes", "batch_extract_text", "project_save",
 }
 
 def maker_shortcut_allowed(key: str) -> bool:
@@ -698,7 +698,7 @@ DEFAULT_SHORTCUTS = {
     "project_open_json": "Ctrl+O",
     "project_show_launcher": "Ctrl+Alt+Home",
     "project_exit": "Alt+Q",
-    "project_save": "Ctrl+E",
+    "project_save": "Ctrl+S",
     "project_save_as": "",
     "project_recover_last_work": "Ctrl+Alt+Shift+B",
 
@@ -723,7 +723,8 @@ DEFAULT_SHORTCUTS = {
     "option_maker_game_settings": "Ctrl+Alt+9",
     "option_maker_game_refresh": "Ctrl+Alt+0",
     "option_maker_database_translation": "Ctrl+D",
-    "db_maker_character_name_translation": "Ctrl+G",
+    "db_maker_plugin_translation": "Ctrl+Alt+D",
+    "db_maker_character_name_translation": "Ctrl+Alt+G",
     "option_maker_refresh_runtime_profile": "",
     "option_glossary": "Ctrl+Alt+6",
     "option_analysis_mask_settings": "Ctrl+Alt+Shift+M",
@@ -756,7 +757,9 @@ DEFAULT_SHORTCUTS = {
     "quick_ocr_execute": "",
     "work_text_number_width": "Ctrl+Shift+W",
     "work_translate": "Ctrl+F6",
+    "work_apply_maker_game_json": "",
     "work_restore_edge_control_codes_current": "Ctrl+B",
+    "work_toggle_maker_control_code_auto_apply": "Alt+Shift+B",
     "work_refresh_maker_preview": "Alt+F5",
     "work_inpaint": "Ctrl+F7",
     "work_import_clean_background": "Alt+C",
@@ -904,7 +907,7 @@ GROUPS = [
         ("project_maker_character_profiles", "캐릭터 프로필 보기"),
         ("project_open", "YSBG 열기"),
         ("project_open_json", "프로젝트 열기"),
-        ("project_save", "내보내기"),
+        ("project_save", "프로젝트 저장"),
         ("project_recover_last_work", "복구하기"),
         ("project_show_launcher", "홈화면으로 가기"),
         ("project_exit", "프로젝트 나가기"),
@@ -924,7 +927,9 @@ GROUPS = [
         ("work_quick_ocr", "빠른 OCR 설정"),
         ("work_text_number_width", "텍스트 넘버 크기 변경"),
         ("work_translate", "번역"),
+        # ("work_apply_maker_game_json", "프로젝트 저장"),  # 프로젝트 저장으로 통합됨
         ("work_restore_edge_control_codes_current", "맵 제어코드 복원"),
+        ("work_toggle_maker_control_code_auto_apply", "번역 시 제어코드 자동 반영"),
         ("work_inpaint", "인페인팅"),
         ("work_import_clean_background", "클린본 불러오기"),
         ("final_paint_to_background", "배경을 원본으로 쓰기"),
@@ -962,7 +967,8 @@ GROUPS = [
     ]),
     ("DB번역", [
         ("option_maker_database_translation", "데이터베이스 모드"),
-        ("db_maker_character_name_translation", "화자 번역"),
+        ("db_maker_plugin_translation", "플러그인 번역 모드"),
+        ("db_maker_character_name_translation", "화자 번역 모드"),
     ]),
     ("옵션", [
         ("option_api_settings", "API 관리"),
@@ -1023,7 +1029,7 @@ SHORTCUT_GROUP_SECTIONS = {
     "작업": [
         ("기본동작", ["work_source_compare", "edit_undo", "edit_redo", "work_open_current_project_folder", "work_export"]),
         ("페이지탭", ["work_page_prev", "work_page_next", "work_page_list", "work_page_full_name", "work_page_rename_source", "work_page_delete_current"]),
-        ("작업류", ["work_scan_maker_game", "paint_reanalyze", "work_translate", "work_inpaint"]),
+        ("작업류", ["work_scan_maker_game", "paint_reanalyze", "work_translate", "work_apply_maker_game_json", "work_inpaint"]),
         ("텍스트 수정류", ["work_extract_text", "work_import_translation", "work_clear_translation", "work_clean_text", "work_text_find", "work_text_replace", "work_unify_translations"]),
         ("이미지 교체류", ["work_import_clean_background", "final_paint_to_background", "work_restore_original_source"]),
         ("기타 동작", ["work_quick_ocr", "work_text_number_width", "work_reset_text_rects", "work_output_preview"]),
@@ -1272,13 +1278,15 @@ class ShortcutSettingsStore:
             merged_shortcuts["project_exit"] = "Alt+Q"
             merged_shortcuts["project_import_maker_game"] = "Alt+O"
             merged_shortcuts["project_import_images"] = "Alt+O"
-            merged_shortcuts["project_save"] = "Ctrl+E"
+            merged_shortcuts["project_save"] = "Ctrl+S"
             merged_shortcuts["project_save_as"] = ""
             merged_shortcuts["work_restore_edge_control_codes_current"] = "Ctrl+B"
+            merged_shortcuts["work_toggle_maker_control_code_auto_apply"] = "Alt+Shift+B"
             merged_shortcuts["batch_restore_edge_control_codes"] = "Ctrl+Shift+B"
             merged_shortcuts["work_unify_translations"] = "Ctrl+Shift+T"
             merged_shortcuts["option_maker_database_translation"] = "Ctrl+D"
-            merged_shortcuts["db_maker_character_name_translation"] = "Ctrl+G"
+            merged_shortcuts["db_maker_plugin_translation"] = "Ctrl+Alt+D"
+            merged_shortcuts["db_maker_character_name_translation"] = "Ctrl+Alt+G"
             merged_shortcuts["option_api_settings"] = "Ctrl+Alt+1"
             merged_shortcuts["option_shortcut_settings"] = "Ctrl+Alt+2"
             merged_shortcuts["option_macro_settings"] = "Ctrl+Alt+3"
@@ -2330,12 +2338,12 @@ def shortcut_item_description(key: str, label: str, group_title: str, lang=LANG_
         "item_stroke_color": "획 색상 팔레트를 엽니다.",
 
         "project_new": "새 프로젝트 작업 폴더를 만듭니다.",
-        "project_import_maker_game": "RPG Maker MV/MZ 게임 폴더를 불러와 쯔꾸르 번역 프로젝트를 시작합니다.",
-        "project_import_images": "RPG Maker MV/MZ 게임 폴더를 불러옵니다. (호환 키)",
+        "project_import_maker_game": "RPG Maker MV/MZ JSON 게임 폴더를 불러와 쯔꾸르 번역 프로젝트를 시작합니다. www/resources/app.nw/macOS .app 구조도 감지합니다.",
+        "project_import_images": "RPG Maker MV/MZ JSON 게임 폴더를 불러옵니다. (호환 키)",
         "project_open": "YSBG 패키지를 엽니다.",
         "project_open_json": "작업 폴더의 project.json을 엽니다.",
-        "project_save": "현재 프로젝트를 저장합니다.",
-        "project_save_as": "현재 프로젝트를 다른 이름으로 저장합니다.",
+        "project_save": "현재 작업 폴더와 작업용 게임 JSON을 저장합니다.",
+        "project_save_as": "현재 작업 폴더를 YSBG 패키지로 내보냅니다.",
         "project_recover_last_work": "이전 작업 상태를 복구합니다.",
         "project_show_launcher": "홈 화면으로 이동합니다.",
         "project_exit": "현재 프로젝트를 닫습니다.",
@@ -2355,6 +2363,7 @@ def shortcut_item_description(key: str, label: str, group_title: str, lang=LANG_
         "work_quick_ocr": "빠른 OCR 설정창을 엽니다.",
         "work_text_number_width": "텍스트 넘버 크기 설정을 엽니다.",
         "work_translate": "현재 페이지를 번역합니다.",
+        "work_apply_maker_game_json": "프로젝트 저장 기능으로 통합되었습니다.",
         "work_refresh_maker_preview": "현재 맵의 프리뷰 이미지를 상태/캐시와 무관하게 다시 만듭니다.",
         "work_inpaint": "현재 페이지를 인페인팅합니다.",
         "work_import_clean_background": "클린본 이미지를 최종결과 배경으로 불러옵니다. 1개를 선택하면 현재 페이지, 여러 개를 선택하면 파일명과 페이지명을 매칭합니다.",
@@ -2389,8 +2398,8 @@ def shortcut_item_description(key: str, label: str, group_title: str, lang=LANG_
 
         
         "option_api_settings": "API 설정 관리창을 엽니다.",
-        "option_translation_prompt": "번역 프롬프트 설정창을 엽니다.",
-        "option_maker_character_prompts": "쯔꾸르 캐릭터별 번역 프롬프트 관리창을 엽니다.",
+        "option_translation_prompt": "기존 호환용 항목입니다. 게임 프롬프트 관리창을 엽니다.",
+        "option_maker_character_prompts": "전체 번역 프롬프트, 프로젝트 DB 지침, 캐릭터 프롬프트를 한곳에서 관리합니다.",
         "option_maker_translation_settings": "쯔꾸르 AI 번역용 원문 정규화 설정창을 엽니다.",
         "option_maker_refresh_runtime_profile": "현재 작업 폴더의 maker_game에서 표시 환경을 다시 읽고 프리뷰 캐시를 갱신합니다.",
         "option_maker_preview_display_settings": "게임 프리뷰 옵션창을 엽니다.",

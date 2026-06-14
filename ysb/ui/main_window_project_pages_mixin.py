@@ -1,10 +1,18 @@
 from ysb.ui.main_window_support import *
 from ysb.core.project_store import PackageProjectCancelled, WORKSPACE_STATE_FILENAME, read_workspace_state, write_workspace_state, relpath, json_safe
+from ysb.core.perf_tracer import perf_counter, elapsed_ms, log as perf_log, log_elapsed as perf_log_elapsed, next_action_id
 from ysb.tools.maker_project import (
     strip_maker_control_codes,
     compose_maker_inline_speaker_writeback,
     extract_database_text_units,
+    extract_plugin_text_units,
     load_maker_preview_settings,
+    maker_project_paths,
+    load_maker_trp_skit_actor_config,
+    load_maker_trp_skit_display_config,
+    maker_trp_position_ratio,
+    parse_maker_trp_skit_command,
+    maker_trp_skit_layer_spec,
     _ysb_text_item_from_unit,
     _virtual_page_placeholder_image,
     _MAKER_CONTROL_CODE_RE,
@@ -352,6 +360,28 @@ class MainWindowProjectPagesMixin:
             pass
         return scene_ids, data_ids, selected_ids
 
+    def _should_skip_text_scene_resync_for_maker_page(self):
+        """Return True when the current page is a Maker table/preview page.
+
+        쯔꾸르붕이는 우측 표와 좌측 게임식 프리뷰를 쓰며, YSB 식질용
+        TypesettingItem을 캔버스에 만들지 않는다.  따라서 텍스트 씬
+        재동기화(mode_chg 기반 rebuild)를 돌리면 scene_count=0/data_count=0인
+        빈 작업만 반복되어 선택 이동/편집 체감이 나빠진다.
+        """
+        try:
+            if not self._is_current_maker_page():
+                return False
+        except Exception:
+            return False
+        try:
+            curr = self.data.get(self.idx) if isinstance(getattr(self, "data", None), dict) else None
+            data_list = curr.get("data", []) if isinstance(curr, dict) else []
+            # 안전장치: 혹시 Maker 페이지에 실제 YSB 식질 텍스트가 섞여 있으면
+            # 기존 resync를 허용한다. 정상 Maker 행은 _is_renderable...에서 False다.
+            return not any(self._is_renderable_text_data_item(d) for d in (data_list or []) if isinstance(d, dict))
+        except Exception:
+            return True
+
     def schedule_safe_text_scene_resync(self, reason="text_scene_resync", selected_ids=None, delay_ms=40, table_refresh=False):
         """Queue a single safe text scene/data resync on the next event loop turn.
 
@@ -366,6 +396,19 @@ class MainWindowProjectPagesMixin:
                 return False
         except Exception:
             return False
+        try:
+            if self._should_skip_text_scene_resync_for_maker_page():
+                try:
+                    self.audit_boundary_event(
+                        "TEXT_SCENE_RESYNC_SKIPPED_MAKER_PAGE",
+                        reason=str(reason or "text_scene_resync"),
+                        throttle_ms=250,
+                    )
+                except Exception:
+                    pass
+                return False
+        except Exception:
+            pass
         ids = []
         try:
             ids.extend([x for x in (selected_ids or []) if x is not None])
@@ -455,6 +498,21 @@ class MainWindowProjectPagesMixin:
                 return
         except Exception:
             return
+        try:
+            if self._should_skip_text_scene_resync_for_maker_page():
+                try:
+                    self.audit_boundary_event(
+                        "TEXT_SCENE_RESYNC_RUN_SKIPPED_MAKER_PAGE",
+                        reason=str(getattr(self, "_pending_safe_text_scene_resync_reason", "text_scene_resync") or "text_scene_resync"),
+                        throttle_ms=250,
+                    )
+                except Exception:
+                    pass
+                self._pending_safe_text_scene_resync_selected_ids = []
+                self._pending_safe_text_scene_resync_table_refresh = False
+                return
+        except Exception:
+            pass
         if getattr(self, "_text_item_drag_active", False):
             try:
                 self.audit_boundary_event(
@@ -2466,15 +2524,67 @@ class MainWindowProjectPagesMixin:
         return token
 
     def _clear_maker_preview_display_state(self, *, reason="project_close"):
-        """Clear every visual/cache bit owned by the Maker preview area.
+        """Release Maker preview runtime memory without deleting disk caches.
 
-        This is intentionally stronger than clearing selection overlays.  The
-        project lifecycle rule is simple: leaving/closing a project must leave an
-        empty preview; opening/creating a project must build a fresh preview from
-        that project's current page.
+        The project lifecycle boundary must detach every QGraphicsItem, QPixmap,
+        timer seed, and in-memory blueprint owned by the current project.  The
+        persistent ``maker_row_preview_blueprints_v4.json.gz`` file and extracted
+        asset-cache files are deliberately left untouched, so reopening the same
+        project restores the prepared blueprints instead of rebuilding them.
         """
+        runtime_before = {}
+        try:
+            view = getattr(self, "view", None)
+            scene = getattr(view, "scene", None) if view is not None else None
+            runtime_before = {
+                "blueprints": len(getattr(self, "_maker_row_preview_blueprint_cache", {}) or {}),
+                "picture_states": len(getattr(self, "_maker_preview_picture_state_cache", {}) or {}),
+                "event_commands": len(getattr(self, "_maker_preview_event_command_cache", {}) or {}),
+                "qpixmaps": len(getattr(self, "_maker_preview_qpixmap_cache", {}) or {}),
+                "window_pixmaps": len(getattr(self, "_maker_preview_window_pixmap_cache", {}) or {}),
+                "asset_paths": len(getattr(self, "_maker_preview_asset_resolve_cache", {}) or {}),
+                "scene_items": len(scene.items()) if scene is not None else 0,
+            }
+            self.audit_boundary_event(
+                "MAKER_PREVIEW_RUNTIME_RELEASE_BEGIN",
+                reason=str(reason or "project_close"),
+                **runtime_before,
+            )
+        except Exception:
+            runtime_before = {}
+
+        # Delayed selection/warm-up callbacks may retain the current page and can
+        # recreate pixmaps after the project has already been closed.  Stop and
+        # dispose them before clearing scenes and caches.
+        for timer_attr in ("_maker_preview_selection_timer", "_maker_preview_state_warm_timer"):
+            try:
+                timer = getattr(self, timer_attr, None)
+                if timer is not None:
+                    try:
+                        timer.stop()
+                    except Exception:
+                        pass
+                    try:
+                        timer.deleteLater()
+                    except Exception:
+                        pass
+                setattr(self, timer_attr, None)
+            except Exception:
+                pass
+        try:
+            self._maker_preview_state_warm_seed = None
+        except Exception:
+            pass
         try:
             self._maker_preview_overlay_items = []
+            self._maker_dialogue_overlay_items = []
+            self._maker_dialogue_overlay_preserve_enabled = False
+            self._maker_dialogue_text_items = {"body": [], "speaker": []}
+            self._maker_dialogue_text_render_context = None
+            self._maker_dialogue_current_row_id = None
+            self._maker_fixed_preview_last_row_id = None
+            self._maker_fixed_preview_last_page_idx = None
+            self._maker_fixed_preview_last_map_file = ""
             self._maker_scene_preview_items = []
             self._maker_scene_preview_picture_items = []
             self._maker_scene_preview_text_items = []
@@ -2499,11 +2609,25 @@ class MainWindowProjectPagesMixin:
         # 폰트/Window/DB JSON/뷰어 base pixmap 캐시가 프로젝트를 넘나들면
         # 같은 page:0/final 키로 이전 프로젝트 프리뷰가 새 프로젝트에 붙을 수 있다.
         for attr in (
+            # Heavy QPixmap and rendered-window caches.
+            "_maker_preview_qpixmap_cache",
             "_maker_preview_window_pixmap_cache",
+            # Per-project blueprint/state/command caches restored from disk on reopen.
+            "_maker_preview_picture_state_cache",
+            "_maker_row_preview_blueprint_cache",
+            "_maker_preview_event_command_cache",
+            # Resolved project assets and parsed plugin configuration.
+            "_maker_preview_asset_resolve_cache",
+            "_maker_preview_plugins_js_cache",
+            "_maker_preview_window_back_image_cache",
+            "_maker_preview_trp_skit_actor_cache",
+            "_maker_preview_trp_skit_display_cache",
+            # Text/window/database runtime caches.
             "_maker_preview_window_text_color_cache",
             "_maker_db_window_text_color_cache",
             "_maker_database_json_cache",
             "_maker_database_preview_raw_pixmap",
+            # Diagnostics can retain nested project metadata.
             "_last_maker_preview_font_deps_diag",
             "_last_maker_preview_font_conversion_diag",
             "_last_maker_preview_font_load_diag",
@@ -2523,7 +2647,10 @@ class MainWindowProjectPagesMixin:
             pass
         try:
             self.maker_database_mode_enabled = False
+            self.maker_translation_layer = "normal"
             self.maker_database_idx = 0
+            self.maker_plugin_idx = 0
+            self.maker_speaker_idx = 0
             self.maker_database_tabs = []
             self._maker_database_preview_raw_pixmap = None
             self._maker_database_preview_fit_mode = True
@@ -2621,6 +2748,28 @@ class MainWindowProjectPagesMixin:
                     pass
         except Exception:
             pass
+        # Python/Qt may keep allocator arenas for reuse, but after all scene and
+        # dictionary references are detached a collection pass can release the
+        # actual Python wrappers immediately.  This never removes the disk cache.
+        collected = 0
+        try:
+            import gc
+            collected = int(gc.collect())
+        except Exception:
+            collected = 0
+        try:
+            self.audit_boundary_event(
+                "MAKER_PREVIEW_RUNTIME_RELEASE_DONE",
+                reason=str(reason or "project_close"),
+                collected=collected,
+                disk_cache_preserved=True,
+                before=runtime_before,
+                blueprints=len(getattr(self, "_maker_row_preview_blueprint_cache", {}) or {}),
+                picture_states=len(getattr(self, "_maker_preview_picture_state_cache", {}) or {}),
+                qpixmaps=len(getattr(self, "_maker_preview_qpixmap_cache", {}) or {}),
+            )
+        except Exception:
+            pass
         try:
             self.audit_boundary_event("MAKER_PREVIEW_CLEARED", reason=str(reason or "project_close"))
         except Exception:
@@ -2634,6 +2783,8 @@ class MainWindowProjectPagesMixin:
         an old project fires after a new project was opened, the lifecycle token
         check drops it.
         """
+        if hasattr(self, "is_maker_preview_enabled") and not self.is_maker_preview_enabled():
+            return False
         try:
             current_token = int(getattr(self, "_maker_preview_lifecycle_token", 0) or 0)
             if token is not None and int(token) != current_token:
@@ -2646,6 +2797,7 @@ class MainWindowProjectPagesMixin:
             if not getattr(self, "paths", None):
                 return False
             self.maker_database_mode_enabled = False
+            self.maker_translation_layer = "normal"
             # 새 프로젝트의 일반 맵 프리뷰를 세울 때는 DB 프리뷰 패널을 반드시 닫는다.
             # saved ui_state/current_mode가 4여도 이것은 최종결과 탭이지 DB 모드가 아니다.
             try:
@@ -2755,6 +2907,8 @@ class MainWindowProjectPagesMixin:
         regenerated from the current project/game clone and the left viewer is
         rebuilt immediately.
         """
+        if hasattr(self, "is_maker_preview_enabled") and not self.is_maker_preview_enabled():
+            return False
         return self.force_refresh_maker_preview_current_page(reason="manual_preview_refresh", show_message=True)
 
     def force_refresh_maker_preview_current_page(self, *, reason="manual_preview_refresh", show_message=False):
@@ -2872,7 +3026,7 @@ class MainWindowProjectPagesMixin:
             except Exception:
                 pass
             try:
-                self._clear_maker_preview_selection_overlay()
+                self._clear_maker_preview_selection_overlay(force=True)
             except Exception:
                 pass
             try:
@@ -3040,16 +3194,728 @@ class MainWindowProjectPagesMixin:
                     pass
             return False
 
-    def _clear_maker_preview_selection_overlay(self):
+    def _maker_dialogue_overlay_items_alive(self):
+        """Return True when the fixed Maker dialogue UI layer is still in the scene.
+
+        The dialogue box is no longer treated as a disposable preview overlay.
+        It is a separate fixed UI layer that survives selection changes and base
+        preview rebuilds; only explicit single-dialogue replacement/project reset
+        may remove it.
+        """
+        try:
+            scene = self._safe_graphics_scene() if hasattr(self, "_safe_graphics_scene") else getattr(getattr(self, "view", None), "scene", None)
+        except Exception:
+            scene = None
+        if scene is None:
+            return False
+        try:
+            items = list(getattr(self, "_maker_dialogue_overlay_items", []) or [])
+        except Exception:
+            items = []
+        if not items:
+            return False
+        alive = 0
+        for item in items:
+            try:
+                if item is not None and item.scene() is scene:
+                    alive += 1
+            except Exception:
+                continue
+        return bool(alive > 0)
+
+    def _maker_is_dynamic_preview_item(self, item):
+        """Return True for every row-specific Maker preview object.
+
+        The Python tracking lists are only a convenience cache.  They cannot be
+        the source of truth because text-only refreshes, choice windows, plugin
+        window images, and QGraphicsItemGroup children may be created through
+        different paths.  Scene tags are the authoritative ownership marker.
+        """
+        if item is None:
+            return False
+        try:
+            marker = str(item.data(0) or "")
+        except Exception:
+            marker = ""
+        if marker in {"maker_preview_overlay", "maker_dialogue_overlay"}:
+            return True
+        try:
+            if str(item.data(4) or "") == "maker_dynamic_preview":
+                return True
+        except Exception:
+            pass
+        try:
+            role = str(item.data(1) or "")
+        except Exception:
+            role = ""
+        return bool(role.startswith("maker_dialogue_") or role.startswith("maker_preview_"))
+
+    def _maker_collect_dynamic_preview_items(self, scene):
+        """Collect all alive dynamic Maker preview items directly from Scene."""
+        if scene is None:
+            return []
+        found = []
+        seen = set()
+        for seq in (
+            list(getattr(self, "_maker_preview_overlay_items", []) or []),
+            list(getattr(self, "_maker_dialogue_overlay_items", []) or []),
+        ):
+            for item in seq:
+                if item is None or id(item) in seen:
+                    continue
+                try:
+                    if item.scene() is scene:
+                        found.append(item)
+                        seen.add(id(item))
+                except Exception:
+                    continue
+        try:
+            scene_items = list(scene.items())
+        except Exception:
+            scene_items = []
+        for item in scene_items:
+            if item is None or id(item) in seen:
+                continue
+            try:
+                if self._maker_is_dynamic_preview_item(item):
+                    found.append(item)
+                    seen.add(id(item))
+            except Exception:
+                continue
+        return found
+
+    def _maker_remove_stale_dynamic_preview_items(self, scene, keep_items=None, *, reason="row_preview_swap"):
+        """Remove every old row-preview item not present in ``keep_items``.
+
+        This is the final leak barrier.  It scans the real Scene instead of only
+        the latest tracking list, so orphaned body text, choice text, name boxes,
+        plugin windows, picture layers, and grouped children cannot accumulate
+        across row changes.
+        """
+        if scene is None:
+            return 0
+        keep_roots = [x for x in list(keep_items or []) if x is not None]
+        keep_ids = {id(x) for x in keep_roots}
+        # QGraphicsItemGroup/window-image roots may own tagged children that are
+        # not separately present in the overlay list.  Keeping a parent must keep
+        # its entire subtree; otherwise a scene scan would detach the new window
+        # image immediately after it was built.
+        stack = list(keep_roots)
+        while stack:
+            parent = stack.pop()
+            try:
+                children = list(parent.childItems() or [])
+            except Exception:
+                children = []
+            for child in children:
+                if child is None or id(child) in keep_ids:
+                    continue
+                keep_ids.add(id(child))
+                stack.append(child)
+        stale = [x for x in self._maker_collect_dynamic_preview_items(scene) if id(x) not in keep_ids]
+        if not stale:
+            return 0
+        # Children first, then parents/groups.  This remains safe when a group
+        # owns untagged children and when both parent and child were tagged.
+        def depth(item):
+            d = 0
+            try:
+                p = item.parentItem()
+                while p is not None and d < 64:
+                    d += 1
+                    p = p.parentItem()
+            except Exception:
+                pass
+            return d
+        stale.sort(key=depth, reverse=True)
+        removed = 0
+        old_block = None
+        try:
+            old_block = scene.blockSignals(True)
+        except Exception:
+            old_block = None
+        try:
+            for item in stale:
+                try:
+                    if item.scene() is not scene:
+                        continue
+                    item.setVisible(False)
+                    scene.removeItem(item)
+                    removed += 1
+                except Exception:
+                    continue
+        finally:
+            try:
+                if old_block is not None:
+                    scene.blockSignals(old_block)
+            except Exception:
+                pass
+        try:
+            self.audit_boundary_event(
+                "MAKER_PREVIEW_STALE_SCENE_ITEMS_PURGED",
+                reason=str(reason or "row_preview_swap"),
+                removed=removed,
+                kept=len(keep_ids),
+                throttle_ms=100,
+            )
+        except Exception:
+            pass
+        return removed
+
+    def _maker_preview_overlay_is_alive(self):
+        # Compatibility name used by older fixed-preview guards.  For the current
+        # Maker preview architecture, the persistent dialogue layer is the one
+        # that matters.
+        try:
+            if self._maker_dialogue_overlay_items_alive():
+                return True
+        except Exception:
+            pass
+        try:
+            scene = self._safe_graphics_scene() if hasattr(self, "_safe_graphics_scene") else getattr(getattr(self, "view", None), "scene", None)
+        except Exception:
+            scene = None
+        if scene is None:
+            return False
+        try:
+            items = list(getattr(self, "_maker_preview_overlay_items", []) or [])
+        except Exception:
+            items = []
+        if not items:
+            return False
+        for item in items:
+            try:
+                if item is not None and item.scene() is scene:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _clear_maker_dialogue_overlay(self, *, reason="", allow_project_reset=False):
+        """Remove only the fixed dialogue UI layer.
+
+        This must not be called from table multi-selection/no-selection preview
+        paths.  It is allowed for explicit single row replacement, project reset,
+        or manual preview refresh.
+        """
+        scene = self._safe_graphics_scene() if hasattr(self, "_safe_graphics_scene") else getattr(getattr(self, "view", None), "scene", None)
+        items = list(getattr(self, "_maker_dialogue_overlay_items", []) or [])
+        self._maker_dialogue_overlay_items = []
+        try:
+            self._maker_dialogue_text_items = {"body": [], "speaker": []}
+            self._maker_dialogue_text_render_context = None
+            self._maker_dialogue_current_row_id = None
+        except Exception:
+            pass
+        try:
+            self._maker_dialogue_overlay_preserve_enabled = False
+        except Exception:
+            pass
+        if scene is None:
+            return
+        old_block = None
+        try:
+            old_block = scene.blockSignals(True)
+        except Exception:
+            old_block = None
+        try:
+            if items:
+                for item in items:
+                    try:
+                        item.setVisible(False)
+                        scene.removeItem(item)
+                    except Exception:
+                        continue
+            elif allow_project_reset:
+                for item in list(scene.items()):
+                    try:
+                        if item.data(0) == "maker_dialogue_overlay":
+                            item.setVisible(False)
+                            scene.removeItem(item)
+                    except Exception:
+                        continue
+        finally:
+            try:
+                if old_block is not None:
+                    scene.blockSignals(old_block)
+            except Exception:
+                pass
+        try:
+            if hasattr(self, "audit_boundary_event"):
+                self.audit_boundary_event("MAKER_DIALOGUE_OVERLAY_CLEARED", reason=str(reason or ""), count=len(items), allow_project_reset=bool(allow_project_reset), throttle_ms=200)
+        except Exception:
+            pass
+
+    def _maker_collect_dialogue_text_items(self, scene):
+        """Return every currently alive dialogue text item, including legacy leftovers.
+
+        The fixed preview used to track only the most recently registered body/speaker
+        lists.  A late full-preview path could replace those lists while leaving older
+        text items alive in the scene, which produced stacked dialogue.  The scene tag
+        is the source of truth here, not the cached Python list.
+        """
+        if scene is None:
+            return []
+        text_tags = {
+            "maker_dialogue_body_text",
+            "maker_dialogue_speaker_text",
+            "maker_dialogue_text_warning",
+            "maker_dialogue_choice_text",
+        }
+        found = []
+        seen = set()
+        tracked = getattr(self, "_maker_dialogue_text_items", None)
+        if isinstance(tracked, dict):
+            for key in ("body", "speaker", "aux", "choice"):
+                for item in list(tracked.get(key) or []):
+                    if item is None or id(item) in seen:
+                        continue
+                    try:
+                        if item.scene() is scene:
+                            found.append(item)
+                            seen.add(id(item))
+                    except Exception:
+                        continue
+        try:
+            scene_items = list(scene.items())
+        except Exception:
+            scene_items = []
+        for item in scene_items:
+            if item is None or id(item) in seen:
+                continue
+            try:
+                if str(item.data(1) or "") in text_tags:
+                    found.append(item)
+                    seen.add(id(item))
+            except Exception:
+                continue
+        return found
+
+    def _maker_refresh_dialogue_text_only(self, row, *, reason="single_row_activation", request_id=None):
+        """Replace only the fixed dialogue text for a newly activated row.
+
+        Bulk text operations already update the right table without rebuilding the
+        left preview.  A plain single-row click must therefore refresh what the
+        user reads, but it must not touch the cached map, standing pictures, window
+        skins, or transient preview layers.  New text items are prepared first and
+        atomically swapped with the previous body/speaker items.
+        """
+        if not isinstance(row, dict):
+            return False
+        # A minimal fallback is an emergency whole-preview scene, not a stable
+        # dialogue overlay.  Never mutate it through the text-only path; the
+        # next single-row activation must retry the complete blueprint render.
+        try:
+            if bool(getattr(self, "_maker_current_preview_is_fallback", False)):
+                return False
+        except Exception:
+            return False
+        try:
+            if request_id is not None and int(request_id) != int(getattr(self, "_maker_single_activation_request_id", 0) or 0):
+                return False
+        except Exception:
+            return False
+        try:
+            if not self._is_current_maker_page():
+                return False
+            if not self._maker_dialogue_overlay_items_alive():
+                return False
+        except Exception:
+            return False
+        ctx = getattr(self, "_maker_dialogue_text_render_context", None)
+        if not isinstance(ctx, dict):
+            return False
+        try:
+            meta = row.get("maker_text_unit") or {}
+            text_type = str(meta.get("text_type") or row.get("type") or "dialogue")
+            if self._maker_preview_text_type_is_choice(text_type):
+                return False
+        except Exception:
+            pass
+        try:
+            scene = self._safe_graphics_scene() if hasattr(self, "_safe_graphics_scene") else getattr(getattr(self, "view", None), "scene", None)
+        except Exception:
+            scene = None
+        if scene is None:
+            return False
+        try:
+            curr = self.data.get(self.idx) if isinstance(getattr(self, "data", None), dict) else None
+            payload = self._maker_preview_payload_for_row(row, curr)
+            body_text = str(payload.get("body_for_preview") or payload.get("body_raw_with_codes") or row.get("text") or "")
+            speaker = str(self._maker_row_speaker_text(row) or "").strip() if hasattr(self, "_maker_row_speaker_text") else str(payload.get("speaker_plain") or "").strip()
+            if bool((row.get("maker_text_unit") or {}).get("inline_speaker") or payload.get("inline_speaker")):
+                speaker = ""
+            if speaker.lower() == "unknown":
+                speaker = ""
+        except Exception:
+            return False
+
+        body_ctx = ctx.get("body") if isinstance(ctx.get("body"), dict) else None
+        speaker_ctx = ctx.get("speaker") if isinstance(ctx.get("speaker"), dict) else None
+        name_box = ctx.get("name_box")
+        if not isinstance(body_ctx, dict):
+            return False
+        if name_box is not None:
+            try:
+                if name_box.scene() is not scene:
+                    name_box = None
+            except Exception:
+                name_box = None
+
+        # The fixed text overlay must not fall back to a full preview rebuild just
+        # because the first cached row had no speaker.  Create the name box once,
+        # inside the dialogue overlay only, then reuse/hide it for later rows.
+        if speaker and name_box is None:
+            try:
+                st = dict(body_ctx.get("settings") or {})
+                profile = dict(body_ctx.get("profile") or {})
+                padding = max(0, int(st.get("message_padding") or 12))
+                body_x = int(body_ctx.get("x") or 0)
+                body_y = int(body_ctx.get("y") or 0)
+                box_x = max(0, body_x - padding)
+                box_y = max(0, body_y - padding)
+                message_w = max(96, int(body_ctx.get("width") or 0) + padding * 2)
+                name_font = self._maker_preview_font(
+                    st,
+                    text_type="name",
+                    bold=False,
+                    size_override=st.get("name_font_size") or 24,
+                )
+                try:
+                    nfm = QFontMetrics(name_font)
+                    name_text_w = int(nfm.horizontalAdvance(speaker))
+                    name_text_h = int(nfm.height())
+                except Exception:
+                    name_text_w = max(48, len(speaker) * 24)
+                    name_text_h = int(st.get("name_font_size") or 28) + 10
+                maker_item_padding = max(0, int(st.get("item_padding") or 8))
+                name_pad_x = max(0, int(st.get("name_padding_x") or (padding + maker_item_padding)))
+                name_pad_y = max(0, int(st.get("name_padding_y") or padding))
+                name_min_w = max(32, int(st.get("name_min_width") or 96))
+                name_min_h = max(24, int(st.get("name_min_height") or (name_text_h + name_pad_y * 2)))
+                name_overlap = int(st.get("name_overlap") or 0)
+                name_w = min(max(name_min_w, name_text_w + name_pad_x * 2), max(name_min_w, int(message_w * 0.62)))
+                name_h = max(name_min_h, name_text_h + name_pad_y * 2)
+                name_x = max(0, box_x)
+                name_y = max(0, int(box_y - name_h + name_overlap))
+                try:
+                    win_opacity = max(0, min(255, int(st.get("window_opacity") or 205)))
+                except Exception:
+                    win_opacity = 205
+                name_box, _name_diag = self._maker_preview_add_window_item(
+                    scene,
+                    name_x,
+                    name_y,
+                    name_w,
+                    name_h,
+                    z=self._maker_preview_layer_z("name_window"),
+                    opacity=win_opacity,
+                    profile=profile,
+                    fallback_pen=QPen(QColor(150, 185, 255, 230), 3),
+                    fallback_brush=QBrush(QColor(8, 10, 12, 218)),
+                    window_class="Window_NameBox",
+                )
+                name_box.setData(0, "maker_dialogue_overlay")
+                name_box.setData(1, "maker_dialogue_name_box")
+                try:
+                    name_box.setData(2, int(getattr(self, "_maker_preview_generation", 0) or 0))
+                    name_box.setData(3, str(row.get("id") or ""))
+                    name_box.setData(4, "maker_dynamic_preview")
+                except Exception:
+                    pass
+                overlay = list(getattr(self, "_maker_dialogue_overlay_items", []) or [])
+                overlay.append(name_box)
+                self._maker_dialogue_overlay_items = overlay
+                speaker_ctx = {
+                    "x": name_x + name_pad_x,
+                    "y": name_y + name_pad_y,
+                    "font": QFont(name_font),
+                    "text_color": QColor(self._maker_preview_color(st.get("text_color"), "#FFFFFF")),
+                    "outline_color": QColor(self._maker_preview_color(st.get("outline_color"), "#202020")),
+                    "outline_width": self._maker_preview_effective_outline_width(st, st.get("outline_width") or 0),
+                    "width": None,
+                    "z": self._maker_preview_layer_z("message_text", order=1),
+                    "height_scale": body_ctx.get("height_scale", 1.0),
+                }
+                ctx["speaker"] = speaker_ctx
+                ctx["name_box"] = name_box
+                self._maker_dialogue_text_render_context = ctx
+            except Exception as e:
+                try:
+                    self.audit_boundary_event(
+                        "MAKER_DIALOGUE_NAME_BOX_TEXT_ONLY_CREATE_FAILED",
+                        row_id=str(row.get("id") or ""),
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                except Exception:
+                    pass
+                speaker = ""
+                name_box = None
+
+        new_body = []
+        new_speaker = []
+        view = getattr(self, "view", None)
+        old_view_updates = None
+        old_scene_block = None
+        try:
+            if view is not None and hasattr(view, "updatesEnabled"):
+                old_view_updates = bool(view.updatesEnabled())
+                view.setUpdatesEnabled(False)
+        except Exception:
+            old_view_updates = None
+        try:
+            old_scene_block = scene.blockSignals(True)
+        except Exception:
+            old_scene_block = None
+        try:
+            made = self._maker_add_control_text_items(
+                scene,
+                body_text,
+                body_ctx.get("x", 0),
+                body_ctx.get("y", 0),
+                settings=body_ctx.get("settings") or {},
+                base_font=body_ctx.get("base_font"),
+                width=body_ctx.get("width", 0),
+                max_lines=body_ctx.get("max_lines", 4),
+                line_height=body_ctx.get("line_height", 36),
+                z=body_ctx.get("z", self._maker_preview_layer_z("message_text")),
+                profile=body_ctx.get("profile") or {},
+                height_scale=body_ctx.get("height_scale", 1.0),
+            )
+            if isinstance(made, tuple):
+                new_body = list(made[0] or [])
+            else:
+                new_body = list(made or [])
+            for item in new_body:
+                try:
+                    item.setData(0, "maker_dialogue_overlay")
+                    item.setData(1, "maker_dialogue_body_text")
+                    item.setData(2, int(getattr(self, "_maker_preview_generation", 0) or 0))
+                    item.setData(3, str(row.get("id") or ""))
+                    item.setData(4, "maker_dynamic_preview")
+                except Exception:
+                    pass
+
+            if name_box is not None:
+                try:
+                    name_box.setVisible(bool(speaker))
+                except Exception:
+                    pass
+            if speaker and isinstance(speaker_ctx, dict):
+                new_speaker = list(self._maker_add_outlined_text_items(
+                    scene,
+                    speaker,
+                    speaker_ctx.get("x", 0),
+                    speaker_ctx.get("y", 0),
+                    font=speaker_ctx.get("font"),
+                    text_color=speaker_ctx.get("text_color"),
+                    outline_color=speaker_ctx.get("outline_color"),
+                    outline_width=speaker_ctx.get("outline_width", 0),
+                    width=speaker_ctx.get("width"),
+                    z=speaker_ctx.get("z", self._maker_preview_layer_z("message_text", order=1)),
+                    height_scale=speaker_ctx.get("height_scale", 1.0),
+                ) or [])
+                for item in new_speaker:
+                    try:
+                        item.setData(0, "maker_dialogue_overlay")
+                        item.setData(1, "maker_dialogue_speaker_text")
+                        item.setData(2, int(getattr(self, "_maker_preview_generation", 0) or 0))
+                        item.setData(3, str(row.get("id") or ""))
+                        item.setData(4, "maker_dynamic_preview")
+                    except Exception:
+                        pass
+
+            try:
+                if request_id is not None and int(request_id) != int(getattr(self, "_maker_single_activation_request_id", 0) or 0):
+                    raise RuntimeError("stale_single_row_text_request")
+            except ValueError:
+                raise RuntimeError("stale_single_row_text_request")
+
+            new_ids = {id(x) for x in list(new_body) + list(new_speaker)}
+            old_items = [
+                item for item in self._maker_collect_dialogue_text_items(scene)
+                if id(item) not in new_ids
+            ]
+            for item in old_items:
+                try:
+                    if item is not None and item.scene() is scene:
+                        item.setVisible(False)
+                        scene.removeItem(item)
+                except Exception:
+                    continue
+
+            old_ids = {id(x) for x in old_items}
+            overlay = [
+                x for x in list(getattr(self, "_maker_dialogue_overlay_items", []) or [])
+                if x is not None and id(x) not in old_ids and id(x) not in new_ids
+            ]
+            overlay.extend(new_body)
+            overlay.extend(new_speaker)
+            self._maker_dialogue_overlay_items = overlay
+            self._maker_dialogue_text_items = {"body": new_body, "speaker": new_speaker, "aux": [], "choice": []}
+            self._maker_dialogue_current_row_id = str(row.get("id") or "")
+            try:
+                self._maker_fixed_preview_last_row_id = str(row.get("id") or "")
+            except Exception:
+                pass
+        except Exception as e:
+            for item in list(new_body) + list(new_speaker):
+                try:
+                    if item is not None and item.scene() is scene:
+                        scene.removeItem(item)
+                except Exception:
+                    pass
+            if str(e) == "stale_single_row_text_request":
+                try:
+                    self.audit_boundary_event(
+                        "MAKER_DIALOGUE_TEXT_STALE_DROPPED",
+                        row_id=str(row.get("id") or ""),
+                        reason=str(reason or "single_row_activation"),
+                        request_id=request_id,
+                    )
+                except Exception:
+                    pass
+                return False
+            try:
+                self.audit_boundary_event(
+                    "MAKER_DIALOGUE_TEXT_ONLY_REFRESH_FAILED",
+                    row_id=str(row.get("id") or ""),
+                    reason=str(reason or "single_row_activation"),
+                    error=f"{type(e).__name__}: {e}",
+                )
+            except Exception:
+                pass
+            return False
+        finally:
+            try:
+                if old_scene_block is not None:
+                    scene.blockSignals(old_scene_block)
+            except Exception:
+                pass
+            try:
+                if view is not None and old_view_updates is not None:
+                    view.setUpdatesEnabled(old_view_updates)
+            except Exception:
+                pass
+        try:
+            scene.update()
+            if view is not None and hasattr(view, "viewport"):
+                view.viewport().update()
+        except Exception:
+            pass
+        try:
+            self.audit_boundary_event(
+                "MAKER_DIALOGUE_TEXT_ONLY_REFRESHED",
+                row_id=str(row.get("id") or ""),
+                body_items=len(new_body),
+                speaker_items=len(new_speaker),
+                reason=str(reason or "single_row_activation"),
+            )
+        except Exception:
+            pass
+        return True
+
+    def _maker_find_row_by_text_id(self, text_id):
+        try:
+            curr = self.data.get(self.idx) if isinstance(getattr(self, "data", None), dict) else None
+            if not isinstance(curr, dict):
+                return None
+            wanted = str(text_id)
+            for row in curr.get("data") or []:
+                try:
+                    if isinstance(row, dict) and str(row.get("id")) == wanted and isinstance(row.get("maker_text_unit"), dict):
+                        return row
+                except Exception:
+                    continue
+        except Exception:
+            return None
+        return None
+
+    def _maker_restore_fixed_preview_overlay_if_needed(self, reason=""):
+        # 다중 선택/선택 없음 상태에서도 좌측 메시지 박스는 마지막 단일 대사
+        # 프리뷰로 고정되어 있어야 한다.  scene 재구성으로 overlay item이
+        # 날아간 경우에만 마지막 단일 대사 기준으로 다시 붙인다.
+        try:
+            if not self._is_current_maker_page():
+                return False
+            if bool(getattr(self, "_maker_fixed_preview_restoring", False)):
+                return False
+            if self._maker_preview_overlay_is_alive():
+                return True
+            last_id = getattr(self, "_maker_fixed_preview_last_row_id", None)
+            if last_id is None or str(last_id).strip() == "":
+                return False
+            row = self._maker_find_row_by_text_id(last_id)
+            if not isinstance(row, dict):
+                return False
+            self._maker_fixed_preview_restoring = True
+            try:
+                if hasattr(self, "audit_boundary_event"):
+                    self.audit_boundary_event(
+                        "MAKER_FIXED_PREVIEW_RESTORE",
+                        reason=str(reason or "overlay_missing"),
+                        row_id=str(last_id),
+                    )
+            except Exception:
+                pass
+            try:
+                return bool(self.update_maker_preview_selection_from_table(row_override=row, fixed_restore=True))
+            finally:
+                self._maker_fixed_preview_restoring = False
+        except Exception as e:
+            try:
+                self._maker_fixed_preview_restoring = False
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "audit_boundary_event"):
+                    self.audit_boundary_event("MAKER_FIXED_PREVIEW_RESTORE_FAILED", reason=str(reason or ""), error=f"{type(e).__name__}: {e}")
+            except Exception:
+                pass
+            return False
+
+    def _clear_maker_preview_selection_overlay(self, force=False, include_dialogue=False, reason=""):
+        """Clear transient Maker preview overlay items.
+
+        The dialogue box/name box/message text are a separate fixed UI layer and
+        are not removed here unless include_dialogue=True is explicitly passed.
+        This prevents table selection/no-selection paths from deleting the text
+        box just because preview/background layers are refreshed.
+        """
         scene = self._safe_graphics_scene() if hasattr(self, "_safe_graphics_scene") else getattr(getattr(self, "view", None), "scene", None)
         items = list(getattr(self, "_maker_preview_overlay_items", []) or [])
         self._maker_preview_overlay_items = []
         if scene is None:
             return
-        # Older preview builds did not always keep every dynamic overlay item in
-        # _maker_preview_overlay_items.  Clear the whole high-z Maker preview layer
-        # so each row selection reconstructs a fresh in-game screen instead of
-        # stacking old standing pictures/message text on top of the new one.
+        if include_dialogue:
+            try:
+                self._clear_maker_dialogue_overlay(reason=reason or "preview_selection_clear_include_dialogue", allow_project_reset=bool(force))
+            except Exception:
+                pass
+        # Fast path: row selection can fire many times while the user is holding
+        # ↑/↓.  Remove only transient items we created last time; avoid scene.items()
+        # full scans on every selection change.
+        if items and not force:
+            for item in items:
+                try:
+                    # Never remove the fixed dialogue layer through this path.
+                    if item.data(0) == "maker_dialogue_overlay":
+                        continue
+                except Exception:
+                    pass
+                try:
+                    item.setVisible(False)
+                    scene.removeItem(item)
+                except Exception:
+                    continue
+            try:
+                scene.update()
+            except Exception:
+                pass
+            return
+        # Forced cleanup for project/page rebuilds or old leaked transient overlay
+        # items.  Even in forced mode, fixed dialogue items are protected unless
+        # include_dialogue=True was explicitly requested above.
         try:
             tracked = set(id(x) for x in items)
         except Exception:
@@ -3057,35 +3923,34 @@ class MainWindowProjectPagesMixin:
         try:
             for item in list(scene.items()):
                 try:
+                    marker = item.data(0)
+                except Exception:
+                    marker = None
+                if marker == "maker_dialogue_overlay" and not include_dialogue:
+                    continue
+                try:
                     z = float(item.zValue())
                 except Exception:
                     z = 0.0
-                try:
-                    marked = bool(item.data(0) == "maker_preview_overlay")
-                except Exception:
-                    marked = False
-                if id(item) in tracked or marked or z >= 99000.0:
+                marked = bool(marker == "maker_preview_overlay")
+                if id(item) in tracked or marked or (z >= 99000.0 and marker != "maker_dialogue_overlay"):
                     try:
                         item.setVisible(False)
                         scene.removeItem(item)
-                    except RuntimeError:
-                        continue
                     except Exception:
                         continue
-        except RuntimeError:
-            pass
         except Exception:
-            # Fallback to the tracked list if a scene-wide scan fails.
             for item in items:
+                try:
+                    if item.data(0) == "maker_dialogue_overlay" and not include_dialogue:
+                        continue
+                except Exception:
+                    pass
                 try:
                     item.setVisible(False)
                     scene.removeItem(item)
                 except Exception:
                     continue
-        try:
-            scene.update()
-        except Exception:
-            pass
 
     def _maker_page_canvas_geometry(self, page=None):
         # Maker preview uses a fixed game-screen coordinate system.  The left
@@ -3134,10 +3999,8 @@ class MainWindowProjectPagesMixin:
         try:
             project_dir = Path(str(getattr(self, "project_dir", "") or ""))
             map_file = str(meta.get("map_file") or "")
-            candidates = [
-                project_dir / "maker_game" / "data" / map_file,
-                project_dir / "maker_game" / "www" / "data" / map_file,
-            ]
+            resolved = self._maker_preview_resolved_project_paths()
+            candidates = [Path(resolved.get("data_dir") or (project_dir / "maker_game" / "data")) / map_file]
             for path in candidates:
                 if not path.is_file():
                     continue
@@ -3284,15 +4147,64 @@ class MainWindowProjectPagesMixin:
             pass
         return None
 
+    def _maker_preview_resolved_project_paths(self):
+        """Return the canonical nested Maker content paths for this project.
+
+        The selected/imported folder is cloned as-is, so data/js/img may live
+        below an extra wrapper directory.  Cache the resolved set per project
+        root and let maker_project_paths validate stale import summaries.
+        """
+        root = self._maker_preview_project_root()
+        if root is None:
+            return {}
+        try:
+            root_key = str(root.resolve())
+        except Exception:
+            root_key = str(root)
+        summary_sig = None
+        try:
+            summary_path = root / "maker_meta" / "maker_import_summary.json"
+            st = summary_path.stat()
+            summary_sig = (int(st.st_mtime_ns), int(st.st_size))
+        except Exception:
+            summary_sig = None
+        cache = getattr(self, "_maker_preview_project_paths_cache", None)
+        if (
+            isinstance(cache, dict)
+            and cache.get("root") == root_key
+            and cache.get("summary_sig") == summary_sig
+            and isinstance(cache.get("paths"), dict)
+        ):
+            cached_paths = dict(cache.get("paths") or {})
+            try:
+                if (Path(cached_paths.get("data_dir")) / "MapInfos.json").is_file():
+                    return cached_paths
+            except Exception:
+                pass
+        try:
+            paths = maker_project_paths(root)
+        except Exception:
+            game_root = root / "maker_game"
+            paths = {
+                "project_root": root,
+                "game_root": game_root,
+                "content_root": game_root,
+                "data_dir": game_root / "data",
+                "js_dir": game_root / "js",
+                "img_dir": game_root / "img",
+                "fonts_dir": game_root / "fonts",
+                "engine": {},
+            }
+        self._maker_preview_project_paths_cache = {"root": root_key, "summary_sig": summary_sig, "paths": dict(paths)}
+        return dict(paths)
+
     def _maker_preview_read_system_json(self):
         root = self._maker_preview_project_root()
         checked = []
         if root is None:
             return {}, {"checked": checked, "found": False, "error": "project_root_missing"}
-        candidates = [
-            root / "maker_game" / "data" / "System.json",
-            root / "maker_game" / "www" / "data" / "System.json",
-        ]
+        resolved = self._maker_preview_resolved_project_paths()
+        candidates = [Path(resolved.get("data_dir") or (root / "maker_game" / "data")) / "System.json"]
         for c in candidates:
             try:
                 checked.append(str(c))
@@ -3435,6 +4347,52 @@ class MainWindowProjectPagesMixin:
             diag["error_type"] = type(e).__name__
             return None, diag
 
+    def _maker_preview_load_pixmap(self, path, *, purpose="image"):
+        """Load QPixmap with a path/mtime cache and timing log.
+
+        Large RPG Maker bust/UI assets can be 1000px+ and are selected repeatedly
+        while reviewing dialogue.  Re-decoding them on every row click is a major
+        preview lag source, so cache the QPixmap object by file identity.
+        """
+        t0 = perf_counter()
+        try:
+            p = Path(str(path))
+            try:
+                st = p.stat()
+                key = (str(p.resolve()), int(st.st_mtime_ns), int(st.st_size))
+            except Exception:
+                key = (str(p), 0, 0)
+            cache = getattr(self, "_maker_preview_qpixmap_cache", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                self._maker_preview_qpixmap_cache = cache
+            pm = cache.get(key)
+            if pm is not None and not pm.isNull():
+                perf_log_elapsed(self, "PERF_PIXMAP_LOAD", t0, purpose=str(purpose), cache="hit", path=str(p), width=int(pm.width()), height=int(pm.height()))
+                return pm
+            pm = QPixmap(str(p))
+            if pm is not None and not pm.isNull():
+                cache[key] = pm
+                # Keep cache bounded.  The newest access is not tracked perfectly,
+                # but this prevents runaway memory on games with many busts.
+                try:
+                    max_cache = 96
+                    if len(cache) > max_cache:
+                        for old_key in list(cache.keys())[:max(1, len(cache) - max_cache)]:
+                            cache.pop(old_key, None)
+                except Exception:
+                    pass
+                perf_log_elapsed(self, "PERF_PIXMAP_LOAD", t0, purpose=str(purpose), cache="miss", path=str(p), width=int(pm.width()), height=int(pm.height()))
+                return pm
+            perf_log_elapsed(self, "PERF_PIXMAP_LOAD", t0, purpose=str(purpose), cache="failed", path=str(p))
+            return pm
+        except Exception as e:
+            perf_log_elapsed(self, "PERF_PIXMAP_LOAD", t0, purpose=str(purpose), cache="error", path=str(path), error_type=type(e).__name__, error=str(e))
+            try:
+                return QPixmap(str(path))
+            except Exception:
+                return QPixmap()
+
     def _maker_preview_find_font_source_path(self, font_path, settings=None):
         """Resolve Maker font paths robustly from project-relative values.
 
@@ -3473,7 +4431,13 @@ class MainWindowProjectPagesMixin:
             for name in filename_hints:
                 if not name:
                     continue
-                for base in (root / "maker_game" / "fonts", root / "maker_game" / "www" / "fonts", root / "fonts"):
+                resolved = self._maker_preview_resolved_project_paths()
+                font_bases = (
+                    Path(resolved.get("fonts_dir") or (root / "maker_game" / "fonts")),
+                    Path(resolved.get("content_root") or (root / "maker_game")) / "font",
+                    root / "fonts",
+                )
+                for base in font_bases:
                     candidates.append(base / name)
         checked = []
         for c in candidates:
@@ -3490,7 +4454,13 @@ class MainWindowProjectPagesMixin:
         # Case-insensitive fallback for unpacked game folders copied from other OSes.
         if root is not None:
             wanted = {str(x).lower() for x in filename_hints if x}
-            for base in (root / "maker_game" / "fonts", root / "maker_game" / "www" / "fonts", root / "fonts"):
+            resolved = self._maker_preview_resolved_project_paths()
+            font_bases = (
+                Path(resolved.get("fonts_dir") or (root / "maker_game" / "fonts")),
+                Path(resolved.get("content_root") or (root / "maker_game")) / "font",
+                root / "fonts",
+            )
+            for base in font_bases:
                 try:
                     if not base.is_dir():
                         continue
@@ -3900,11 +4870,21 @@ class MainWindowProjectPagesMixin:
         except Exception:
             pass
         if root is not None:
+            resolved = self._maker_preview_resolved_project_paths()
+            content_root = Path(resolved.get("content_root") or (root / "maker_game"))
+            game_root = Path(resolved.get("game_root") or (root / "maker_game"))
+            # Raw runtime paths are usually relative to the actual content root.
+            # Keep the selected clone root as a compatibility fallback.
+            try:
+                candidates.append(content_root / raw)
+                candidates.append(game_root / raw)
+            except Exception:
+                pass
             for sub in subdirs or ():
                 try:
                     clean_sub = str(sub).strip("/\\")
-                    candidates.append(root / "maker_game" / clean_sub / raw)
-                    candidates.append(root / "maker_game" / "www" / clean_sub / raw)
+                    candidates.append(content_root / clean_sub / raw)
+                    candidates.append(game_root / clean_sub / raw)
                 except Exception:
                     pass
 
@@ -3957,11 +4937,8 @@ class MainWindowProjectPagesMixin:
             path, diag = self._maker_preview_resolve_asset_path(skin, profile=profile)
             if path is not None:
                 return path, diag
-        # Stable RPG Maker default location.
-        path, diag = self._maker_preview_resolve_asset_path("maker_game/img/system/Window.png", profile=profile)
-        if path is not None:
-            return path, diag
-        path, diag = self._maker_preview_resolve_asset_path("maker_game/www/img/system/Window.png", profile=profile)
+        # Stable RPG Maker default location, relative to the detected content root.
+        path, diag = self._maker_preview_resolve_asset_path("img/system/Window.png", profile=profile)
         if path is not None:
             return path, diag
         return None, diag
@@ -4031,6 +5008,12 @@ class MainWindowProjectPagesMixin:
             finally:
                 painter.end()
             cache[key] = pm
+            try:
+                if len(cache) > 128:
+                    for old_key in list(cache.keys())[:32]:
+                        cache.pop(old_key, None)
+            except Exception:
+                pass
             self._maker_preview_window_pixmap_cache = cache
             diag.update({"loaded": True, "cached": False, "slice_border": 24})
             return pm, diag
@@ -4039,7 +5022,118 @@ class MainWindowProjectPagesMixin:
             diag["error_type"] = type(e).__name__
             return None, diag
 
-    def _maker_preview_add_window_item(self, scene, x, y, width, height, *, z=100000, opacity=205, profile=None, fallback_pen=None, fallback_brush=None):
+    def _maker_preview_add_window_item(self, scene, x, y, width, height, *, z=100000, opacity=205, profile=None, fallback_pen=None, fallback_brush=None, window_class=None):
+        """Add a window-looking item to the preview scene.
+
+        If the game uses the WindowBackImage plugin for this window class,
+        treat that UI asset exactly like another image layer loaded from the
+        game and only fall back to Window.png / a debug rectangle when no
+        plugin-provided image is available.
+        """
+        try:
+            wc = str(window_class or '').strip()
+            cfg = self._maker_preview_window_back_image_config(wc) if wc else {}
+        except Exception:
+            cfg = {}
+        if isinstance(cfg, dict) and cfg:
+            diag = {'window_class': str(window_class or ''), 'mode': 'window_back_image', 'config': cfg}
+            try:
+                asset_name = str(cfg.get('ImageFile') or '').strip()
+                asset_path, asset_diag = self._maker_preview_picture_asset_path(asset_name)
+                diag['asset'] = asset_diag
+                if asset_path:
+                    pm = self._maker_preview_load_pixmap(str(asset_path), purpose=f"window:{window_class or 'unknown'}")
+                    if pm is not None and not pm.isNull():
+                        # Follow WindowBackImage.js placement instead of trimming
+                        # or fitting the asset.  The plugin often ships UI images
+                        # as full-screen transparent canvases (for example
+                        # name_tag.png_ is 1280x228 with the tag drawn only in a
+                        # corner).  Cropping or fitting that canvas destroys the
+                        # very offset data the game uses.
+                        diag['trim'] = {'skipped': True, 'reason': 'WindowBackImage uses original bitmap canvas for anchoring'}
+                        try:
+                            scale_x = float(cfg.get('ScaleX') or 100.0) / 100.0
+                        except Exception:
+                            scale_x = 1.0
+                        try:
+                            scale_y = float(cfg.get('ScaleY') or 100.0) / 100.0
+                        except Exception:
+                            scale_y = scale_x
+                        try:
+                            offset_x = float(cfg.get('OffsetX') or 0.0)
+                        except Exception:
+                            offset_x = 0.0
+                        try:
+                            offset_y = float(cfg.get('OffsetY') or 0.0)
+                        except Exception:
+                            offset_y = 0.0
+                        try:
+                            origin = int(cfg.get('Origin') or 0)
+                        except Exception:
+                            origin = 0
+                        sx = max(0.001, float(scale_x))
+                        sy = max(0.001, float(scale_y))
+                        scaled_w = float(pm.width()) * sx
+                        scaled_h = float(pm.height()) * sy
+                        if origin == 1:
+                            # Sprite_WindowBackImage.refreshPosition():
+                            # x = parent.width / 2 + OffsetX; anchor.x = 0.5
+                            # y = parent.height / 2 + OffsetY; anchor.y = 0.5
+                            px = float(x) + float(width) / 2.0 + offset_x - scaled_w / 2.0
+                            py = float(y) + float(height) / 2.0 + offset_y - scaled_h / 2.0
+                        else:
+                            px = float(x) + offset_x
+                            py = float(y) + offset_y
+                        fit_scale = 1.0
+                        item = QGraphicsPixmapItem(pm)
+                        item.setPos(px, py)
+                        tr = QTransform()
+                        tr.scale(sx, sy)
+                        item.setTransform(tr, False)
+                        try:
+                            item.setOpacity(max(0.0, min(1.0, float(opacity or 205) / 255.0)))
+                        except Exception:
+                            pass
+                        item.setZValue(float(z))
+                        scene.addItem(item)
+                        diag.update({
+                            'custom_image': True,
+                            'image_path': str(asset_path),
+                            'origin': origin,
+                            'offset_x': offset_x,
+                            'offset_y': offset_y,
+                            'scale_x': scale_x,
+                            'scale_y': scale_y,
+                            'fit_scale': fit_scale,
+                            'render_x': px,
+                            'render_y': py,
+                            'render_width': scaled_w,
+                            'render_height': scaled_h,
+                            'window_show': str(cfg.get('WindowShow') or ''),
+                        })
+                        if str(cfg.get('WindowShow') or 'false').strip().lower() in ('false', '0', 'off', 'no'):
+                            return item, diag
+                        # If WindowShow is true, keep the plugin image and also
+                        # draw the fallback/default window behind it.
+                        pm2, diag2 = self._maker_preview_build_window_pixmap(width, height, opacity=opacity, profile=profile)
+                        if pm2 is not None and not pm2.isNull():
+                            bg = QGraphicsPixmapItem(pm2)
+                            bg.setPos(float(x), float(y))
+                            bg.setZValue(float(z) - 0.01)
+                            scene.addItem(bg)
+                            try:
+                                group = QGraphicsItemGroup()
+                                scene.addItem(group)
+                                bg.setParentItem(group)
+                                item.setParentItem(group)
+                                group.setZValue(float(z))
+                                return group, diag
+                            except Exception:
+                                return item, diag
+                        return item, diag
+            except Exception as e:
+                diag.update({'error': str(e), 'error_type': type(e).__name__})
+                # Fall through to the legacy skin/rect path for resilience.
         pm, diag = self._maker_preview_build_window_pixmap(width, height, opacity=opacity, profile=profile)
         if pm is not None and not pm.isNull():
             item = QGraphicsPixmapItem(pm)
@@ -4055,6 +5149,48 @@ class MainWindowProjectPagesMixin:
         return rect, diag
 
     def _maker_preview_picture_asset_path(self, name):
+        """Cached picture asset resolver with timing diagnostics."""
+        t0 = perf_counter()
+        raw = str(name or "").strip().replace("\\", "/")
+        try:
+            root = self._maker_preview_project_root()
+            root_key = str(root.resolve()) if root is not None else ""
+        except Exception:
+            root_key = ""
+        cache = getattr(self, "_maker_preview_asset_resolve_cache", None)
+        if not isinstance(cache, dict) or cache.get("root") != root_key:
+            cache = {"root": root_key, "items": {}}
+            self._maker_preview_asset_resolve_cache = cache
+        items = cache.setdefault("items", {})
+        key = raw
+        if key in items:
+            rec = items.get(key) or {}
+            resolved = str(rec.get("resolved") or "")
+            diag = dict(rec.get("diag") or {})
+            diag["cache"] = "hit"
+            if self._maker_preview_bulk_perf_suppressed():
+                self._maker_preview_bulk_perf_count("asset_cache_hits")
+            else:
+                perf_log_elapsed(self, "PERF_ASSET_RESOLVE", t0, raw=raw, cache="hit", resolved=resolved)
+            return (Path(resolved) if resolved else None), diag
+        path, diag = self._maker_preview_picture_asset_path_uncached(name)
+        resolved = str(path) if path else ""
+        try:
+            items[key] = {"resolved": resolved, "diag": dict(diag or {})}
+            if len(items) > 2048:
+                for old_key in list(items.keys())[:256]:
+                    items.pop(old_key, None)
+        except Exception:
+            pass
+        if self._maker_preview_bulk_perf_suppressed():
+            self._maker_preview_bulk_perf_count("asset_cache_misses")
+            if not resolved:
+                self._maker_preview_bulk_perf_count("asset_not_found")
+        else:
+            perf_log_elapsed(self, "PERF_ASSET_RESOLVE", t0, raw=raw, cache="miss", resolved=resolved, found_by=str((diag or {}).get("found_by") or ""))
+        return path, diag
+
+    def _maker_preview_picture_asset_path_uncached(self, name):
         root = self._maker_preview_project_root()
         raw = str(name or "").strip().replace("\\", "/")
         if not raw:
@@ -4067,8 +5203,7 @@ class MainWindowProjectPagesMixin:
             raw_variants = [raw]
         # RPG Maker picture command omits extension.  Keep the exact filename
         # first, then try common image extensions.  Some deployed titles may keep
-        # encrypted .rpgmvp files; we still report those clearly even though Qt
-        # cannot render them without game-side decryption.
+        # encrypted .png_/.rpgmvp files; the shared image preparer decrypts them.
         exts = (".png", ".PNG", ".png_", ".PNG_", ".jpg", ".jpg_", ".jpeg", ".jpeg_", ".webp", ".webp_", ".bmp", ".bmp_", ".rpgmvp", ".rpgmvp_")
         base_names = []
         for rv in raw_variants:
@@ -4082,9 +5217,20 @@ class MainWindowProjectPagesMixin:
         seen_names = set()
         base_names = [x for x in base_names if not (x.lower() in seen_names or seen_names.add(x.lower()))]
         if root is not None:
+            # PATCH: image ZIPs are often unpacked either as img/pictures or as
+            # pictures directly under the imported game root.  Also support the
+            # current project root because patched/hand-made test workspaces may
+            # keep resources there.
+            resolved = self._maker_preview_resolved_project_paths()
+            content_root = Path(resolved.get("content_root") or (root / "maker_game"))
+            game_root = Path(resolved.get("game_root") or (root / "maker_game"))
             direct_dirs = (
-                root / "maker_game" / "img" / "pictures",
-                root / "maker_game" / "www" / "img" / "pictures",
+                content_root / "img" / "pictures",
+                content_root / "pictures",
+                game_root / "img" / "pictures",
+                game_root / "pictures",
+                root / "img" / "pictures",
+                root / "pictures",
             )
             for base in direct_dirs:
                 for bn in base_names:
@@ -4106,15 +5252,29 @@ class MainWindowProjectPagesMixin:
                                 return rpath, {"raw": raw, "resolved": str(rpath) if rpath else "", "source_resolved": str(f.resolve()), "checked": checked, "found_by": "case_insensitive_pictures_scan", "asset": rdiag}
                 except Exception:
                     pass
-            # Last-resort recursive scan under img.  This catches projects that
-            # put pictures in subfolders or copy assets with different casing.
+            # Last-resort recursive scan under likely resource roots.  This catches
+            # TRP_SkitMZ bust folders such as pictures/busts/<actor>/<pose>.
             try:
                 wanted_stems = {Path(x).stem.lower() for x in base_names}
                 wanted_names = {Path(x).name.lower() for x in base_names}
                 allowed_exts = {e.lower() for e in exts}
-                for img_root in (root / "maker_game" / "img", root / "maker_game" / "www" / "img"):
-                    if not img_root.is_dir():
+                scan_roots = (
+                    content_root / "img",
+                    content_root,
+                    game_root / "img",
+                    game_root,
+                    root / "img",
+                    root,
+                )
+                seen_roots = set()
+                for img_root in scan_roots:
+                    try:
+                        img_root = img_root.resolve()
+                    except Exception:
                         continue
+                    if str(img_root) in seen_roots or not img_root.is_dir():
+                        continue
+                    seen_roots.add(str(img_root))
                     # keep scans bounded; picture folders are normally small enough.
                     for f in img_root.rglob("*"):
                         try:
@@ -4123,14 +5283,889 @@ class MainWindowProjectPagesMixin:
                             lname = f.name.lower()
                             if lname in wanted_names or (f.stem.lower() in wanted_stems and f.suffix.lower() in allowed_exts):
                                 rpath, rdiag = self._maker_preview_prepare_image_asset(f.resolve(), category="pictures")
-                                return rpath, {"raw": raw, "resolved": str(rpath) if rpath else "", "source_resolved": str(f.resolve()), "checked": checked, "found_by": "recursive_img_scan", "asset": rdiag}
+                                return rpath, {"raw": raw, "resolved": str(rpath) if rpath else "", "source_resolved": str(f.resolve()), "checked": checked, "found_by": "recursive_resource_scan", "asset": rdiag}
                         except Exception:
                             continue
             except Exception as e:
                 checked.append(f"recursive_scan_error:{e}")
         return None, {"raw": raw, "checked": checked, "found_by": "not_found"}
 
-    def _maker_preview_collect_picture_state_for_row(self, row, page=None):
+    def _maker_preview_plugins_js_data(self):
+        try:
+            root = self._maker_preview_project_root()
+            if root is None:
+                return []
+            cache_key = str(root.resolve())
+            cache = getattr(self, "_maker_preview_plugins_js_cache", None)
+            if isinstance(cache, dict) and cache.get("root") == cache_key:
+                return cache.get("plugins") or []
+            resolved = self._maker_preview_resolved_project_paths()
+            candidates = (
+                Path(resolved.get("js_dir") or (root / "maker_game" / "js")) / "plugins.js",
+                Path(resolved.get("content_root") or (root / "maker_game")) / "js" / "plugins.js",
+                root / "js" / "plugins.js",
+            )
+            text = ""
+            for p in candidates:
+                try:
+                    if p.is_file():
+                        text = p.read_text(encoding="utf-8-sig", errors="ignore")
+                        break
+                except Exception:
+                    continue
+            plugins = []
+            if text:
+                import re as _re
+                m = _re.search(r"var\s+\$plugins\s*=\s*(\[.*\])\s*;", text, _re.S)
+                if m:
+                    try:
+                        plugins = json.loads(m.group(1))
+                    except Exception:
+                        plugins = []
+            self._maker_preview_plugins_js_cache = {"root": cache_key, "plugins": plugins}
+            return plugins
+        except Exception:
+            return []
+
+    def _maker_preview_plugin_parameters(self, plugin_name):
+        try:
+            name = str(plugin_name or "").strip().lower()
+            for p in self._maker_preview_plugins_js_data() or []:
+                if isinstance(p, dict) and str(p.get("name") or "").strip().lower() == name:
+                    return p.get("parameters") if isinstance(p.get("parameters"), dict) else {}
+        except Exception:
+            pass
+        return {}
+
+    def _maker_preview_window_back_image_configs(self):
+        """Return WindowBackImage plugin configs keyed by WindowClass.
+
+        The plugin stores a JSON array of JSON strings.  Keep parsing isolated
+        here so scene preview code can treat message/name/choice windows as
+        ordinary image layers loaded from the game data instead of editor-side
+        hardcoded rectangles.
+        """
+        try:
+            cache = getattr(self, '_maker_preview_window_back_image_cache', None)
+            root = self._maker_preview_project_root()
+            cache_key = str(root.resolve()) if root is not None else ''
+            if isinstance(cache, dict) and cache.get('root') == cache_key:
+                return cache.get('configs') or {}
+            params = self._maker_preview_plugin_parameters('WindowBackImage')
+            raw_list = params.get('windowImageInfo') or '[]'
+            try:
+                arr = json.loads(raw_list) if isinstance(raw_list, str) else raw_list
+            except Exception:
+                arr = []
+            configs = {}
+            if isinstance(arr, list):
+                for raw in arr:
+                    try:
+                        obj = json.loads(raw) if isinstance(raw, str) else raw
+                        if not isinstance(obj, dict):
+                            continue
+                        key = str(obj.get('WindowClass') or '').strip()
+                        if key:
+                            configs[key.lower()] = obj
+                    except Exception:
+                        continue
+            self._maker_preview_window_back_image_cache = {'root': cache_key, 'configs': configs}
+            return configs
+        except Exception:
+            return {}
+
+    def _maker_preview_window_back_image_config(self, window_class):
+        try:
+            return (self._maker_preview_window_back_image_configs() or {}).get(str(window_class or '').strip().lower()) or {}
+        except Exception:
+            return {}
+
+    def _maker_preview_plugin_json_param(self, plugin_name, param_name, default=None):
+        """Parse a JSON-valued plugin parameter safely.
+
+        Many MZ plugins store objects as JSON strings inside plugins.js.  Scene
+        preview should read those values directly instead of using editor-side
+        constants whenever possible.
+        """
+        try:
+            params = self._maker_preview_plugin_parameters(plugin_name)
+            raw = params.get(param_name) if isinstance(params, dict) else None
+            if raw is None or raw == "":
+                return default
+            return json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            return default
+
+    def _maker_preview_mpp_message_default_config(self):
+        try:
+            obj = self._maker_preview_plugin_json_param("MPP_MessageEX", "Default", {})
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+
+    def _maker_preview_mpp_name_window_config(self):
+        try:
+            obj = self._maker_preview_plugin_json_param("MPP_MessageEX_Op1", "Name Window", {})
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+
+    def _maker_preview_mpp_choice_config(self):
+        try:
+            params = self._maker_preview_plugin_parameters("MPP_ChoiceEX")
+            if not isinstance(params, dict):
+                return {}
+            out = {}
+            try:
+                out["max_page_row"] = int(params.get("Max Page Row") or 0)
+            except Exception:
+                pass
+            out["disabled_position"] = str(params.get("Disabled Position") or "")
+            return out
+        except Exception:
+            return {}
+
+    def _maker_preview_layer_z(self, role, *, order=0):
+        """Centralize preview z roles instead of scattering magic numbers.
+
+        The values are still editor-internal, but every call now uses semantic
+        roles.  Plugin/command data decides what goes into each role; this table
+        only keeps the review UI readable.
+        """
+        base = {
+            "map_marker": 98000,
+            "picture": 99000,
+            "standing": 99100,
+            "message_window": 100000,
+            "name_window": 100002,
+            "message_text": 100006,
+            "choice_window": 100020,
+            "choice_cursor": 100022,
+            "choice_text": 100024,
+            "debug": 110000,
+        }.get(str(role or ""), 100000)
+        try:
+            return float(base) + float(order or 0)
+        except Exception:
+            return float(base)
+
+    def _maker_preview_trim_transparent_pixmap(self, pm):
+        diag = {'trimmed': False}
+        try:
+            if pm is None or pm.isNull():
+                diag['reason'] = 'pixmap_null'
+                return pm, diag
+            img = pm.toImage()
+            if img is None or img.isNull() or not img.hasAlphaChannel():
+                diag['reason'] = 'no_alpha_channel'
+                return pm, diag
+            w = int(img.width())
+            h = int(img.height())
+            left = w
+            top = h
+            right = -1
+            bottom = -1
+            alpha_threshold = 3
+            for yy in range(h):
+                for xx in range(w):
+                    try:
+                        if img.pixelColor(xx, yy).alpha() > alpha_threshold:
+                            if xx < left:
+                                left = xx
+                            if yy < top:
+                                top = yy
+                            if xx > right:
+                                right = xx
+                            if yy > bottom:
+                                bottom = yy
+                    except Exception:
+                        continue
+            if right < left or bottom < top:
+                diag['reason'] = 'fully_transparent'
+                return pm, diag
+            rect = QRect(left, top, right - left + 1, bottom - top + 1)
+            if rect.x() == 0 and rect.y() == 0 and rect.width() == w and rect.height() == h:
+                diag.update({'reason': 'already_tight', 'bounds': [0, 0, w, h]})
+                return pm, diag
+            cropped = pm.copy(rect)
+            if cropped is not None and not cropped.isNull():
+                diag.update({'trimmed': True, 'bounds': [rect.x(), rect.y(), rect.width(), rect.height()]})
+                return cropped, diag
+        except Exception as e:
+            diag.update({'error': str(e), 'error_type': type(e).__name__})
+        return pm, diag
+
+    def _maker_preview_trp_skit_actor_config(self):
+        """Shared TRP actor config used by both scene preview and profiles."""
+        try:
+            cache = getattr(self, "_maker_preview_trp_skit_actor_cache", None)
+            root = self._maker_preview_project_root()
+            cache_key = str(root.resolve()) if root is not None else ""
+            if isinstance(cache, dict) and cache.get("root") == cache_key:
+                return cache.get("actors") or {}
+            if root is None:
+                return {}
+            paths = maker_project_paths(root)
+            actors = load_maker_trp_skit_actor_config(paths.get("game_root"), paths.get("engine"))
+            self._maker_preview_trp_skit_actor_cache = {"root": cache_key, "actors": actors}
+            return actors
+        except Exception:
+            return {}
+
+    def _maker_preview_trp_skit_display_config(self):
+        """Shared TRP display settings used by preview/profile state parsing."""
+        try:
+            cache = getattr(self, "_maker_preview_trp_skit_display_cache", None)
+            root = self._maker_preview_project_root()
+            cache_key = str(root.resolve()) if root is not None else ""
+            if isinstance(cache, dict) and cache.get("root") == cache_key:
+                return cache.get("config") or {}
+            if root is None:
+                return {"busts_scale": 100.0, "base_offset_y": 0.0, "positions": {}}
+            paths = maker_project_paths(root)
+            config = load_maker_trp_skit_display_config(paths.get("game_root"), paths.get("engine"))
+            self._maker_preview_trp_skit_display_cache = {"root": cache_key, "config": config}
+            return config
+        except Exception:
+            return {"busts_scale": 100.0, "base_offset_y": 0.0, "positions": {}}
+
+    def _maker_preview_trp_skit_asset_path(self, actor_key, pose=None, expression=None):
+        """Compatibility wrapper: return the best single TRP_SkitMZ asset.
+
+        PATCH: static scene composer.
+        Older preview code treated ``pose_expression`` as a complete standing
+        bust.  In many TRP_SkitMZ projects it is only an expression overlay and
+        must be drawn over ``pose``.  New callers should use
+        _maker_preview_trp_skit_layer_asset_paths(); this wrapper keeps legacy
+        call sites safe by preferring the base pose image.
+        """
+        try:
+            layers = self._maker_preview_trp_skit_layer_asset_paths(actor_key, pose, expression)
+            base_path = layers.get("base_path")
+            overlay_path = layers.get("overlay_path")
+            chosen = base_path or overlay_path
+            return chosen, {**layers.get("diag", {}), "chosen_role": "base" if base_path else "overlay" if overlay_path else "missing"}
+        except Exception as e:
+            return None, {"actor_key": actor_key, "pose": pose, "expression": expression, "error": str(e), "error_type": type(e).__name__}
+
+    def _maker_preview_trp_skit_layer_asset_paths(self, actor_key, pose=None, expression=None):
+        """Resolve TRP_SkitMZ standing bust as composited preview layers.
+
+        TRP_SkitMZ commonly stores a full body/pose image as:
+            pictures/busts/<actor>/<pose>.png_
+        and a transparent expression overlay as:
+            pictures/busts/<actor>/<pose>_<expression>.png_
+
+        The translation preview must draw both in the same normalized position.
+        If either layer is missing, keep the other visible and report the miss in
+        diagnostics instead of dropping the whole preview.
+        """
+        result = {"base_path": None, "overlay_path": None, "diag": {}}
+        try:
+            actors = self._maker_preview_trp_skit_actor_config()
+            spec = maker_trp_skit_layer_spec(actor_key, pose, expression, actors_cfg=actors)
+            cfg = spec.get("config") or {}
+            file_name = str(spec.get("file_name") or actor_key or "").strip()
+            pose = str(spec.get("pose") or "normal").strip()
+            requested_expression = str(spec.get("requested_expression") or "default").strip()
+            expression = str(spec.get("normalized_expression") or "default").strip()
+            pose_info = spec.get("pose_info") or {}
+            numeric_expression_token = str(spec.get("numeric_expression_token") or "")
+            base_candidates = list(spec.get("base_candidates") or [])
+            overlay_candidates = list(spec.get("overlay_candidates") or [])
+            fallback_candidates = list(spec.get("fallback_candidates") or [])
+
+            base_path = None
+            base_diag = {"reason": "not_checked"}
+            for cand in base_candidates:
+                path, diag = self._maker_preview_picture_asset_path(cand)
+                if path:
+                    base_path, base_diag = path, {"candidate": cand, "asset": diag}
+                    break
+                base_diag = {"candidate": cand, "asset": diag, "reason": "not_found"}
+
+            overlay_path = None
+            overlay_diag = {"reason": "not_checked"}
+            resolved_expression = expression
+            for cand in overlay_candidates:
+                path, diag = self._maker_preview_picture_asset_path(cand)
+                if path:
+                    overlay_path, overlay_diag = path, {"candidate": cand, "asset": diag}
+                    break
+                overlay_diag = {"candidate": cand, "asset": diag, "reason": "not_found"}
+
+            # Numeric/control-like tokens in TRP pose commands are commonly
+            # transition durations (15/20/30/45/60), not expression filenames.
+            # If the requested overlay is absent, fall back to the actor's
+            # default expression layer instead of rendering a faceless base.
+            expression_fallback = ({
+                "from": numeric_expression_token,
+                "to": expression,
+                "reason": "numeric_transition_token",
+            } if numeric_expression_token else None)
+            if base_path and not overlay_path and expression:
+                import re as _re
+                token = str(expression or "").strip()
+                default_expr = str(
+                    pose_info.get("defaultExpression")
+                    or pose_info.get("defaultExp")
+                    or "default"
+                ).strip()
+                should_try_default = bool(
+                    token.lower() != default_expr.lower()
+                    and (_re.fullmatch(r"[+-]?\d+(?:\.\d+)?", token) or overlay_diag.get("reason") == "not_found")
+                )
+                if should_try_default and default_expr:
+                    default_candidate = f"busts/{file_name}/{pose}_{default_expr}"
+                    default_path, default_diag = self._maker_preview_picture_asset_path(default_candidate)
+                    if default_path:
+                        overlay_path = default_path
+                        resolved_expression = default_expr
+                        expression_fallback = {
+                            "from": token,
+                            "to": default_expr,
+                            "candidate": default_candidate,
+                            "asset": default_diag,
+                        }
+
+            fallback_path = None
+            fallback_diag = {"reason": "not_checked"}
+            if not base_path and not overlay_path:
+                for cand in fallback_candidates:
+                    path, diag = self._maker_preview_picture_asset_path(cand)
+                    if path:
+                        fallback_path, fallback_diag = path, {"candidate": cand, "asset": diag}
+                        break
+                    fallback_diag = {"candidate": cand, "asset": diag, "reason": "not_found"}
+
+            result.update({
+                "base_path": base_path or fallback_path,
+                "overlay_path": overlay_path if base_path else None,
+                "diag": {
+                    "actor_key": actor_key,
+                    "file_name": file_name,
+                    "pose": pose,
+                    "expression": requested_expression,
+                    "normalized_expression": expression,
+                    "resolved_expression": resolved_expression,
+                    "expression_fallback": expression_fallback,
+                    "pose_info": pose_info,
+                    "base": base_diag,
+                    "overlay": overlay_diag,
+                    "fallback": fallback_diag,
+                    "composition": "base_plus_expression_overlay" if base_path and overlay_path else ("base_only" if base_path else "fallback_or_overlay_only" if fallback_path else "missing"),
+                },
+            })
+            return result
+        except Exception as e:
+            result["diag"] = {"actor_key": actor_key, "pose": pose, "expression": expression, "error": str(e), "error_type": type(e).__name__}
+            return result
+
+    def _maker_preview_skit_position_xy(self, position, *, image_width=0, image_height=0):
+        pos = str(position or "").strip().lower()
+        # TRP_Skit projects usually use MZ screen-space coordinates.  These are
+        # intentionally approximate: preview should make the speaker visible for
+        # translation, not reproduce every easing frame.
+        if pos in ("left", "l"):
+            return -80, 0
+        if pos in ("right", "r"):
+            return 760, 0
+        if pos in ("center", "c", "def", "d", ""):
+            return 340, 0
+        try:
+            return float(pos), 0
+        except Exception:
+            return 340, 0
+
+    def _maker_preview_trp_position_ratio(self, position, *, positions=None):
+        return maker_trp_position_ratio(position, positions=positions)
+
+    def _maker_preview_parse_trp_skit_command(self, line, actors_cfg, positions):
+        return parse_maker_trp_skit_command(line, actors_cfg, positions)
+
+    def _maker_preview_collect_trp_skit_state_from_commands(self, commands, command_index):
+        diag = {"enabled": False, "reason": "not_used", "pictures": []}
+        try:
+            actors_cfg = self._maker_preview_trp_skit_actor_config()
+            if not actors_cfg:
+                diag["reason"] = "trp_skit_config_missing"
+                return [], diag
+            states = {}
+            used = False
+            display_cfg = self._maker_preview_trp_skit_display_config()
+            configured_positions = display_cfg.get("positions") or {}
+            show_sequence = 0
+
+            def get_state(name):
+                key = str(name or "").replace("\\PX[160]", "").strip().lower()
+                cfg = actors_cfg.get(key) or {
+                    "fileName": str(name or "").strip(),
+                    "defaultPose": "normal",
+                    "defaultPosition": "center",
+                }
+                st = states.get(key)
+                if not isinstance(st, dict):
+                    st = {
+                        "key": key,
+                        "actor": str(name or "").replace("\\PX[160]", "").strip(),
+                        "instance_key": f"trp_actor:{key}",
+                        "pose": cfg.get("defaultPose") or "normal",
+                        "expression": "default",
+                        "visible": False,
+                        "position": cfg.get("defaultPosition") or "center",
+                        "opacity": 255,
+                        "show_sequence": -1,
+                        "source_command_index": -1,
+                    }
+                    states[key] = st
+                return st
+
+            def occupy_position(actor_key, position, *, explicit=False):
+                """One visible actor per explicit TRP position slot.
+
+                Showing another actor in the same named slot replaces the previous
+                occupant, while actors in different slots remain visible together.
+                """
+                ratio = self._maker_preview_trp_position_ratio(position, positions=configured_positions)
+                if ratio is None or not explicit:
+                    return
+                for other_key, other in states.items():
+                    if other_key == actor_key or not other.get("visible"):
+                        continue
+                    other_ratio = self._maker_preview_trp_position_ratio(other.get("position"), positions=configured_positions)
+                    if other_ratio is not None and abs(float(other_ratio) - float(ratio)) < 0.001:
+                        other["visible"] = False
+                        other["replaced_by"] = actor_key
+            for idx, cmd in enumerate(commands or []):
+                if idx > int(command_index or 0):
+                    break
+                if not isinstance(cmd, dict):
+                    continue
+                code = int(cmd.get("code") or 0)
+                if code in (101, 401):
+                    # TRP_SkitMZ lets dialogue control codes such as \SE[default]
+                    # change the current speaker expression.  For static preview,
+                    # apply it to the speaker if the name maps to a skit actor.
+                    try:
+                        params = cmd.get("parameters") or []
+                        speaker = ""
+                        if code == 101 and len(params) >= 5:
+                            speaker = str(params[4] or "").replace("\\PX[160]", "").strip()
+                            current_skit_speaker = speaker
+                        elif code == 401:
+                            speaker = locals().get("current_skit_speaker", "")
+                        if speaker:
+                            key = speaker.lower()
+                            if key in actors_cfg:
+                                import re
+                                for m in re.finditer(r"\\SE\[([^\]]+)\]", " ".join(map(str, params))):
+                                    expr = str(m.group(1) or "").strip()
+                                    if expr:
+                                        st = get_state(speaker)
+                                        st["expression"] = expr
+                                        if st.get("visible") is not False:
+                                            st["visible"] = True
+                    except Exception:
+                        pass
+                    continue
+                if code not in (355, 655):
+                    continue
+                for raw_line in (cmd.get("parameters") or []):
+                    line = str(raw_line or "").strip()
+                    if not line.lower().startswith("skit"):
+                        continue
+                    used = True
+                    parsed = self._maker_preview_parse_trp_skit_command(line, actors_cfg, configured_positions)
+                    parts = parsed.get("parts") or []
+                    op = str(parsed.get("op") or "").lower()
+                    actor = str(parsed.get("actor") or "").strip()
+                    actor_idx = int(parsed.get("actor_index") or -1)
+                    if not op:
+                        continue
+                    if op in ("start",):
+                        continue
+                    if op in ("end", "clear"):
+                        states.clear()
+                        continue
+                    if op in ("hide", "fadeout") and actor:
+                        st = get_state(actor)
+                        st["visible"] = False
+                        st["source_command_index"] = idx
+                        continue
+                    if op == "pose" and actor:
+                        st = get_state(actor)
+                        cfg = actors_cfg.get(str(actor).replace("\\PX[160]", "").lower()) or {}
+                        pose_names = {str(x).lower(): str(x) for x in (cfg.get("poses") or [])}
+                        tail = parts[actor_idx + 1:] if actor_idx >= 0 else []
+                        pose_token = next((pose_names[str(x).lower()] for x in tail if str(x).lower() in pose_names), "")
+                        if not pose_token and tail:
+                            pose_token = str(tail[-1])
+                        if pose_token:
+                            st["pose"] = pose_token
+                        # Extra numeric arguments on a pose command are normally
+                        # transition duration/easing values, not expression names.
+                        # Keep the previous expression unless a non-numeric token
+                        # remains after removing the selected pose and position.
+                        import re as _re
+                        candidate_tokens = []
+                        for raw_token in tail:
+                            token = str(raw_token or "").strip()
+                            if not token or (pose_token and token.lower() == str(pose_token).lower()):
+                                continue
+                            if self._maker_preview_trp_position_ratio(token, positions=configured_positions) is not None:
+                                continue
+                            if _re.fullmatch(r"[+-]?\d+(?:\.\d+)?", token):
+                                continue
+                            if token.lower() in {"true", "false", "wait", "nowait", "linear", "easein", "easeout", "easeinout"}:
+                                continue
+                            candidate_tokens.append(token)
+                        if candidate_tokens:
+                            st["expression"] = candidate_tokens[-1]
+                        st["source_command_index"] = idx
+                        continue
+                    if op in ("exp", "expression") and actor:
+                        st = get_state(actor)
+                        tail = parts[actor_idx + 1:] if actor_idx >= 0 else []
+                        if tail:
+                            st["expression"] = str(tail[-1])
+                        st["source_command_index"] = idx
+                        continue
+                    if op in ("fadein", "show") and actor:
+                        show_sequence += 1
+                        st = get_state(actor)
+                        if parsed.get("explicit_position"):
+                            st["position"] = parsed.get("position")
+                        occupy_position(st.get("key"), st.get("position"), explicit=bool(parsed.get("explicit_position")))
+                        st["visible"] = True
+                        st["show_sequence"] = show_sequence
+                        st["source_command_index"] = idx
+                        continue
+                    if op == "move" and actor:
+                        st = get_state(actor)
+                        if parsed.get("explicit_position"):
+                            st["position"] = parsed.get("position")
+                            occupy_position(st.get("key"), st.get("position"), explicit=True)
+                        st["source_command_index"] = idx
+                        continue
+                    # focus/unFocus/name/shake do not change the static asset.
+            pics = []
+            order = 0
+            composition_diags = []
+            for key, st in states.items():
+                if not st.get("visible"):
+                    continue
+                layer_info = self._maker_preview_trp_skit_layer_asset_paths(st.get("actor"), st.get("pose"), st.get("expression"))
+                pdiag = (layer_info or {}).get("diag") or {}
+                composition_diags.append(pdiag)
+                x, y = self._maker_preview_skit_position_xy(st.get("position"))
+                bust_scale = float(display_cfg.get("busts_scale") or 100.0)
+                pos_key = str(st.get("position") or "").strip().lower()
+                pos_ratio = self._maker_preview_trp_position_ratio(pos_key, positions=configured_positions)
+                pose_offset_y = 0.0
+                try:
+                    pose_offset_y = float(((pdiag or {}).get("pose_info") or {}).get("displayOffsetY") or 0.0)
+                except Exception:
+                    pose_offset_y = 0.0
+                instance_key = str(st.get("instance_key") or f"trp_actor:{key}")
+                group_id = f"TRP_Skit:{instance_key}:{st.get('pose')}"
+
+                def add_layer(role, path, z_offset):
+                    if not path:
+                        return
+                    pics.append({
+                        "id": 91000 + order * 10 + z_offset,
+                        "name": f"TRP_Skit:{st.get('actor')}:{st.get('pose')}:{st.get('expression')}:{role}",
+                        "origin": 0, "x": x, "y": y,
+                        "scale_x": bust_scale, "scale_y": bust_scale, "opacity": st.get("opacity") or 255, "blend_mode": 0,
+                        "path": str(path), "path_diag": pdiag, "command_index": command_index,
+                        "preview_source": "TRP_SkitMZ_static_composited",
+                        "preview_layout": "trp_skit_runtime_position",
+                        "preview_composite_group": group_id,
+                        "preview_layer_role": role,
+                        "trp_actor_key": str(st.get("key") or key),
+                        "trp_instance_key": instance_key,
+                        "trp_show_sequence": int(st.get("show_sequence") or 0),
+                        "trp_source_command_index": int(st.get("source_command_index") or command_index),
+                        "preview_layer_order": z_offset,
+                        "trp_position": st.get("position"),
+                        "trp_position_ratio": pos_ratio,
+                        "trp_pose_display_offset_y": pose_offset_y,
+                        "trp_base_offset_y": float(display_cfg.get("base_offset_y") or 0.0),
+                    })
+
+                add_layer("base_pose", (layer_info or {}).get("base_path"), 0)
+                add_layer("expression_overlay", (layer_info or {}).get("overlay_path"), 1)
+                order += 1
+            diag.update({"enabled": bool(used), "reason": "ok" if used else "not_used", "pictures": pics, "compositions": composition_diags})
+            return pics, diag
+        except Exception as e:
+            diag.update({"enabled": False, "reason": "error", "error": str(e), "error_type": type(e).__name__})
+            return [], diag
+
+    def _maker_preview_collect_cbr_status_images_from_commands(self, commands, command_index):
+        diag = {"enabled": False, "reason": "not_used", "pictures": []}
+        try:
+            blocks = []
+            cur = None
+            used = False
+            def finish():
+                nonlocal cur
+                if isinstance(cur, dict) and str(cur.get("name") or "").strip():
+                    blocks.append(cur)
+                cur = None
+            for idx, cmd in enumerate(commands or []):
+                if idx > int(command_index or 0):
+                    break
+                if not isinstance(cmd, dict):
+                    continue
+                if int(cmd.get("code") or 0) not in (355, 655):
+                    continue
+                for raw_line in (cmd.get("parameters") or []):
+                    line = str(raw_line or "").strip()
+                    if not line:
+                        continue
+                    if line.startswith("CBR-"):
+                        used = True
+                        finish()
+                        cur = {"x": 0, "y": 0, "scale_x": 100, "scale_y": 100, "opacity": 255, "source_index": idx}
+                        continue
+                    if cur is None:
+                        continue
+                    if line.startswith("画像-"):
+                        cur["name"] = line.split("-", 1)[1].strip()
+                    elif line.startswith("x-"):
+                        try: cur["x"] = float(line.split("-", 1)[1] or 0)
+                        except Exception: pass
+                    elif line.startswith("y-"):
+                        try: cur["y"] = float(line.split("-", 1)[1] or 0)
+                        except Exception: pass
+                    elif line.startswith("透明度-"):
+                        try: cur["opacity"] = max(0, min(255, float(line.split("-", 1)[1] or 100) * 2.55))
+                        except Exception: pass
+                    elif line.startswith("サイズ-"):
+                        try:
+                            sc = float(line.split("-", 1)[1] or 100)
+                            cur["scale_x"] = sc
+                            cur["scale_y"] = sc
+                        except Exception:
+                            pass
+            finish()
+            pics = []
+            for i, b in enumerate(blocks):
+                name = str(b.get("name") or "").strip()
+                path, pdiag = self._maker_preview_picture_asset_path(name)
+                pics.append({
+                    "id": 92000 + i, "name": f"CBR_Status:{name}", "origin": 0,
+                    "x": b.get("x") or 0, "y": b.get("y") or 0,
+                    "scale_x": b.get("scale_x") or 100, "scale_y": b.get("scale_y") or 100,
+                    "opacity": b.get("opacity") or 255, "blend_mode": 0,
+                    "path": str(path) if path else "", "path_diag": pdiag, "command_index": b.get("source_index") or command_index,
+                    "preview_source": "CBR_EroStatus_static",
+                })
+            diag.update({"enabled": bool(used), "reason": "ok" if used else "not_used", "pictures": pics})
+            return pics, diag
+        except Exception as e:
+            diag.update({"enabled": False, "reason": "error", "error": str(e), "error_type": type(e).__name__})
+            return [], diag
+
+    def _maker_preview_collect_generic_plugin_image_layers_from_commands(self, commands, command_index):
+        """Best-effort static image extraction from plugin commands/scripts.
+
+        PATCH: static scene composer.
+        This is intentionally conservative.  It does not execute arbitrary JS or
+        plugin code; it only converts explicit image-like arguments into preview
+        layers.  Plugin-specific adapters (TRP_SkitMZ, CBR_EroStatus, Show
+        Picture) remain more authoritative and are allowed to add richer layer
+        composition data.
+        """
+        diag = {"enabled": False, "reason": "not_used", "pictures": []}
+        try:
+            import re
+            used = False
+            pics = []
+            seen = set()
+
+            image_key_tokens = (
+                "image", "img", "picture", "pic", "file", "filename", "background", "back", "bust", "face", "sprite", "portrait",
+                "画像", "ピクチャ", "背景", "立ち絵", "顔", "ファイル",
+            )
+            path_prefixes = (
+                "pictures/", "picture/", "busts/", "system/", "characters/", "faces/", "parallaxes/", "battlebacks1/", "battlebacks2/",
+                "sv_actors/", "sv_enemies/", "enemies/", "animations/", "titles1/", "titles2/",
+            )
+            image_exts = (".png", ".png_", ".jpg", ".jpg_", ".jpeg", ".jpeg_", ".webp", ".webp_", ".bmp", ".bmp_", ".rpgmvp", ".rpgmvp_")
+
+            def key_suggests_image(key_path):
+                low = str(key_path or "").lower()
+                return any(tok.lower() in low for tok in image_key_tokens)
+
+            def clean_asset_value(value):
+                s = str(value or "").strip()
+                if not s:
+                    return ""
+                # Strip JS/JSON quotes and RPG Maker percent escape wrappers that
+                # occasionally survive in plugin arguments.
+                s = s.strip().strip('"').strip("'").strip()
+                s = s.replace("\\/", "/").replace("\\\\", "/").replace("\\", "/")
+                stripped = s.strip()
+                # PATCH: effect/config JSON is not an image path.  Some plugins
+                # store glow/filter configs as JSON strings under image-looking
+                # argument names; recursively resolving those caused 600ms+
+                # preview spikes.
+                if stripped.startswith(("{", "[")) or stripped.endswith(("}", "]")):
+                    return ""
+                if re.search(r"[\{\[]\s*[/\"]?(type|value|strength|color1|color2|knockout|opacity|blend)[/\"]?\s*:", stripped, re.I):
+                    return ""
+                # Drop common runtime-variable expressions.  They cannot be
+                # resolved safely by a static previewer.
+                if any(x in s for x in ("$game", "this.", "function", "=>", "+", "${")):
+                    return ""
+                return s
+
+            def value_suggests_asset(value, key_path=""):
+                s = clean_asset_value(value)
+                if not s or len(s) > 180:
+                    return False
+                low = s.lower()
+                if low in {"true", "false", "null", "undefined", "none"}:
+                    return False
+                if low.startswith(("#", "rgba(", "rgb(", "hsl(")):
+                    return False
+                if any(tok in low for tok in ("glow", "filter", "outline", "shadow", "strength", "knockout")) and not any(low.endswith(ext) for ext in image_exts):
+                    return False
+                try:
+                    float(s)
+                    return False
+                except Exception:
+                    pass
+                if any(low.endswith(ext) for ext in image_exts):
+                    return True
+                if any(low.startswith(pref) for pref in path_prefixes):
+                    return True
+                if "/" in low and not low.startswith(("http://", "https://")):
+                    return True
+                return bool(key_suggests_image(key_path) and not re.search(r"\s", s))
+
+            def iter_values(obj, key_path=""):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        kp = f"{key_path}.{k}" if key_path else str(k)
+                        yield from iter_values(v, kp)
+                elif isinstance(obj, (list, tuple)):
+                    for i, v in enumerate(obj):
+                        yield from iter_values(v, f"{key_path}[{i}]")
+                else:
+                    yield key_path, obj
+
+            def parse_float_arg(args, *names, default=0.0):
+                try:
+                    if not isinstance(args, dict):
+                        return float(default)
+                    lows = {str(k).lower(): v for k, v in args.items()}
+                    for name in names:
+                        if str(name).lower() in lows:
+                            return float(str(lows[str(name).lower()]).strip() or default)
+                except Exception:
+                    pass
+                return float(default)
+
+            def add_candidate(raw_name, *, source, source_index, args=None, x=None, y=None, scale_x=None, scale_y=None, opacity=None, origin=0):
+                nonlocal used
+                name = clean_asset_value(raw_name)
+                if not name:
+                    return
+                path, pdiag = self._maker_preview_picture_asset_path(name)
+                if not path:
+                    return
+                sig = (str(source), int(source_index or 0), str(path))
+                if sig in seen:
+                    return
+                seen.add(sig)
+                used = True
+                if x is None:
+                    x = parse_float_arg(args, "x", "X", "posX", "positionX", "left", default=0.0)
+                if y is None:
+                    y = parse_float_arg(args, "y", "Y", "posY", "positionY", "top", default=0.0)
+                if scale_x is None:
+                    scale_x = parse_float_arg(args, "scaleX", "scale", "size", "zoom", "拡大率", default=100.0)
+                if scale_y is None:
+                    scale_y = parse_float_arg(args, "scaleY", "scale", "size", "zoom", "拡大率", default=scale_x)
+                if opacity is None:
+                    opacity = parse_float_arg(args, "opacity", "alpha", "透明度", default=255.0)
+                    if 0.0 <= float(opacity) <= 100.0:
+                        opacity = float(opacity) * 2.55
+                pics.append({
+                    "id": 93000 + len(pics),
+                    "name": f"PluginImage:{source}:{name}",
+                    "origin": int(origin or 0),
+                    "x": float(x or 0), "y": float(y or 0),
+                    "scale_x": float(scale_x or 100), "scale_y": float(scale_y or 100),
+                    "opacity": max(0, min(255, float(opacity if opacity is not None else 255))),
+                    "blend_mode": 0,
+                    "path": str(path), "path_diag": pdiag, "command_index": source_index,
+                    "preview_source": "GenericPluginImage_static",
+                    "preview_layout": "plugin_image_visible_fit",
+                    "preview_layer_role": "plugin_image",
+                })
+
+            show_pic_re = re.compile(r"(?:showPicture|show_picture|ピクチャ表示|画像表示)\s*\(?\s*(\d+)?\s*,?\s*['\"]([^'\"]+)['\"]", re.I)
+            quoted_re = re.compile(r"['\"]([^'\"]+)['\"]")
+
+            for idx, cmd in enumerate(commands or []):
+                if idx > int(command_index or 0):
+                    break
+                if not isinstance(cmd, dict):
+                    continue
+                code = int(cmd.get("code") or 0)
+                params = cmd.get("parameters") or []
+                if code == 357 and isinstance(params, list) and len(params) >= 4:
+                    plugin_name = str(params[0] or "")
+                    command_name = str(params[1] or "")
+                    args = params[3] if isinstance(params[3], dict) else {}
+                    source = f"{plugin_name}.{command_name}".strip(".")
+                    for key_path, value in iter_values(args):
+                        if value_suggests_asset(value, key_path):
+                            add_candidate(value, source=source, source_index=idx, args=args)
+                    continue
+                if code not in (355, 655):
+                    continue
+                for raw_line in params:
+                    line = str(raw_line or "").strip()
+                    if not line or line.lower().startswith("skit") or line.startswith("CBR-") or line.startswith("画像-"):
+                        continue
+                    for m in show_pic_re.finditer(line):
+                        add_candidate(m.group(2), source="ScriptShowPicture", source_index=idx)
+                    # Last resort: quoted path-like strings only.  Do not treat
+                    # arbitrary quoted dialogue/style names as assets.
+                    for m in quoted_re.finditer(line):
+                        cand = m.group(1)
+                        if value_suggests_asset(cand, "script.path"):
+                            add_candidate(cand, source="ScriptImageLiteral", source_index=idx)
+
+            diag.update({"enabled": bool(used), "reason": "ok" if used else "not_used", "pictures": pics})
+            return pics, diag
+        except Exception as e:
+            diag.update({"enabled": False, "reason": "error", "error": str(e), "error_type": type(e).__name__})
+            return [], diag
+
+    def _maker_preview_collect_picture_state_for_row(self, *args, **kwargs):
+        _perf_t0 = perf_counter()
+        _perf_action_id = next_action_id("_maker_preview_collect_picture_state_for_row")
+        _perf_ok = False
+        try:
+            _res = self._perf_impl__maker_preview_collect_picture_state_for_row(*args, **kwargs)
+            _perf_ok = True
+            return _res
+        finally:
+            try:
+                if self._maker_preview_bulk_perf_suppressed():
+                    self._maker_preview_bulk_perf_count("picture_state_calls")
+                else:
+                    perf_log_elapsed(self, "PERF_MAKER_PREVIEW_STEP", _perf_t0, action="_maker_preview_collect_picture_state_for_row", action_id=_perf_action_id, ok=bool(_perf_ok), args_count=len(args), kwargs=','.join(sorted([str(k) for k in kwargs.keys()])))
+            except Exception:
+                pass
+
+    def _perf_impl__maker_preview_collect_picture_state_for_row(self, row, page=None):
         """Return Show Picture state at the selected text command.
 
         MZ visual-novel style scenes often stack multiple pictures (body layer,
@@ -4153,46 +6188,108 @@ class MainWindowProjectPagesMixin:
                 return [], diag
 
             source_kind = str(meta.get("source_kind") or "").strip().lower()
-            is_common_event = source_kind == "common_event" or map_file.lower() == "commonevents.json"
-            candidates = [
-                project_dir / "maker_game" / "data" / map_file,
-                project_dir / "maker_game" / "www" / "data" / map_file,
-            ]
-            map_path = next((p for p in candidates if p.is_file()), None)
-            if map_path is None:
-                diag.update({"reason": "source_file_missing", "checked": [str(p) for p in candidates], "source_kind": source_kind})
-                return [], diag
-            with map_path.open("r", encoding="utf-8-sig") as f:
-                obj = json.load(f)
-
-            if is_common_event:
-                ce = None
-                if isinstance(obj, list):
-                    for e in obj:
-                        if isinstance(e, dict) and int(e.get("id") or 0) == event_id:
-                            ce = e
-                            break
-                    if ce is None and 0 <= event_id < len(obj) and isinstance(obj[event_id], dict):
-                        ce = obj[event_id]
-                if not isinstance(ce, dict):
-                    diag.update({"reason": "common_event_not_found", "source_kind": source_kind, "common_event_id": event_id})
-                    return [], diag
-                commands = ce.get("list") or []
-                diag.update({"source_kind": "common_event", "common_event_id": event_id, "common_event_name": str(ce.get("name") or "")})
+            # PATCH: static picture/UI state is independent from the dialogue
+            # text itself.  Cache the reconstructed image state per event command
+            # so text edits/row reselections do not re-scan map JSON or re-resolve
+            # all bust/window assets.
+            try:
+                root_key = str(project_dir.resolve())
+            except Exception:
+                root_key = str(project_dir)
+            state_key = (root_key, source_kind, map_file, int(event_id), int(page_index), int(command_index))
+            state_cache = getattr(self, "_maker_preview_picture_state_cache", None)
+            if not isinstance(state_cache, dict) or state_cache.get("root") != root_key:
+                state_cache = {"root": root_key, "items": {}}
+                self._maker_preview_picture_state_cache = state_cache
+            state_items = state_cache.setdefault("items", {})
+            if state_key in state_items:
+                try:
+                    cached_pictures, cached_diag = state_items.get(state_key) or ([], {})
+                    pictures_copy = [dict(x) for x in (cached_pictures or []) if isinstance(x, dict)]
+                    diag_copy = dict(cached_diag or {})
+                    diag_copy["cache"] = "hit"
+                    if self._maker_preview_bulk_perf_suppressed():
+                        self._maker_preview_bulk_perf_count("state_cache_hits")
+                    else:
+                        perf_log(self, "PERF_MAKER_PREVIEW_STATE_CACHE", cache="hit", key=str(state_key), pictures=len(pictures_copy))
+                    return pictures_copy, diag_copy
+                except Exception:
+                    pass
+            if self._maker_preview_bulk_perf_suppressed():
+                self._maker_preview_bulk_perf_count("state_cache_misses")
             else:
-                ev = None
-                for e in obj.get("events") or []:
-                    if isinstance(e, dict) and int(e.get("id") or 0) == event_id:
-                        ev = e
-                        break
-                if not isinstance(ev, dict):
-                    diag["reason"] = "event_not_found"
+                perf_log(self, "PERF_MAKER_PREVIEW_STATE_CACHE", cache="miss", key=str(state_key))
+
+            is_common_event = source_kind == "common_event" or map_file.lower() == "commonevents.json"
+            command_key = (root_key, source_kind, map_file, int(event_id), int(page_index))
+            command_cache = getattr(self, "_maker_preview_event_command_cache", None)
+            if not isinstance(command_cache, dict) or command_cache.get("root") != root_key:
+                command_cache = {"root": root_key, "items": {}}
+                self._maker_preview_event_command_cache = command_cache
+            command_items = command_cache.setdefault("items", {})
+            command_entry = command_items.get(command_key)
+            if isinstance(command_entry, dict) and isinstance(command_entry.get("commands"), list):
+                commands = command_entry.get("commands") or []
+                try:
+                    diag.update(dict(command_entry.get("diag") or {}))
+                except Exception:
+                    pass
+                try:
+                    if self._maker_preview_bulk_perf_suppressed():
+                        self._maker_preview_bulk_perf_count("command_cache_hits")
+                    else:
+                        perf_log(self, "PERF_MAKER_PREVIEW_COMMAND_CACHE", cache="hit", key=str(command_key), commands=len(commands))
+                except Exception:
+                    pass
+            else:
+                resolved = self._maker_preview_resolved_project_paths()
+                candidates = [Path(resolved.get("data_dir") or (project_dir / "maker_game" / "data")) / map_file]
+                map_path = next((p for p in candidates if p.is_file()), None)
+                if map_path is None:
+                    diag.update({"reason": "source_file_missing", "checked": [str(p) for p in candidates], "source_kind": source_kind})
                     return [], diag
-                pages = ev.get("pages") or []
-                if page_index < 0 or page_index >= len(pages):
-                    diag["reason"] = "page_index_out_of_range"
-                    return [], diag
-                commands = (pages[page_index] or {}).get("list") or []
+                with map_path.open("r", encoding="utf-8-sig") as f:
+                    obj = json.load(f)
+
+                if is_common_event:
+                    ce = None
+                    if isinstance(obj, list):
+                        for e in obj:
+                            if isinstance(e, dict) and int(e.get("id") or 0) == event_id:
+                                ce = e
+                                break
+                        if ce is None and 0 <= event_id < len(obj) and isinstance(obj[event_id], dict):
+                            ce = obj[event_id]
+                    if not isinstance(ce, dict):
+                        diag.update({"reason": "common_event_not_found", "source_kind": source_kind, "common_event_id": event_id})
+                        return [], diag
+                    commands = ce.get("list") or []
+                    diag.update({"source_kind": "common_event", "common_event_id": event_id, "common_event_name": str(ce.get("name") or "")})
+                else:
+                    ev = None
+                    for e in obj.get("events") or []:
+                        if isinstance(e, dict) and int(e.get("id") or 0) == event_id:
+                            ev = e
+                            break
+                    if not isinstance(ev, dict):
+                        diag["reason"] = "event_not_found"
+                        return [], diag
+                    pages = ev.get("pages") or []
+                    if page_index < 0 or page_index >= len(pages):
+                        diag["reason"] = "page_index_out_of_range"
+                        return [], diag
+                    commands = (pages[page_index] or {}).get("list") or []
+                try:
+                    command_items[command_key] = {"commands": list(commands or []), "diag": {k: v for k, v in dict(diag or {}).items() if k != "pictures"}}
+                    if len(command_items) > 1024:
+                        for old_key in list(command_items.keys())[:128]:
+                            command_items.pop(old_key, None)
+                    if self._maker_preview_bulk_perf_suppressed():
+                        self._maker_preview_bulk_perf_count("command_cache_misses")
+                    else:
+                        perf_log(self, "PERF_MAKER_PREVIEW_COMMAND_CACHE", cache="miss_store", key=str(command_key), commands=len(commands or []))
+                except Exception:
+                    pass
             slots = {}
             for idx, cmd in enumerate(commands):
                 if idx > command_index:
@@ -4280,13 +6377,55 @@ class MainWindowProjectPagesMixin:
                     except Exception:
                         pass
             pictures = [slots[k] for k in sorted(slots.keys())]
-            diag.update({"enabled": True, "reason": "ok", "map_file": map_file, "event_id": event_id, "page_index": page_index, "command_index": command_index, "pictures": pictures})
+            skit_diag = {}
+            cbr_diag = {}
+            generic_plugin_diag = {}
+            try:
+                skit_pictures, skit_diag = self._maker_preview_collect_trp_skit_state_from_commands(commands, command_index)
+                if skit_pictures:
+                    pictures.extend(skit_pictures)
+            except Exception as _skit_e:
+                skit_diag = {"enabled": False, "reason": "error", "error": str(_skit_e), "error_type": type(_skit_e).__name__}
+            try:
+                cbr_pictures, cbr_diag = self._maker_preview_collect_cbr_status_images_from_commands(commands, command_index)
+                if cbr_pictures:
+                    pictures.extend(cbr_pictures)
+            except Exception as _cbr_e:
+                cbr_diag = {"enabled": False, "reason": "error", "error": str(_cbr_e), "error_type": type(_cbr_e).__name__}
+            try:
+                generic_pictures, generic_plugin_diag = self._maker_preview_collect_generic_plugin_image_layers_from_commands(commands, command_index)
+                if generic_pictures:
+                    pictures.extend(generic_pictures)
+            except Exception as _generic_e:
+                generic_plugin_diag = {"enabled": False, "reason": "error", "error": str(_generic_e), "error_type": type(_generic_e).__name__}
+            diag.update({"enabled": True, "reason": "ok", "map_file": map_file, "event_id": event_id, "page_index": page_index, "command_index": command_index, "pictures": pictures, "trp_skit": skit_diag, "cbr_status": cbr_diag, "generic_plugin_images": generic_plugin_diag, "cache": "miss_store"})
+            try:
+                state_items[state_key] = ([dict(x) for x in (pictures or []) if isinstance(x, dict)], dict(diag or {}))
+                if len(state_items) > 4096:
+                    for old_key in list(state_items.keys())[:512]:
+                        state_items.pop(old_key, None)
+            except Exception:
+                pass
             return pictures, diag
         except Exception as e:
             diag.update({"reason": "error", "error": str(e), "error_type": type(e).__name__})
             return [], diag
 
-    def _maker_preview_add_picture_layers(self, scene, pictures, *, z_base=99900, settings=None):
+    def _maker_preview_add_picture_layers(self, *args, **kwargs):
+        _perf_t0 = perf_counter()
+        _perf_action_id = next_action_id("_maker_preview_add_picture_layers")
+        _perf_ok = False
+        try:
+            _res = self._perf_impl__maker_preview_add_picture_layers(*args, **kwargs)
+            _perf_ok = True
+            return _res
+        finally:
+            try:
+                perf_log_elapsed(self, "PERF_MAKER_PREVIEW_STEP", _perf_t0, action="_maker_preview_add_picture_layers", action_id=_perf_action_id, ok=bool(_perf_ok), args_count=len(args), kwargs=','.join(sorted([str(k) for k in kwargs.keys()])))
+            except Exception:
+                pass
+
+    def _perf_impl__maker_preview_add_picture_layers(self, scene, pictures, *, z_base=99900, settings=None):
         items = []
         rendered = []
         settings = settings if isinstance(settings, dict) else {}
@@ -4299,7 +6438,7 @@ class MainWindowProjectPagesMixin:
                 if not path:
                     rendered.append({**dict(pic), "rendered": False, "error": "path_missing"})
                     continue
-                pm = QPixmap(path)
+                pm = self._maker_preview_load_pixmap(path, purpose=str((pic or {}).get("preview_source") or "picture"))
                 if pm.isNull():
                     rendered.append({**dict(pic), "rendered": False, "error": "pixmap_null"})
                     continue
@@ -4307,7 +6446,96 @@ class MainWindowProjectPagesMixin:
                 sy = float((pic or {}).get("scale_y") or 100) / 100.0
                 x = float((pic or {}).get("x") or 0)
                 y = float((pic or {}).get("y") or 0)
-                if int((pic or {}).get("origin") or 0) == 1:
+                layout = str((pic or {}).get("preview_layout") or "")
+                if layout in ("trp_skit_runtime_position", "trp_skit_visible_fit"):
+                    # TRP_SkitMZ runtime data: x = (position/10)*Graphics.width,
+                    # y = Graphics.height - (defaultPositionY - poseOffsetY).
+                    # Use plugin xPosition/bustsScale/displayOffsetY directly;
+                    # only fall back to review fitting when the plugin did not
+                    # provide a registered position.
+                    try:
+                        screen_w = max(320, int(settings.get("screen_width") or 816))
+                        screen_h = max(240, int(settings.get("screen_height") or 624))
+                    except Exception:
+                        screen_w, screen_h = 816, 624
+                    try:
+                        if sy <= 0:
+                            sy = sx
+                        scaled_w = float(pm.width()) * abs(sx)
+                        scaled_h = float(pm.height()) * abs(sy)
+                        pos = str((pic or {}).get("trp_position") or "").strip().lower()
+                        ratio = (pic or {}).get("trp_position_ratio")
+                        try:
+                            ratio = float(ratio)
+                        except Exception:
+                            ratio = None
+                        if ratio is not None:
+                            x = float(screen_w) * ratio - scaled_w / 2.0
+                            try:
+                                pose_offset_y = float((pic or {}).get("trp_pose_display_offset_y") or 0.0)
+                                base_offset_y = float((pic or {}).get("trp_base_offset_y") or 0.0)
+                            except Exception:
+                                pose_offset_y = base_offset_y = 0.0
+                            # TRP stores displayOffsetY in screen pixels.  Do not
+                            # multiply it by bust scale; the runtime adds it to
+                            # the actor's screen y position, then applies sprite scale.
+                            y = float(screen_h) + pose_offset_y + base_offset_y - scaled_h
+                        else:
+                            # Data was incomplete.  Keep the previous review-fit
+                            # behavior as a fallback instead of pretending it is
+                            # runtime-accurate.
+                            base_scale = max(0.01, min(abs(sx), abs(sy)))
+                            max_scale_w = (float(screen_w) * 0.72) / max(1.0, float(pm.width()))
+                            max_scale_h = (float(screen_h) * 1.18) / max(1.0, float(pm.height()))
+                            fit_scale = max(0.08, min(2.0, min(base_scale, max_scale_w, max_scale_h)))
+                            sx = sy = fit_scale
+                            scaled_w = float(pm.width()) * sx
+                            scaled_h = float(pm.height()) * sy
+                            if pos in ("left", "l"):
+                                fallback_ratio = 0.25
+                            elif pos in ("right", "r"):
+                                fallback_ratio = 0.78
+                            else:
+                                fallback_ratio = 0.50
+                            x = float(screen_w) * fallback_ratio - scaled_w / 2.0
+                            y = float(screen_h) - scaled_h
+                    except Exception:
+                        pass
+                elif layout == "plugin_image_visible_fit":
+                    # PATCH: generic plugin image visualization.  If a plugin
+                    # explicitly references an image but its exact runtime layout
+                    # cannot be executed, keep the asset visible rather than
+                    # letting a huge/off-screen layer appear as a tiny fragment.
+                    try:
+                        screen_w = max(320, int(settings.get("screen_width") or 816))
+                        screen_h = max(240, int(settings.get("screen_height") or 624))
+                    except Exception:
+                        screen_w, screen_h = 816, 624
+                    try:
+                        if sy <= 0:
+                            sy = sx
+                        scaled_w = float(pm.width()) * abs(sx)
+                        scaled_h = float(pm.height()) * abs(sy)
+                        if scaled_w > float(screen_w) * 1.10 or scaled_h > float(screen_h) * 1.10:
+                            fit = min((float(screen_w) * 0.96) / max(1.0, float(pm.width())), (float(screen_h) * 0.96) / max(1.0, float(pm.height())))
+                            fit = max(0.03, min(abs(sx), fit))
+                            sx = sy = fit
+                            scaled_w = float(pm.width()) * abs(sx)
+                            scaled_h = float(pm.height()) * abs(sy)
+                        if int((pic or {}).get("origin") or 0) == 1:
+                            x -= scaled_w / 2.0
+                            y -= scaled_h / 2.0
+                        margin = 8.0
+                        # If the layer is almost completely outside the screen,
+                        # bring it back just enough for review.  Normal in-screen
+                        # plugin coordinates are preserved.
+                        if x > float(screen_w) - margin or x + scaled_w < margin:
+                            x = max(margin, min(float(screen_w) - scaled_w - margin, x)) if scaled_w <= float(screen_w) - margin * 2 else (float(screen_w) - scaled_w) / 2.0
+                        if y > float(screen_h) - margin or y + scaled_h < margin:
+                            y = max(margin, min(float(screen_h) - scaled_h - margin, y)) if scaled_h <= float(screen_h) - margin * 2 else (float(screen_h) - scaled_h) / 2.0
+                    except Exception:
+                        pass
+                elif int((pic or {}).get("origin") or 0) == 1:
                     x -= (pm.width() * sx) / 2.0
                     y -= (pm.height() * sy) / 2.0
                 item = QGraphicsPixmapItem(pm)
@@ -4322,10 +6550,30 @@ class MainWindowProjectPagesMixin:
                         item.setOpacity(1.0)
                 except Exception:
                     pass
-                item.setZValue(float(z_base + int((pic or {}).get("id") or 0)))
+                # PATCH: picture IDs are game slots, not UI z-order numbers.
+                # Synthetic plugin IDs can be very large (e.g. 91000), so adding
+                # them directly can place standing images above message/choice
+                # windows.  Keep all reconstructed picture layers below RPG
+                # Maker UI windows while preserving only a small intra-layer order.
+                try:
+                    raw_id = int((pic or {}).get("id") or 0)
+                except Exception:
+                    raw_id = 0
+                try:
+                    role_order = float((pic or {}).get("preview_layer_order") or 0.0)
+                except Exception:
+                    role_order = 0.0
+                source_name = str((pic or {}).get("preview_source") or "")
+                if source_name.startswith("TRP_Skit"):
+                    z_value = self._maker_preview_layer_z("standing", order=role_order)
+                else:
+                    # Picture IDs are game slots, not absolute z values.  Keep a
+                    # bounded slot order inside the semantic picture layer.
+                    z_value = self._maker_preview_layer_z("picture", order=min(900, max(0, raw_id)) * 0.001 + role_order * 0.1)
+                item.setZValue(z_value)
                 scene.addItem(item)
                 items.append(item)
-                rendered.append({**dict(pic), "rendered": True, "pixmap_width": pm.width(), "pixmap_height": pm.height(), "draw_x": x, "draw_y": y, "preview_follow_opacity": follow_picture_opacity})
+                rendered.append({**dict(pic), "rendered": True, "pixmap_width": pm.width(), "pixmap_height": pm.height(), "draw_x": x, "draw_y": y, "preview_z": z_value, "preview_follow_opacity": follow_picture_opacity})
             except Exception as e:
                 try:
                     rendered.append({**dict(pic), "rendered": False, "error": str(e), "error_type": type(e).__name__})
@@ -4346,7 +6594,7 @@ class MainWindowProjectPagesMixin:
             if key in cache:
                 return cache[key]
             if path:
-                pm = QPixmap(str(path))
+                pm = self._maker_preview_load_pixmap(str(path), purpose="window_text_color")
                 if not pm.isNull() and pm.width() >= 192 and pm.height() >= 180:
                     x = 96 + (idx % 8) * 12 + 6
                     y = 144 + (idx // 8) * 12 + 6
@@ -4389,7 +6637,21 @@ class MainWindowProjectPagesMixin:
             pass
         return font
 
-    def _maker_add_control_text_items(self, scene, text, x, y, *, settings, base_font, width, max_lines=4, line_height=36, z=100000, profile=None, height_scale=1.0):
+    def _maker_add_control_text_items(self, *args, **kwargs):
+        _perf_t0 = perf_counter()
+        _perf_action_id = next_action_id("_maker_add_control_text_items")
+        _perf_ok = False
+        try:
+            _res = self._perf_impl__maker_add_control_text_items(*args, **kwargs)
+            _perf_ok = True
+            return _res
+        finally:
+            try:
+                perf_log_elapsed(self, "PERF_MAKER_PREVIEW_STEP", _perf_t0, action="_maker_add_control_text_items", action_id=_perf_action_id, ok=bool(_perf_ok), args_count=len(args), kwargs=','.join(sorted([str(k) for k in kwargs.keys()])))
+            except Exception:
+                pass
+
+    def _perf_impl__maker_add_control_text_items(self, scene, text, x, y, *, settings, base_font, width, max_lines=4, line_height=36, z=100000, profile=None, height_scale=1.0):
         r"""Render MV/MZ message text while applying common control codes.
 
         This is a static preview renderer.  It intentionally ignores animation-only
@@ -4852,6 +7114,337 @@ class MainWindowProjectPagesMixin:
             pass
         return str(raw or "")
 
+    def _maker_preview_source_commands_for_row(self, row):
+        """Load the original RPG Maker command list that owns a preview row.
+
+        PATCH: UI scene reconstruction from game data.
+        Keep UI placement/help decisions tied to MapXXX/CommonEvents JSON instead
+        of editor-side hardcoded assumptions.
+        """
+        diag = {"enabled": False, "reason": "not_available"}
+        try:
+            meta = (row or {}).get("maker_text_unit") or {}
+            map_file = str(meta.get("map_file") or meta.get("source_file") or "").strip()
+            event_id = int(meta.get("event_id") or 0)
+            page_index = int(meta.get("page_index") or 0)
+            command_index = int(meta.get("command_index") or 0)
+            source_kind = str(meta.get("source_kind") or "").strip().lower()
+            if not map_file or event_id <= 0:
+                diag["reason"] = "missing_map_or_event"
+                return [], command_index, diag
+            project_dir = self._maker_preview_project_root()
+            if project_dir is None:
+                diag["reason"] = "project_root_missing"
+                return [], command_index, diag
+            try:
+                root_key = str(project_dir.resolve())
+            except Exception:
+                root_key = str(project_dir)
+            is_common_event = source_kind == "common_event" or map_file.lower() == "commonevents.json"
+            command_key = (root_key, source_kind, map_file, int(event_id), int(page_index))
+            command_cache = getattr(self, "_maker_preview_event_command_cache", None)
+            if not isinstance(command_cache, dict) or command_cache.get("root") != root_key:
+                command_cache = {"root": root_key, "items": {}}
+                self._maker_preview_event_command_cache = command_cache
+            command_items = command_cache.setdefault("items", {})
+            cached = command_items.get(command_key)
+            if isinstance(cached, dict) and isinstance(cached.get("commands"), list):
+                try:
+                    diag.update(dict(cached.get("diag") or {}))
+                except Exception:
+                    pass
+                diag["cache"] = "hit"
+                return list(cached.get("commands") or []), command_index, diag
+            resolved = self._maker_preview_resolved_project_paths()
+            candidates = [Path(resolved.get("data_dir") or (project_dir / "maker_game" / "data")) / map_file]
+            map_path = next((pp for pp in candidates if pp.is_file()), None)
+            if map_path is None:
+                diag.update({"reason": "source_file_missing", "checked": [str(x) for x in candidates]})
+                return [], command_index, diag
+            with map_path.open("r", encoding="utf-8-sig") as f:
+                obj = json.load(f)
+            if is_common_event:
+                ce = None
+                if isinstance(obj, list):
+                    for e in obj:
+                        if isinstance(e, dict) and int(e.get("id") or 0) == event_id:
+                            ce = e
+                            break
+                    if ce is None and 0 <= event_id < len(obj) and isinstance(obj[event_id], dict):
+                        ce = obj[event_id]
+                if not isinstance(ce, dict):
+                    diag.update({"reason": "common_event_not_found", "source_kind": source_kind, "event_id": event_id})
+                    return [], command_index, diag
+                commands = ce.get("list") or []
+                diag.update({"enabled": True, "reason": "ok", "source_kind": "common_event", "source_path": str(map_path), "event_name": str(ce.get("name") or "")})
+                try:
+                    command_items[command_key] = {"commands": list(commands or []), "diag": dict(diag or {})}
+                except Exception:
+                    pass
+                return commands if isinstance(commands, list) else [], command_index, diag
+            ev = None
+            if isinstance(obj, dict):
+                for e in obj.get("events") or []:
+                    if isinstance(e, dict) and int(e.get("id") or 0) == event_id:
+                        ev = e
+                        break
+            if not isinstance(ev, dict):
+                diag.update({"reason": "event_not_found", "event_id": event_id})
+                return [], command_index, diag
+            pages = ev.get("pages") or []
+            if page_index < 0 or page_index >= len(pages) or not isinstance(pages[page_index], dict):
+                diag.update({"reason": "page_index_out_of_range", "page_index": page_index, "page_count": len(pages) if isinstance(pages, list) else 0})
+                return [], command_index, diag
+            commands = (pages[page_index] or {}).get("list") or []
+            diag.update({"enabled": True, "reason": "ok", "source_kind": "map", "source_path": str(map_path), "event_name": str(ev.get("name") or "")})
+            try:
+                command_items[command_key] = {"commands": list(commands or []), "diag": dict(diag or {})}
+                if len(command_items) > 1024:
+                    for old_key in list(command_items.keys())[:128]:
+                        command_items.pop(old_key, None)
+            except Exception:
+                pass
+            return commands if isinstance(commands, list) else [], command_index, diag
+        except Exception as e:
+            diag.update({"reason": "error", "error": str(e), "error_type": type(e).__name__})
+            try:
+                return [], int(((row or {}).get("maker_text_unit") or {}).get("command_index") or 0), diag
+            except Exception:
+                return [], 0, diag
+
+    def _maker_preview_choice_command_info_for_row(self, row):
+        """Read Show Choices(102) parameters from the original game command."""
+        info = {"enabled": False, "reason": "not_choice_command"}
+        try:
+            commands, command_index, source_diag = self._maker_preview_source_commands_for_row(row)
+            info["source"] = source_diag
+            if not commands or command_index < 0 or command_index >= len(commands):
+                info["reason"] = "command_missing"
+                return info
+            cmd = commands[command_index] if isinstance(commands[command_index], dict) else {}
+            try:
+                code = int(cmd.get("code") or 0)
+            except Exception:
+                code = 0
+            if code != 102:
+                info.update({"reason": "not_102", "code": code})
+                return info
+            params = cmd.get("parameters") if isinstance(cmd.get("parameters"), list) else []
+            choices = []
+            if params and isinstance(params[0], list):
+                choices = [str(x or "") for x in params[0]]
+            def as_int_at(idx, fallback=0):
+                try:
+                    return int(params[idx]) if len(params) > idx and params[idx] is not None else fallback
+                except Exception:
+                    return fallback
+            # RPG Maker MV/MZ Show Choices params are game data:
+            # [choices, cancelType, defaultType, positionType, background]
+            info.update({
+                "enabled": True,
+                "reason": "ok",
+                "choices": choices,
+                "cancel_type": as_int_at(1, -2),
+                "default_type": as_int_at(2, 0),
+                "position_type": as_int_at(3, 2),
+                "background": as_int_at(4, 0),
+                "command_index": command_index,
+                "parameters": params,
+            })
+            return info
+        except Exception as e:
+            info.update({"reason": "error", "error": str(e), "error_type": type(e).__name__})
+            return info
+
+    def _maker_preview_message_command_info_for_row(self, row):
+        """Read Show Text(101) window parameters for one dialogue row.
+
+        MV/MZ store the window background and vertical position in the original
+        Show Text command.  Those values are structural preview data, not
+        editable text, so they belong in the row blueprint.
+        """
+        info = {"enabled": False, "reason": "not_message_command"}
+        try:
+            commands, command_index, source_diag = self._maker_preview_source_commands_for_row(row)
+            info["source"] = source_diag
+            if not commands or command_index < 0 or command_index >= len(commands):
+                info["reason"] = "command_missing"
+                return info
+            row_command_index = int(command_index)
+            resolved_command_index = int(command_index)
+            cmd = commands[resolved_command_index] if isinstance(commands[resolved_command_index], dict) else {}
+            try:
+                code = int(cmd.get("code") or 0)
+            except Exception:
+                code = 0
+            # Extracted dialogue rows commonly point at a Show Text continuation
+            # command (401), not the owning Show Text header (101).  Walk backward
+            # inside the same message block so background/position/speaker format
+            # comes from the original game command instead of a generic fallback.
+            if code != 101:
+                found_index = None
+                for idx in range(min(row_command_index, len(commands) - 1), max(-1, row_command_index - 64), -1):
+                    candidate = commands[idx] if isinstance(commands[idx], dict) else {}
+                    try:
+                        candidate_code = int(candidate.get("code") or 0)
+                    except Exception:
+                        candidate_code = 0
+                    if candidate_code == 101:
+                        found_index = idx
+                        break
+                    # A continuation line may be preceded by other 401 lines.
+                    # Stop at a real command boundary instead of borrowing an
+                    # unrelated earlier message window.
+                    if idx < row_command_index and candidate_code not in (0, 401):
+                        break
+                if found_index is None:
+                    info.update({"reason": "not_101", "code": code, "row_command_index": row_command_index})
+                    return info
+                resolved_command_index = int(found_index)
+                cmd = commands[resolved_command_index] if isinstance(commands[resolved_command_index], dict) else {}
+                code = 101
+            params = cmd.get("parameters") if isinstance(cmd.get("parameters"), list) else []
+
+            def int_at(idx, fallback=0):
+                try:
+                    return int(params[idx]) if len(params) > idx and params[idx] is not None else fallback
+                except Exception:
+                    return fallback
+
+            info.update({
+                "enabled": True,
+                "reason": "ok",
+                "face_name": str(params[0] or "") if len(params) > 0 else "",
+                "face_index": int_at(1, 0),
+                # RPG Maker MV/MZ Show Text:
+                # [faceName, faceIndex, background, positionType, speakerName?]
+                "background": int_at(2, 0),
+                "position_type": int_at(3, 2),
+                "speaker_name": str(params[4] or "") if len(params) > 4 else "",
+                "command_index": resolved_command_index,
+                "row_command_index": row_command_index,
+                "resolved_from_continuation": bool(resolved_command_index != row_command_index),
+                "parameters": list(params),
+            })
+            return info
+        except Exception as e:
+            info.update({"reason": "error", "error": str(e), "error_type": type(e).__name__})
+            return info
+
+    def _maker_preview_choice_help_markers_from_game(self):
+        """Read MPP_ChoiceEX help marker commands from js/plugins.js params."""
+        markers = []
+        diag = {"enabled": False, "reason": "not_found", "markers": markers}
+        try:
+            params = self._maker_preview_plugin_parameters("MPP_ChoiceEX")
+            raw = params.get("Choice Help Commands") if isinstance(params, dict) else None
+            parsed = []
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    parsed = json.loads(raw)
+                except Exception:
+                    parsed = [x.strip() for x in raw.split(",") if x.strip()]
+            if isinstance(parsed, list):
+                for value in parsed:
+                    text = str(value or "").strip()
+                    if text and text not in markers:
+                        markers.append(text)
+            diag.update({"enabled": bool(markers), "reason": "ok" if markers else "empty", "markers": markers})
+            return markers, diag
+        except Exception as e:
+            diag.update({"reason": "error", "error": str(e), "error_type": type(e).__name__})
+            return markers, diag
+
+    def _maker_preview_choice_help_for_row(self, row):
+        """Return selected-choice help text declared by the game's choice plugin.
+
+        Supports MPP_ChoiceEX by reading its marker list from plugin parameters.
+        The help body itself is read from the original event comments under the
+        selected 402 branch; no per-game literal is assumed in code.
+        """
+        diag = {"enabled": False, "reason": "not_available", "text": ""}
+        try:
+            meta = (row or {}).get("maker_text_unit") or {}
+            if not self._maker_preview_text_type_is_choice(meta.get("text_type")):
+                diag["reason"] = "not_choice"
+                return "", diag
+            selected_index = self._maker_preview_choice_index_from_text_type(meta.get("text_type"))
+            markers, marker_diag = self._maker_preview_choice_help_markers_from_game()
+            diag["markers"] = marker_diag
+            if not markers:
+                diag["reason"] = "no_plugin_markers"
+                return "", diag
+            marker_set = set(str(x).strip() for x in markers if str(x).strip())
+            commands, command_index, source_diag = self._maker_preview_source_commands_for_row(row)
+            diag["source"] = source_diag
+            if not commands:
+                diag["reason"] = "commands_missing"
+                return "", diag
+            branch_start = None
+            branch_indent = 0
+            for idx in range(max(0, command_index + 1), len(commands)):
+                cmd = commands[idx] if isinstance(commands[idx], dict) else {}
+                try:
+                    code = int(cmd.get("code") or 0)
+                except Exception:
+                    code = 0
+                params = cmd.get("parameters") if isinstance(cmd.get("parameters"), list) else []
+                try:
+                    indent = int(cmd.get("indent") or 0)
+                except Exception:
+                    indent = 0
+                if code == 404:
+                    break
+                if code == 402:
+                    try:
+                        branch_idx = int(params[0]) if params else -1
+                    except Exception:
+                        branch_idx = -1
+                    if branch_idx == selected_index:
+                        branch_start = idx
+                        branch_indent = indent
+                        break
+            if branch_start is None:
+                diag["reason"] = "branch_not_found"
+                return "", diag
+            active = False
+            help_lines = []
+            for idx in range(branch_start + 1, len(commands)):
+                cmd = commands[idx] if isinstance(commands[idx], dict) else {}
+                try:
+                    code = int(cmd.get("code") or 0)
+                except Exception:
+                    code = 0
+                params = cmd.get("parameters") if isinstance(cmd.get("parameters"), list) else []
+                try:
+                    indent = int(cmd.get("indent") or 0)
+                except Exception:
+                    indent = 0
+                if code in {402, 404} and indent <= branch_indent:
+                    break
+                if code in {108, 408}:
+                    line = str(params[0] or "") if params else ""
+                    plain = line.strip()
+                    try:
+                        plain_cmp = strip_maker_control_codes(plain).strip()
+                    except Exception:
+                        plain_cmp = plain
+                    if not active and (plain in marker_set or plain_cmp in marker_set):
+                        active = True
+                        continue
+                    if active:
+                        help_lines.append(line)
+                    continue
+                if active:
+                    # The help comment block is complete when normal event logic starts.
+                    break
+            text = "\n".join(help_lines).strip()
+            diag.update({"enabled": bool(text), "reason": "ok" if text else "empty_help", "text": text, "selected_index": selected_index, "branch_start": branch_start})
+            return text, diag
+        except Exception as e:
+            diag.update({"reason": "error", "error": str(e), "error_type": type(e).__name__})
+            return "", diag
+
     def _maker_preview_choice_group_for_row(self, row, page=None):
         """Collect all choices belonging to the same Show Choices command.
 
@@ -4889,7 +7482,18 @@ class MainWindowProjectPagesMixin:
                     "original": str(r.get("text") or ""),
                 })
             choices.sort(key=lambda x: int(x.get("index") or 0))
-            return {"enabled": bool(choices), "reason": "ok" if choices else "empty", "choices": choices, "selected_index": selected_index, "key": key}
+            command_info = self._maker_preview_choice_command_info_for_row(row)
+            help_text, help_diag = self._maker_preview_choice_help_for_row(row)
+            return {
+                "enabled": bool(choices),
+                "reason": "ok" if choices else "empty",
+                "choices": choices,
+                "selected_index": selected_index,
+                "key": key,
+                "command_info": command_info,
+                "choice_help_text": help_text,
+                "choice_help_diag": help_diag,
+            }
         except Exception as e:
             return {"enabled": False, "reason": "error", "error": str(e), "error_type": type(e).__name__, "choices": [], "selected_index": 0}
 
@@ -4942,12 +7546,26 @@ class MainWindowProjectPagesMixin:
         except Exception:
             return None
 
-    def _maker_preview_add_choice_window(self, scene, choice_group, *, settings, canvas_w, canvas_h, message_box=None, profile=None):
-        """Draw an RPG Maker style Show Choices box.
+    def _maker_preview_add_choice_window(self, *args, **kwargs):
+        _perf_t0 = perf_counter()
+        _perf_action_id = next_action_id("_maker_preview_add_choice_window")
+        _perf_ok = False
+        try:
+            _res = self._perf_impl__maker_preview_add_choice_window(*args, **kwargs)
+            _perf_ok = True
+            return _res
+        finally:
+            try:
+                perf_log_elapsed(self, "PERF_MAKER_PREVIEW_STEP", _perf_t0, action="_maker_preview_add_choice_window", action_id=_perf_action_id, ok=bool(_perf_ok), args_count=len(args), kwargs=','.join(sorted([str(k) for k in kwargs.keys()])))
+            except Exception:
+                pass
 
-        The selected choice row is highlighted with a cursor marker, but every
-        sibling choice from the same 102 command is displayed together so the
-        translator can judge the actual UI block instead of a single loose line.
+    def _perf_impl__maker_preview_add_choice_window(self, scene, choice_group, *, settings, canvas_w, canvas_h, message_box=None, profile=None, layout_spec=None):
+        """Draw Show Choices using RPG Maker command/plugin data.
+
+        Avoid editor-side decorations such as a hardcoded arrow prefix.  The
+        command supplies position/background, MPP_ChoiceEX supplies page-row
+        limits, and WindowBackImage may supply a custom window image.
         """
         overlay = []
         diag = {"enabled": False, "reason": "not_rendered", "choice_count": 0}
@@ -4958,10 +7576,30 @@ class MainWindowProjectPagesMixin:
                 return overlay, diag
             selected_index = int((choice_group or {}).get("selected_index") or 0)
             st = settings if isinstance(settings, dict) else {}
+            command_info = (choice_group or {}).get("command_info") if isinstance(choice_group, dict) else {}
+            mpp_choice = self._maker_preview_mpp_choice_config()
             try:
-                padding = max(8, int(st.get("choice_padding") or st.get("message_padding") or 18))
+                max_page_row = int((mpp_choice or {}).get("max_page_row") or 0)
+            except Exception:
+                max_page_row = 0
+            frozen_layout = layout_spec if isinstance(layout_spec, dict) and bool(layout_spec.get("enabled")) else None
+            visible_rows = len(choices)
+            if max_page_row > 0:
+                visible_rows = min(visible_rows, max_page_row)
+            if frozen_layout is not None:
+                try:
+                    visible_rows = max(1, int(frozen_layout.get("visible_rows") or visible_rows))
+                except Exception:
+                    pass
+            visible_rows = max(1, visible_rows)
+            try:
+                padding = max(0, int(st.get("message_padding") or 18))
             except Exception:
                 padding = 18
+            try:
+                item_padding = max(0, int(st.get("item_padding") or 8))
+            except Exception:
+                item_padding = 8
             font = self._maker_preview_font(st, text_type="choice", bold=False, size_override=st.get("choice_font_size") or st.get("font_size") or 26)
             try:
                 fm = QFontMetrics(font)
@@ -4969,65 +7607,119 @@ class MainWindowProjectPagesMixin:
             except Exception:
                 fm = None
                 base_line_h = max(12, int(st.get("choice_font_size") or st.get("font_size") or 26) + 8)
-            height_scale = 1.0
             try:
                 runtime_line_h = int(st.get("line_height") or 0)
             except Exception:
                 runtime_line_h = 0
             line_h = max(16, int(runtime_line_h or base_line_h))
+            if frozen_layout is not None:
+                try:
+                    line_h = max(16, int(frozen_layout.get("line_height") or line_h))
+                except Exception:
+                    pass
             display = []
             max_w = 0
             for ch in choices:
                 idx = int(ch.get("index") or 0)
                 txt = str(ch.get("text") or "").replace("\r\n", " ").replace("\r", " ").replace("\n", " ").strip()
-                prefix = "▶ " if idx == selected_index else "  "
-                label = prefix + (txt if txt else " ")
+                # RPG Maker selection is a cursor rectangle; do not inject a
+                # text arrow that is not present in the game data.
+                label = txt if txt else " "
                 display.append({**dict(ch), "label": label})
                 try:
-                    max_w = max(max_w, int(fm.horizontalAdvance(label)) if fm is not None else len(label) * 18)
+                    max_w = max(max_w, int(fm.horizontalAdvance(label)) if fm is not None else len(label) * int(st.get("font_size") or 28))
                 except Exception:
-                    max_w = max(max_w, len(label) * 18)
-            choice_w = max(180, min(int(canvas_w * 0.70), max_w + padding * 2))
-            choice_h = max(56, padding * 2 + line_h * len(display))
-            if message_box:
+                    max_w = max(max_w, len(label) * int(st.get("font_size") or 28))
+            # MZ Window_ChoiceList.windowWidth() is roughly maxChoiceWidth +
+            # padding*2; maxChoiceWidth includes a small item padding allowance.
+            if frozen_layout is not None:
                 try:
-                    _mx, box_y, _mw, _mh = message_box
-                    choice_y = max(18, int(box_y - choice_h - 14))
+                    choice_w = max(96, min(int(canvas_w), int(frozen_layout.get("width") or 0)))
                 except Exception:
-                    choice_y = max(18, int(canvas_h * 0.50 - choice_h / 2))
+                    choice_w = max(96, min(int(canvas_w), int(max_w + padding * 2 + item_padding * 2)))
+                try:
+                    choice_h = max(1, int(frozen_layout.get("height") or 0))
+                except Exception:
+                    choice_h = max(1, int(padding * 2 + line_h * visible_rows))
             else:
-                choice_y = max(18, int(canvas_h * 0.50 - choice_h / 2))
-            # RPG Maker choices are commonly right-aligned.  Use a stable
-            # right-side default so message text and choice text do not overlap.
-            choice_x = max(18, int(canvas_w - choice_w - 24))
+                choice_w = max(96, min(int(canvas_w), int(max_w + padding * 2 + item_padding * 2)))
+                choice_h = max(1, int(padding * 2 + line_h * visible_rows))
+            try:
+                position_type = int((command_info or {}).get("position_type"))
+            except Exception:
+                position_type = 2
+            if frozen_layout is not None and frozen_layout.get("x") is not None:
+                choice_x = int(frozen_layout.get("x") or 0)
+            elif position_type == 0:
+                choice_x = 0
+            elif position_type == 1:
+                choice_x = int((canvas_w - choice_w) / 2)
+            else:
+                choice_x = int(canvas_w - choice_w)
+            choice_x = max(0, min(int(canvas_w - choice_w), choice_x))
+            # MZ places choices above a lower-half message window and below an
+            # upper-half message window.  If there is no message window, center.
+            if frozen_layout is not None and frozen_layout.get("y") is not None:
+                choice_y = int(frozen_layout.get("y") or 0)
+            elif message_box:
+                try:
+                    _mx, box_y, _mw, box_h = message_box
+                    if float(box_y) >= float(canvas_h) / 2.0:
+                        choice_y = int(box_y - choice_h)
+                    else:
+                        choice_y = int(box_y + box_h)
+                except Exception:
+                    choice_y = int((canvas_h - choice_h) / 2)
+            else:
+                choice_y = int((canvas_h - choice_h) / 2)
+            choice_y = max(0, min(int(canvas_h - choice_h), choice_y))
+            try:
+                background_type = int((command_info or {}).get("background") or 0)
+            except Exception:
+                background_type = 0
             try:
                 win_opacity = max(0, min(255, int(st.get("window_opacity") or 205)))
             except Exception:
                 win_opacity = 205
-            box, skin_diag = self._maker_preview_add_window_item(
-                scene,
-                choice_x,
-                choice_y,
-                choice_w,
-                choice_h,
-                z=100010,
-                opacity=win_opacity,
-                profile=profile,
-                fallback_pen=QPen(QColor(150, 185, 255, 230), 3),
-                fallback_brush=QBrush(QColor(8, 10, 12, win_opacity)),
-            )
-            overlay.append(box)
+            skin_diag = {"skipped": False}
+            if background_type != 2:
+                # 0=normal window, 1=dim background, 2=transparent.
+                box_opacity = win_opacity if background_type == 0 else max(80, min(255, win_opacity))
+                box, skin_diag = self._maker_preview_add_window_item(
+                    scene,
+                    choice_x,
+                    choice_y,
+                    choice_w,
+                    choice_h,
+                    z=self._maker_preview_layer_z("choice_window"),
+                    opacity=box_opacity,
+                    profile=profile,
+                    fallback_pen=QPen(QColor(150, 185, 255, 230), 3),
+                    fallback_brush=QBrush(QColor(8, 10, 12, box_opacity)),
+                    window_class="Window_ChoiceList",
+                )
+                overlay.append(box)
+            else:
+                skin_diag = {"skipped": True, "reason": "Show Choices background=transparent"}
             text_color = self._maker_preview_color(st.get("text_color"), "#FFFFFF")
             outline_color = self._maker_preview_color(st.get("outline_color"), "#202020")
             outline_width = self._maker_preview_effective_outline_width(st, st.get("outline_width") or 0)
-            for n, ch in enumerate(display):
+            content_x = choice_x + padding
+            content_w = max(20, choice_w - padding * 2)
+            first_visible = 0
+            if selected_index >= visible_rows:
+                first_visible = max(0, selected_index - visible_rows + 1)
+            visible = display[first_visible:first_visible + visible_rows]
+            for n, ch in enumerate(visible):
                 y = choice_y + padding + n * line_h
                 try:
                     if int(ch.get("index") or 0) == selected_index:
-                        hi = QGraphicsRectItem(QRectF(choice_x + 8, y - 2, max(20, choice_w - 16), max(14, line_h)))
-                        hi.setPen(QPen(QColor(255, 255, 255, 40), 1))
-                        hi.setBrush(QBrush(QColor(255, 255, 255, 36)))
-                        hi.setZValue(100011)
+                        # Cursor is a runtime UI state, not user text.  Draw a
+                        # neutral cursor rect only when the command says a row is selected.
+                        hi = QGraphicsRectItem(QRectF(content_x - 2, y - 2, max(20, content_w + 4), max(14, line_h)))
+                        hi.setPen(QPen(QColor(255, 255, 255, 70), 1))
+                        hi.setBrush(QBrush(QColor(255, 255, 255, 34)))
+                        hi.setZValue(self._maker_preview_layer_z("choice_cursor"))
                         scene.addItem(hi)
                         overlay.append(hi)
                 except Exception:
@@ -5035,32 +7727,41 @@ class MainWindowProjectPagesMixin:
                 items = self._maker_add_outlined_text_items(
                     scene,
                     str(ch.get("label") or ""),
-                    choice_x + padding,
+                    content_x + item_padding,
                     y,
                     font=font,
                     text_color=text_color,
                     outline_color=outline_color,
                     outline_width=outline_width,
-                    width=max(40, choice_w - padding * 2),
-                    z=100012,
-                    height_scale=height_scale,
+                    width=max(40, content_w - item_padding * 2),
+                    z=self._maker_preview_layer_z("choice_text"),
+                    height_scale=1.0,
                 )
                 overlay.extend(items)
             diag = {
                 "enabled": True,
                 "reason": "ok",
                 "choice_count": len(display),
+                "visible_rows": visible_rows,
+                "first_visible": first_visible,
                 "selected_index": selected_index,
                 "x": choice_x,
                 "y": choice_y,
                 "width": choice_w,
                 "height": choice_h,
+                "line_height": line_h,
                 "skin": skin_diag,
+                "position_type": position_type,
+                "background_type": background_type,
+                "position_source": "Show Choices parameters[3]" if (command_info or {}).get("enabled") else "fallback",
+                "background_source": "Show Choices parameters[4]" if (command_info or {}).get("enabled") else "fallback",
+                "mpp_choice": mpp_choice,
+                "command_info": command_info,
                 "choices": [{"index": int(c.get("index") or 0), "text": str(c.get("text") or "")} for c in choices],
             }
             return overlay, diag
         except Exception as e:
-            diag.update({"reason": "error", "error": str(e), "error_type": type(e).__name__})
+            diag.update({"enabled": False, "reason": "error", "error": str(e), "error_type": type(e).__name__})
             return overlay, diag
 
     def _maker_preview_message_body_for_row(self, row):
@@ -5230,6 +7931,10 @@ class MainWindowProjectPagesMixin:
                 fallback_pen=QPen(QColor(150, 185, 255, 230), 3),
                 fallback_brush=QBrush(QColor(8, 10, 12, win_opacity)),
             )
+            try:
+                box.setData(1, "maker_dialogue_fallback_window")
+            except Exception:
+                pass
             overlay.append(box)
             body_items, text_diag = self._maker_add_control_text_items(
                 scene, body, box_x + padding, box_y + padding,
@@ -5237,10 +7942,15 @@ class MainWindowProjectPagesMixin:
                 max_lines=max_lines, line_height=line_h, z=100004, profile=profile,
                 height_scale=1.0,
             )
+            for _body_item in list(body_items or []):
+                try:
+                    _body_item.setData(1, "maker_dialogue_body_text")
+                except Exception:
+                    pass
             overlay.extend(body_items)
             try:
                 for it in overlay:
-                    it.setData(0, "maker_preview_overlay")
+                    it.setData(0, "maker_dialogue_overlay")
             except Exception:
                 pass
             diag.update({
@@ -5295,7 +8005,1188 @@ class MainWindowProjectPagesMixin:
             "width_overflow": bool(width_overflow),
         }
 
-    def update_maker_preview_selection_from_table(self):
+
+    def _maker_row_preview_blueprint_cache_paths(self):
+        """Return deterministic project-local preview cache candidates.
+
+        Project-open preparation can briefly expose ``project_dir`` and
+        ``project_json_path`` through different routes.  Treat all canonical
+        workspace roots as candidates, but always prefer ``project_dir`` so the
+        cache stays beside project.json instead of in a transient process path.
+        """
+        roots = []
+        try:
+            pd = str(getattr(self, "project_dir", "") or "").strip()
+            if pd:
+                roots.append(Path(pd).resolve())
+        except Exception:
+            pass
+        try:
+            pf = str(getattr(self, "project_json_path", "") or "").strip()
+            if pf:
+                roots.append(Path(pf).resolve().parent)
+        except Exception:
+            pass
+        try:
+            root = self._maker_preview_project_root()
+            if root is not None:
+                roots.append(Path(str(root)).resolve())
+        except Exception:
+            pass
+        out = []
+        seen = set()
+        for root in roots:
+            try:
+                key = str(root.resolve()).casefold()
+            except Exception:
+                key = str(root).casefold()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(root / "maker_meta" / "maker_row_preview_blueprints_v4.json.gz")
+        return out
+
+    def _maker_row_preview_blueprint_cache_path(self):
+        paths = self._maker_row_preview_blueprint_cache_paths()
+        return paths[0] if paths else None
+
+    def _maker_preview_bulk_perf_suppressed(self):
+        try:
+            return int(getattr(self, "_maker_preview_bulk_build_depth", 0) or 0) > 0
+        except Exception:
+            return False
+
+    def _maker_preview_bulk_perf_count(self, key, amount=1):
+        if not self._maker_preview_bulk_perf_suppressed():
+            return
+        try:
+            stats = getattr(self, "_maker_preview_bulk_perf_stats", None)
+            if not isinstance(stats, dict):
+                stats = {}
+                self._maker_preview_bulk_perf_stats = stats
+            stats[str(key)] = int(stats.get(str(key), 0) or 0) + int(amount or 0)
+        except Exception:
+            pass
+
+    def _maker_row_preview_project_row_count(self):
+        total = 0
+        data = getattr(self, "data", {}) or {}
+        if not isinstance(data, dict):
+            return 0
+        for page in data.values():
+            if not isinstance(page, dict):
+                continue
+            meta = page.get("maker_page") if isinstance(page.get("maker_page"), dict) else {}
+            if not meta or str(meta.get("page_type") or "map").strip().lower() in {"database", "plugin", "speaker"}:
+                continue
+            total += sum(
+                1 for row in (page.get("data") or [])
+                if isinstance(row, dict) and isinstance(row.get("maker_text_unit"), dict)
+            )
+        return int(total)
+
+    def _maker_row_preview_blueprint_structure_fingerprint(self):
+        """Fingerprint immutable Maker structure, never translated live text.
+
+        ``maker_game`` is an output clone.  Normal saves rewrite dialogue,
+        choices, speakers, plugin strings, and control codes there, so hashing
+        those live files makes a valid preview cache look stale after every edit.
+        Structural source revisions instead come from the immutable
+        ``maker_backup/original_json`` snapshot.  Game Refresh/reimport replaces
+        that snapshot deliberately and already rebuilds preview data.
+
+        For old projects without the original snapshot, row/page identities and
+        the stable runtime display profile remain the fallback fingerprint.  The
+        live translated JSON is intentionally not hashed.
+        """
+        try:
+            import hashlib as _hashlib
+            import json as _json
+            h = _hashlib.sha256()
+            h.update(b"YSB_MAKER_ROW_PREVIEW_BLUEPRINT_V4_STRUCTURE_V3\n")
+            data = getattr(self, "data", {}) or {}
+            source_files = set()
+            if isinstance(data, dict):
+                def _sort_key(value):
+                    try:
+                        return (0, int(value))
+                    except Exception:
+                        return (1, str(value))
+                for raw_idx in sorted(data.keys(), key=_sort_key):
+                    page = data.get(raw_idx)
+                    if not isinstance(page, dict):
+                        continue
+                    page_meta = page.get("maker_page") if isinstance(page.get("maker_page"), dict) else {}
+                    if not page_meta or str(page_meta.get("page_type") or "map").strip().lower() in {"database", "plugin", "speaker"}:
+                        continue
+                    page_sig = {
+                        "page_idx": str(raw_idx),
+                        "page_type": str(page_meta.get("page_type") or "map"),
+                        "source_file": str(page_meta.get("source_file") or page_meta.get("map_file") or ""),
+                        "map_id": page_meta.get("map_id"),
+                    }
+                    h.update(_json.dumps(page_sig, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8", "ignore"))
+                    for row in page.get("data") or []:
+                        if not isinstance(row, dict):
+                            continue
+                        unit = row.get("maker_text_unit") if isinstance(row.get("maker_text_unit"), dict) else None
+                        if not isinstance(unit, dict):
+                            continue
+                        map_file = str(unit.get("map_file") or unit.get("source_file") or "").strip()
+                        if map_file:
+                            source_files.add(map_file.replace("\\", "/").lstrip("/"))
+                        row_sig = (
+                            str(row.get("id") or ""),
+                            str(unit.get("source_kind") or ""),
+                            map_file,
+                            int(unit.get("event_id") or 0),
+                            int(unit.get("page_index") or 0),
+                            int(unit.get("command_index") or 0),
+                            str(unit.get("text_type") or row.get("type") or ""),
+                        )
+                        h.update(repr(row_sig).encode("utf-8", "ignore"))
+
+            root = Path(str(getattr(self, "project_dir", "") or ""))
+            backup_root = root / "maker_backup" / "original_json"
+
+            def _hash_immutable_source(logical_name, candidates):
+                """Hash the first immutable baseline candidate only."""
+                chosen = next((Path(x) for x in candidates if Path(x).is_file()), None)
+                if chosen is None:
+                    # Old projects may not have maker_backup/original_json.  Do
+                    # not fall back to maker_game: it contains translated output.
+                    h.update(f"unbacked-source|{logical_name}\n".encode("utf-8", "ignore"))
+                    return False
+                try:
+                    rel = str(chosen.relative_to(root)) if root else str(chosen)
+                except Exception:
+                    rel = str(chosen)
+                file_hash = _hashlib.sha256()
+                with chosen.open("rb") as fp:
+                    while True:
+                        chunk = fp.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        file_hash.update(chunk)
+                h.update(f"{logical_name}|{rel}|{int(chosen.stat().st_size)}|".encode("utf-8", "ignore"))
+                h.update(file_hash.digest())
+                return True
+
+            for name in sorted(source_files):
+                _hash_immutable_source(
+                    f"data/{name}",
+                    [
+                        backup_root / "data" / name,
+                        backup_root / "www" / "data" / name,
+                        backup_root / "resources" / "app.nw" / "data" / name,
+                        backup_root / "resources" / "app" / "data" / name,
+                        backup_root / "package.nw" / "data" / name,
+                        backup_root / name,
+                    ],
+                )
+
+            # plugins.js can affect screen metrics and plugin-driven preview
+            # state.  Hash its immutable import snapshot, not the translated
+            # maker_game copy.
+            _hash_immutable_source(
+                "js/plugins.js",
+                [
+                    backup_root / "js" / "plugins.js",
+                    backup_root / "www" / "js" / "plugins.js",
+                    backup_root / "resources" / "app.nw" / "js" / "plugins.js",
+                    backup_root / "resources" / "app" / "js" / "plugins.js",
+                    backup_root / "package.nw" / "js" / "plugins.js",
+                ],
+            )
+
+            # maker_runtime_profile.json is refreshed during project open and
+            # may contain volatile timestamps.  Hash canonical structural
+            # content after removing time-only fields.
+            runtime_profile = root / "maker_meta" / "maker_runtime_profile.json"
+            try:
+                if runtime_profile.is_file():
+                    profile_obj = _json.loads(runtime_profile.read_text(encoding="utf-8"))
+                    volatile_keys = {
+                        "timestamp", "generated_at", "created_at", "updated_at",
+                        "refreshed_at", "maker_runtime_profile_refreshed_at",
+                    }
+                    def _stable_profile(value):
+                        if isinstance(value, dict):
+                            return {
+                                str(k): _stable_profile(v)
+                                for k, v in value.items()
+                                if str(k) not in volatile_keys
+                            }
+                        if isinstance(value, list):
+                            return [_stable_profile(v) for v in value]
+                        return value
+                    stable_profile = _stable_profile(profile_obj)
+                    profile_bytes = _json.dumps(
+                        stable_profile, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"), default=str,
+                    ).encode("utf-8", "ignore")
+                    h.update(b"maker_runtime_profile.json|")
+                    h.update(_hashlib.sha256(profile_bytes).digest())
+            except Exception:
+                pass
+            return h.hexdigest()
+        except Exception:
+            return ""
+
+    def _maker_compact_preview_picture_for_disk(self, picture):
+        if not isinstance(picture, dict):
+            return None
+        keep_keys = {
+            "id", "name", "origin", "x", "y", "scale_x", "scale_y", "opacity", "blend_mode",
+            "direct_flag", "parameter_layout", "command_index", "move_command_index",
+            "preview_source", "preview_layout", "preview_layer_role", "preview_layer_order",
+            "trp_position", "trp_position_ratio", "trp_pose_display_offset_y", "trp_base_offset_y",
+            "trp_actor", "trp_pose", "trp_expression", "composition",
+            "trp_actor_key", "trp_instance_key", "trp_show_sequence", "trp_source_command_index",
+            "preview_composite_group",
+        }
+        out = {k: json_safe(v) for k, v in picture.items() if k in keep_keys}
+        raw_path = str(picture.get("path") or "")
+        root = Path(str(getattr(self, "project_dir", "") or ""))
+        if raw_path:
+            try:
+                rel = Path(raw_path).resolve().relative_to(root.resolve())
+                out["path_relative"] = rel.as_posix()
+            except Exception:
+                out["path"] = raw_path
+        pdiag = picture.get("path_diag") if isinstance(picture.get("path_diag"), dict) else {}
+        if pdiag:
+            out["path_diag"] = {
+                k: json_safe(v) for k, v in pdiag.items()
+                if k in {"found_by", "candidate", "reason", "asset", "composition"}
+            }
+        return out
+
+    def _maker_encode_row_preview_blueprint_for_disk(self, blueprint):
+        if not isinstance(blueprint, dict):
+            return None
+        out = {}
+        for key, value in blueprint.items():
+            if key in {"pictures", "picture_state_diag", "previous_message_row", "choice_group", "preloaded_assets"}:
+                continue
+            out[key] = json_safe(value)
+        out["pictures"] = [
+            compact for compact in (
+                self._maker_compact_preview_picture_for_disk(pic)
+                for pic in (blueprint.get("pictures") or [])
+            ) if isinstance(compact, dict)
+        ]
+        diag = blueprint.get("picture_state_diag") if isinstance(blueprint.get("picture_state_diag"), dict) else {}
+        out["picture_state_diag"] = {
+            k: json_safe(v) for k, v in diag.items()
+            if k not in {"pictures", "commands"}
+        }
+        choice = blueprint.get("choice_group") if isinstance(blueprint.get("choice_group"), dict) else {}
+        compact_choice = {
+            k: json_safe(v) for k, v in choice.items()
+            if k not in {"choices", "choice_help_text", "choice_help_diag"}
+        }
+        try:
+            compact_choice["choice_count"] = len(choice.get("choices") or [])
+        except Exception:
+            pass
+        out["choice_group"] = compact_choice
+        previous = blueprint.get("previous_message_row") if isinstance(blueprint.get("previous_message_row"), dict) else None
+        previous_id = str(blueprint.get("previous_message_row_id") or ((previous or {}).get("id") if previous else "") or "")
+        if previous_id:
+            out["previous_message_row_id"] = previous_id
+        out["preloaded_assets"] = 0
+        return json_safe(out)
+
+    def _maker_decode_row_preview_blueprint_from_disk(self, encoded):
+        if not isinstance(encoded, dict):
+            return None
+        out = copy.deepcopy(encoded)
+        root = Path(str(getattr(self, "project_dir", "") or ""))
+        pictures = []
+        for raw in out.get("pictures") or []:
+            if not isinstance(raw, dict):
+                continue
+            pic = dict(raw)
+            rel = str(pic.pop("path_relative", "") or "")
+            if rel:
+                try:
+                    pic["path"] = str((root / Path(rel)).resolve())
+                except Exception:
+                    pic["path"] = str(root / rel)
+            pictures.append(pic)
+        out["pictures"] = pictures
+        return out
+
+    def _maker_row_preview_disk_page_identity(self, page_idx, page=None):
+        try:
+            idx = int(page_idx)
+        except Exception:
+            idx = 0
+        if page is None:
+            try:
+                page = (getattr(self, "data", {}) or {}).get(idx)
+            except Exception:
+                page = None
+        meta = page.get("maker_page") if isinstance(page, dict) and isinstance(page.get("maker_page"), dict) else {}
+        return {
+            "page_idx": idx,
+            "page_type": str(meta.get("page_type") or "map"),
+            "source_file": str(meta.get("source_file") or meta.get("map_file") or ""),
+            "map_id": meta.get("map_id"),
+        }
+
+    def _maker_save_row_preview_blueprints_to_disk(self, *, reason="preview_blueprint_build"):
+        cache_paths = self._maker_row_preview_blueprint_cache_paths()
+        if not cache_paths:
+            try:
+                self.audit_boundary_event(
+                    "MAKER_ROW_PREVIEW_DISK_CACHE_PATH_UNAVAILABLE",
+                    reason=str(reason or ""),
+                    project_dir=str(getattr(self, "project_dir", "") or ""),
+                    project_json_path=str(getattr(self, "project_json_path", "") or ""),
+                )
+            except Exception:
+                pass
+            return False
+        try:
+            import gzip as _gzip
+            import json as _json
+            import time as _time
+            data = getattr(self, "data", {}) or {}
+            runtime_cache = getattr(self, "_maker_row_preview_blueprint_cache", {}) or {}
+            pages_payload = {}
+            total_rows = 0
+            if isinstance(data, dict):
+                for raw_idx, page in data.items():
+                    if not isinstance(page, dict):
+                        continue
+                    meta = page.get("maker_page") if isinstance(page.get("maker_page"), dict) else {}
+                    if not meta or str(meta.get("page_type") or "map").strip().lower() in {"database", "plugin", "speaker"}:
+                        continue
+                    try:
+                        idx = int(raw_idx)
+                    except Exception:
+                        continue
+                    page_cache = runtime_cache.get(self._maker_row_preview_blueprint_page_key(page_idx=idx))
+                    if not isinstance(page_cache, dict):
+                        continue
+                    encoded_rows = {}
+                    for row_id, blueprint in (page_cache.get("rows") or {}).items():
+                        encoded = self._maker_encode_row_preview_blueprint_for_disk(blueprint)
+                        if isinstance(encoded, dict):
+                            encoded_rows[str(row_id)] = encoded
+                    expected = sum(
+                        1 for row in (page.get("data") or [])
+                        if isinstance(row, dict) and isinstance(row.get("maker_text_unit"), dict)
+                    )
+                    total_rows += len(encoded_rows)
+                    pages_payload[str(idx)] = {
+                        "identity": self._maker_row_preview_disk_page_identity(idx, page),
+                        "rows": encoded_rows,
+                        "total": int(expected),
+                        "built": int(len(encoded_rows)),
+                        "complete": bool(len(encoded_rows) >= expected),
+                    }
+            payload = {
+                "schema_version": 4,
+                "fingerprint_version": 3,
+                "fingerprint": self._maker_row_preview_blueprint_structure_fingerprint(),
+                "created_at": _time.time(),
+                "pages": pages_payload,
+            }
+            saved_paths = []
+            errors = []
+            for cache_path in cache_paths:
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = cache_path.with_name(cache_path.name + f".{os.getpid()}.tmp")
+                    with _gzip.open(tmp, "wt", encoding="utf-8", compresslevel=6) as fp:
+                        _json.dump(payload, fp, ensure_ascii=False, separators=(",", ":"), default=str)
+                    os.replace(str(tmp), str(cache_path))
+                    if not cache_path.is_file() or int(cache_path.stat().st_size or 0) <= 0:
+                        raise OSError("preview cache file was not created")
+                    saved_paths.append(str(cache_path))
+                except Exception as path_error:
+                    errors.append(f"{cache_path}: {type(path_error).__name__}: {path_error}")
+            if saved_paths:
+                try:
+                    primary = Path(saved_paths[0])
+                    self.audit_boundary_event(
+                        "MAKER_ROW_PREVIEW_DISK_CACHE_SAVED",
+                        reason=str(reason or ""), paths=saved_paths, pages=len(pages_payload), rows=total_rows,
+                        bytes=int(primary.stat().st_size or 0), fingerprint=str(payload.get("fingerprint") or "")[:16],
+                        fingerprint_version=3, mirror_errors=errors[:4],
+                    )
+                except Exception:
+                    pass
+                return True
+            raise OSError("; ".join(errors) or "preview cache save failed")
+        except Exception as e:
+            try:
+                self.audit_boundary_event(
+                    "MAKER_ROW_PREVIEW_DISK_CACHE_SAVE_FAILED",
+                    reason=str(reason or ""), error=f"{type(e).__name__}: {e}",
+                    paths=[str(x) for x in cache_paths],
+                )
+            except Exception:
+                pass
+            return False
+
+    def _maker_row_preview_disk_payload_matches_structure(self, payload):
+        """Cheap structural validation used to migrate legacy v4 fingerprints.
+
+        Older fingerprints hashed live maker_game files.  Translation writeback
+        therefore changed the fingerprint even when visual structure was intact.
+        Accept a complete legacy payload only when every current page identity and
+        row id is present, then immediately rewrite it with the immutable-baseline
+        fingerprint.
+        """
+        try:
+            pages = payload.get("pages") if isinstance(payload, dict) and isinstance(payload.get("pages"), dict) else {}
+            data = getattr(self, "data", {}) or {}
+            for raw_idx, page in (data.items() if isinstance(data, dict) else []):
+                if not isinstance(page, dict):
+                    continue
+                meta = page.get("maker_page") if isinstance(page.get("maker_page"), dict) else {}
+                if not meta or str(meta.get("page_type") or "map").strip().lower() in {"database", "plugin", "speaker"}:
+                    continue
+                idx = int(raw_idx)
+                disk_page = pages.get(str(idx))
+                if not isinstance(disk_page, dict):
+                    return False
+                if (disk_page.get("identity") if isinstance(disk_page.get("identity"), dict) else {}) != self._maker_row_preview_disk_page_identity(idx, page):
+                    return False
+                disk_rows = disk_page.get("rows") if isinstance(disk_page.get("rows"), dict) else {}
+                expected_ids = {
+                    str(row.get("id") or "") for row in (page.get("data") or [])
+                    if isinstance(row, dict) and isinstance(row.get("maker_text_unit"), dict)
+                }
+                if not expected_ids.issubset(set(map(str, disk_rows.keys()))):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _maker_load_row_preview_blueprints_from_disk(self, *, reason="project_open"):
+        cache_paths = self._maker_row_preview_blueprint_cache_paths()
+        existing = next((p for p in cache_paths if p.is_file()), None)
+        if existing is None:
+            try:
+                self.audit_boundary_event(
+                    "MAKER_ROW_PREVIEW_DISK_CACHE_MISSING",
+                    reason=str(reason or ""), paths=[str(x) for x in cache_paths],
+                )
+            except Exception:
+                pass
+            return {"loaded": False, "complete": False, "reason": "missing", "rows": 0}
+        cache_path = existing
+        try:
+            import gzip as _gzip
+            import json as _json
+            with _gzip.open(cache_path, "rt", encoding="utf-8") as fp:
+                payload = _json.load(fp)
+            if int((payload or {}).get("schema_version") or 0) != 4:
+                try:
+                    self.audit_boundary_event(
+                        "MAKER_ROW_PREVIEW_DISK_CACHE_SCHEMA_MISMATCH",
+                        reason=str(reason or ""), path=str(cache_path),
+                        found=int((payload or {}).get("schema_version") or 0), expected=4,
+                    )
+                except Exception:
+                    pass
+                return {"loaded": False, "complete": False, "reason": "schema_mismatch", "rows": 0}
+            expected_fingerprint = self._maker_row_preview_blueprint_structure_fingerprint()
+            stored_fingerprint = str((payload or {}).get("fingerprint") or "")
+            fingerprint_version = int((payload or {}).get("fingerprint_version") or 1)
+            legacy_accepted = False
+            if stored_fingerprint != str(expected_fingerprint or ""):
+                if fingerprint_version < 3 and self._maker_row_preview_disk_payload_matches_structure(payload):
+                    legacy_accepted = True
+                    try:
+                        self.audit_boundary_event(
+                            "MAKER_ROW_PREVIEW_DISK_CACHE_LEGACY_ACCEPTED",
+                            reason=str(reason or ""), path=str(cache_path),
+                            stored_fingerprint=stored_fingerprint[:16], expected_fingerprint=str(expected_fingerprint or "")[:16],
+                        )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self.audit_boundary_event(
+                            "MAKER_ROW_PREVIEW_DISK_CACHE_STALE",
+                            reason=str(reason or ""), path=str(cache_path),
+                            stored_fingerprint=stored_fingerprint[:16],
+                            expected_fingerprint=str(expected_fingerprint or "")[:16],
+                            fingerprint_version=fingerprint_version,
+                        )
+                    except Exception:
+                        pass
+                    return {"loaded": False, "complete": False, "reason": "fingerprint_mismatch", "rows": 0}
+            data = getattr(self, "data", {}) or {}
+            runtime_cache = {}
+            loaded_rows = 0
+            complete = True
+            pages = (payload or {}).get("pages") if isinstance((payload or {}).get("pages"), dict) else {}
+            for raw_idx, page in (data.items() if isinstance(data, dict) else []):
+                if not isinstance(page, dict):
+                    continue
+                meta = page.get("maker_page") if isinstance(page.get("maker_page"), dict) else {}
+                if not meta or str(meta.get("page_type") or "map").strip().lower() in {"database", "plugin", "speaker"}:
+                    continue
+                try:
+                    idx = int(raw_idx)
+                except Exception:
+                    continue
+                disk_page = pages.get(str(idx)) if isinstance(pages, dict) else None
+                expected = sum(
+                    1 for row in (page.get("data") or [])
+                    if isinstance(row, dict) and isinstance(row.get("maker_text_unit"), dict)
+                )
+                decoded_rows = {}
+                if isinstance(disk_page, dict):
+                    disk_identity = disk_page.get("identity") if isinstance(disk_page.get("identity"), dict) else {}
+                    if disk_identity == self._maker_row_preview_disk_page_identity(idx, page):
+                        for row_id, encoded in (disk_page.get("rows") or {}).items():
+                            decoded = self._maker_decode_row_preview_blueprint_from_disk(encoded)
+                            if isinstance(decoded, dict):
+                                decoded_rows[str(row_id)] = decoded
+                page_complete = bool(len(decoded_rows) >= expected)
+                runtime_cache[self._maker_row_preview_blueprint_page_key(page_idx=idx)] = {
+                    "rows": decoded_rows,
+                    "total": expected,
+                    "built": len(decoded_rows),
+                    "complete": page_complete,
+                    "disk_loaded": True,
+                }
+                loaded_rows += len(decoded_rows)
+                complete = bool(complete and page_complete)
+            self._maker_row_preview_blueprint_cache = runtime_cache
+            try:
+                self.audit_boundary_event(
+                    "MAKER_ROW_PREVIEW_DISK_CACHE_LOADED",
+                    reason=str(reason or ""), path=str(cache_path), rows=loaded_rows,
+                    complete=bool(complete), legacy_accepted=bool(legacy_accepted),
+                    fingerprint_version=fingerprint_version,
+                )
+            except Exception:
+                pass
+            if legacy_accepted and complete:
+                self._maker_save_row_preview_blueprints_to_disk(reason=f"{reason}_legacy_migrate")
+            return {"loaded": True, "complete": bool(complete), "reason": "ok", "rows": loaded_rows}
+        except Exception as e:
+            try:
+                self.audit_boundary_event(
+                    "MAKER_ROW_PREVIEW_DISK_CACHE_LOAD_FAILED",
+                    reason=str(reason or ""), error=f"{type(e).__name__}: {e}", path=str(cache_path),
+                )
+            except Exception:
+                pass
+            return {"loaded": False, "complete": False, "reason": "error", "rows": 0}
+
+    def _maker_prepare_row_preview_blueprints_for_project_open(self, progress_callback=None, *, reason="project_open"):
+        total = self._maker_row_preview_project_row_count()
+        cache_paths = self._maker_row_preview_blueprint_cache_paths()
+        if hasattr(self, "is_maker_preview_enabled") and not self.is_maker_preview_enabled():
+            return {"total": total, "built": 0, "loaded": False, "complete": False, "skipped": True}
+        try:
+            self.audit_boundary_event(
+                "MAKER_ROW_PREVIEW_PROJECT_OPEN_PREPARE_BEGIN",
+                reason=str(reason or ""), total=total,
+                paths=[str(x) for x in cache_paths], existing=[str(x) for x in cache_paths if x.is_file()],
+            )
+        except Exception:
+            pass
+        if total <= 0:
+            return {"total": 0, "built": 0, "loaded": False, "complete": True}
+        loaded = self._maker_load_row_preview_blueprints_from_disk(reason=reason)
+        try:
+            self.audit_boundary_event(
+                "MAKER_ROW_PREVIEW_PROJECT_OPEN_LOAD_RESULT",
+                reason=str(reason or ""), loaded=bool(loaded.get("loaded")),
+                complete=bool(loaded.get("complete")), rows=int(loaded.get("rows") or 0),
+                cache_reason=str(loaded.get("reason") or ""),
+            )
+        except Exception:
+            pass
+        if bool(loaded.get("complete")):
+            return {"total": total, "built": int(loaded.get("rows") or 0), "loaded": True, "complete": True}
+        result = self._prebuild_maker_row_preview_blueprints_for_project(
+            progress=None,
+            reason=f"{reason}_rebuild",
+            progress_callback=progress_callback,
+            save_to_disk=False,
+        )
+        save_ok = self._maker_save_row_preview_blueprints_to_disk(reason=f"{reason}_rebuild")
+        result = dict(result or {})
+        result.update({
+            "loaded": bool(loaded.get("loaded")),
+            "complete": bool(int(result.get("built") or 0) >= total),
+            "disk_saved": bool(save_ok),
+        })
+        try:
+            self.audit_boundary_event(
+                "MAKER_ROW_PREVIEW_PROJECT_OPEN_REBUILD_RESULT",
+                reason=str(reason or ""), total=total, built=int(result.get("built") or 0),
+                complete=bool(result.get("complete")), disk_saved=bool(save_ok),
+                paths=[str(x) for x in cache_paths],
+            )
+        except Exception:
+            pass
+        return result
+
+    def _maker_previous_message_row_from_blueprint(self, blueprint, page):
+        if not isinstance(blueprint, dict) or not isinstance(page, dict):
+            return None
+        previous = blueprint.get("previous_message_row")
+        if isinstance(previous, dict):
+            return previous
+        previous_id = str(blueprint.get("previous_message_row_id") or "")
+        if not previous_id:
+            return None
+        for row in page.get("data") or []:
+            if isinstance(row, dict) and str(row.get("id") or "") == previous_id:
+                return row
+        return None
+
+    def _maker_preview_active_picture_slots(self, pictures):
+        slots = []
+        seen_ids = {}
+        duplicates = []
+        for picture in pictures or []:
+            if not isinstance(picture, dict):
+                continue
+            try:
+                picture_id = int(picture.get("id") or 0)
+            except Exception:
+                picture_id = 0
+            item = {
+                "picture_id": picture_id,
+                "name": str(picture.get("name") or ""),
+                "source": str(picture.get("preview_source") or "ShowPicture"),
+                "role": str(picture.get("preview_layer_role") or ""),
+                "command_index": picture.get("command_index"),
+                "path": str(picture.get("path") or ""),
+                "x": picture.get("x"),
+                "y": picture.get("y"),
+                "position": str(picture.get("trp_position") or ""),
+                "position_ratio": picture.get("trp_position_ratio"),
+                "actor_key": str(picture.get("trp_actor_key") or ""),
+                "instance_key": str(picture.get("trp_instance_key") or ""),
+                "show_sequence": picture.get("trp_show_sequence"),
+            }
+            if picture_id in seen_ids:
+                duplicates.append({"picture_id": picture_id, "first": seen_ids[picture_id], "next": item})
+            else:
+                seen_ids[picture_id] = item
+            slots.append(item)
+        return slots, duplicates
+
+    def _maker_tag_dynamic_preview_tree(self, item, *, marker, generation, row_id, role=""):
+        if item is None:
+            return
+        stack = [item]
+        seen = set()
+        while stack:
+            current = stack.pop()
+            if current is None or id(current) in seen:
+                continue
+            seen.add(id(current))
+            try:
+                current.setData(0, str(marker or "maker_dialogue_overlay"))
+                current.setData(2, int(generation or 0))
+                current.setData(3, str(row_id or ""))
+                current.setData(4, "maker_dynamic_preview")
+                if role and not str(current.data(1) or ""):
+                    current.setData(1, str(role))
+            except Exception:
+                pass
+            try:
+                stack.extend(list(current.childItems() or []))
+            except Exception:
+                pass
+
+    def _maker_row_preview_blueprint_page_key(self, page_idx=None):
+        """Return a project/page/lifecycle key for cached Maker row preview structures."""
+        try:
+            idx = int(getattr(self, "idx", 0) if page_idx is None else page_idx)
+        except Exception:
+            idx = 0
+        try:
+            token = int(getattr(self, "_maker_preview_lifecycle_token", 0) or 0)
+        except Exception:
+            token = 0
+        try:
+            project_key = str(Path(str(getattr(self, "project_dir", "") or "")).resolve())
+        except Exception:
+            project_key = str(getattr(self, "project_dir", "") or "")
+        return (project_key, idx, token)
+
+    def _maker_build_row_preview_blueprint(self, row, page=None):
+        """Precompute every non-editable visual input for one Maker text row.
+
+        The blueprint contains the plugin/picture command state, choice-window
+        structure, previous-message linkage, event marker position, and preview
+        payload.  It deliberately keeps translated text out of the structural
+        cache so later edits can replace text without rebuilding picture/plugin
+        state.
+        """
+        if not isinstance(row, dict):
+            return None
+        curr = page if isinstance(page, dict) else (self.data.get(self.idx) if isinstance(getattr(self, "data", None), dict) else None)
+        if not isinstance(curr, dict):
+            return None
+        meta = row.get("maker_text_unit") if isinstance(row.get("maker_text_unit"), dict) else {}
+        text_type = str(meta.get("text_type") or row.get("type") or "text")
+        try:
+            pictures, picture_diag = self._maker_preview_collect_picture_state_for_row(row, page=curr)
+        except Exception as e:
+            pictures, picture_diag = [], {"enabled": False, "reason": "error", "error": f"{type(e).__name__}: {e}"}
+        choice_group = {"enabled": False, "reason": "not_choice", "choices": [], "selected_index": 0}
+        previous_message_row = None
+        message_command_info = {"enabled": False, "reason": "not_message_command"}
+        previous_message_command_info = {"enabled": False, "reason": "not_message_command"}
+        if self._maker_preview_text_type_is_choice(text_type):
+            try:
+                choice_group = self._maker_preview_choice_group_for_row(row, curr)
+            except Exception as e:
+                choice_group = {"enabled": False, "reason": "error", "choices": [], "selected_index": 0, "error": f"{type(e).__name__}: {e}"}
+            try:
+                previous_message_row = self._maker_preview_previous_message_for_choice(row, curr)
+            except Exception:
+                previous_message_row = None
+            if isinstance(previous_message_row, dict):
+                try:
+                    previous_message_command_info = self._maker_preview_message_command_info_for_row(previous_message_row)
+                except Exception:
+                    previous_message_command_info = {"enabled": False, "reason": "error"}
+        else:
+            try:
+                message_command_info = self._maker_preview_message_command_info_for_row(row)
+            except Exception:
+                message_command_info = {"enabled": False, "reason": "error"}
+        # Initial generation resolves every structural asset path, but it must
+        # not decode thousands of full-size standing illustrations into QPixmap
+        # memory.  The path/layout blueprint is persisted; the visible row alone
+        # decodes its images when applied to the Scene.
+        preloaded_assets = 0
+        try:
+            event_pos = self._maker_event_scene_position_for_row(row, page=curr)
+        except Exception:
+            event_pos = None
+        picture_diag_compact = dict(picture_diag or {})
+        picture_diag_compact.pop("pictures", None)
+        active_picture_slots, duplicate_picture_slots = self._maker_preview_active_picture_slots(pictures)
+        previous_message_row_id = str((previous_message_row or {}).get("id") or "") if isinstance(previous_message_row, dict) else ""
+        return {
+            "row_id": str(row.get("id") or ""),
+            "text_type": text_type,
+            "pictures": [dict(x) for x in (pictures or []) if isinstance(x, dict)],
+            "active_picture_slots": active_picture_slots,
+            "duplicate_picture_slots": duplicate_picture_slots,
+            "picture_state_diag": picture_diag_compact,
+            "choice_group": dict(choice_group or {}),
+            "previous_message_row_id": previous_message_row_id,
+            "message_command_info": dict(message_command_info or {}),
+            "previous_message_command_info": dict(previous_message_command_info or {}),
+            "event_pos": tuple(event_pos) if isinstance(event_pos, (tuple, list)) and len(event_pos) >= 2 else None,
+            "preloaded_assets": int(preloaded_assets),
+        }
+
+    def _maker_row_preview_blueprint_for_row(self, row, page=None, *, build_if_missing=True):
+        if not isinstance(row, dict):
+            return None
+        page_key = self._maker_row_preview_blueprint_page_key()
+        cache = getattr(self, "_maker_row_preview_blueprint_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._maker_row_preview_blueprint_cache = cache
+        page_cache = cache.get(page_key)
+        if not isinstance(page_cache, dict):
+            page_cache = {"rows": {}, "complete": False}
+            cache[page_key] = page_cache
+        rows = page_cache.setdefault("rows", {})
+        row_id = str(row.get("id") or "")
+        bp = rows.get(row_id)
+        if bp is None and build_if_missing:
+            bp = self._maker_build_row_preview_blueprint(row, page=page)
+            if isinstance(bp, dict):
+                rows[row_id] = bp
+        return bp if isinstance(bp, dict) else None
+
+    def _ensure_maker_row_preview_blueprints_for_current_page(self, *, show_progress=True, reason="page_initial_preview_build"):
+        """Build all dialogue/choice preview structures for the active Maker page.
+
+        This is the initial-generation phase.  Every row receives its own cached
+        plugin image state, choice-window structure, event position, and message
+        linkage.  Later row activation applies that row's blueprint; text edits do
+        not invalidate the structure cache.
+        """
+        if not self._is_current_maker_page():
+            return False
+        curr = self.data.get(self.idx) if isinstance(getattr(self, "data", None), dict) else None
+        if not isinstance(curr, dict):
+            return False
+        page_key = self._maker_row_preview_blueprint_page_key()
+        cache = getattr(self, "_maker_row_preview_blueprint_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._maker_row_preview_blueprint_cache = cache
+        page_cache = cache.get(page_key)
+        if isinstance(page_cache, dict) and bool(page_cache.get("complete")):
+            return True
+        if not isinstance(page_cache, dict):
+            page_cache = {"rows": {}, "complete": False}
+            cache[page_key] = page_cache
+        rows_cache = page_cache.setdefault("rows", {})
+        rows = [r for r in (curr.get("data") or []) if isinstance(r, dict) and isinstance(r.get("maker_text_unit"), dict)]
+        total = len(rows)
+        if total <= 0:
+            page_cache["complete"] = True
+            return True
+        progress = None
+        if show_progress:
+            try:
+                progress = QProgressDialog(
+                    self.tr_ui("대사별 프리뷰 구조를 생성하는 중입니다..."),
+                    self.tr_ui("취소"),
+                    0,
+                    total,
+                    self,
+                )
+                progress.setWindowTitle(self.tr_ui("대사 프리뷰 초기 생성"))
+                progress.setWindowModality(Qt.WindowModality.WindowModal)
+                progress.setMinimumDuration(250)
+                progress.setAutoClose(False)
+                progress.setAutoReset(False)
+                progress.show()
+            except Exception:
+                progress = None
+        try:
+            self.audit_boundary_event("MAKER_ROW_PREVIEW_BLUEPRINT_BUILD_BEGIN", page_idx=int(self.idx), total=total, reason=str(reason or ""))
+        except Exception:
+            pass
+        built = 0
+        cancelled = False
+        for n, row in enumerate(rows, start=1):
+            if progress is not None:
+                try:
+                    progress.setLabelText(self.tr_ui("대사별 프리뷰 구조 생성 중... ({current}/{total})", current=n, total=total))
+                    progress.setValue(n - 1)
+                    QApplication.processEvents()
+                    if progress.wasCanceled():
+                        cancelled = True
+                        break
+                except Exception:
+                    pass
+            row_id = str(row.get("id") or "")
+            if row_id not in rows_cache:
+                bp = self._maker_build_row_preview_blueprint(row, page=curr)
+                if isinstance(bp, dict):
+                    rows_cache[row_id] = bp
+            if row_id in rows_cache:
+                built += 1
+            if n % 16 == 0:
+                try:
+                    QApplication.processEvents()
+                except Exception:
+                    pass
+        page_cache["complete"] = bool(not cancelled and built >= total)
+        page_cache["built"] = built
+        page_cache["total"] = total
+        if progress is not None:
+            try:
+                progress.setValue(total if not cancelled else built)
+                progress.close()
+                progress.deleteLater()
+            except Exception:
+                pass
+        try:
+            self.audit_boundary_event(
+                "MAKER_ROW_PREVIEW_BLUEPRINT_BUILD_DONE",
+                page_idx=int(self.idx),
+                total=total,
+                built=built,
+                cancelled=bool(cancelled),
+                complete=bool(page_cache.get("complete")),
+                reason=str(reason or ""),
+            )
+        except Exception:
+            pass
+        return bool(page_cache.get("complete"))
+
+    def _prebuild_maker_row_preview_blueprints_for_project(self, progress=None, *, reason="maker_game_import", progress_callback=None, save_to_disk=True):
+        """Build per-dialogue visual blueprints for every Maker map/common-event page.
+
+        Bulk generation intentionally suppresses per-row performance diagnostics.
+        A single summary record is emitted at the end so one project open cannot
+        create tens of megabytes of repetitive cache/asset timing lines.
+        """
+        if hasattr(self, "is_maker_preview_enabled") and not self.is_maker_preview_enabled():
+            return {"total": 0, "built": 0, "skipped": True}
+        data = getattr(self, "data", {}) or {}
+        targets = []
+        for page_idx, page in list(data.items()) if isinstance(data, dict) else []:
+            if not isinstance(page, dict):
+                continue
+            meta = page.get("maker_page") if isinstance(page.get("maker_page"), dict) else {}
+            if not meta or str(meta.get("page_type") or "map").strip().lower() in {"database", "plugin", "speaker"}:
+                continue
+            for row in page.get("data") or []:
+                if isinstance(row, dict) and isinstance(row.get("maker_text_unit"), dict):
+                    targets.append((int(page_idx), page, row))
+        total = len(targets)
+        if total <= 0:
+            return {"total": 0, "built": 0}
+        built = 0
+        t0 = perf_counter()
+        previous_depth = int(getattr(self, "_maker_preview_bulk_build_depth", 0) or 0)
+        if previous_depth <= 0:
+            self._maker_preview_bulk_perf_stats = {}
+        self._maker_preview_bulk_build_depth = previous_depth + 1
+        try:
+            try:
+                self.audit_boundary_event("MAKER_ROW_PREVIEW_PROJECT_BUILD_BEGIN", total=total, reason=str(reason or ""))
+            except Exception:
+                pass
+            for n, (page_idx, page, row) in enumerate(targets, start=1):
+                detail = self.tr_ui("대사별 프리뷰 구조 생성 중... ({current}/{total})", current=n, total=total)
+                try:
+                    self._maker_import_progress_update(
+                        progress,
+                        detail,
+                        current=n - 1,
+                        total=total,
+                    )
+                except Exception:
+                    pass
+                if callable(progress_callback) and (n == 1 or n == total or n % 8 == 0):
+                    try:
+                        progress_callback(n - 1, total, detail)
+                    except Exception:
+                        pass
+                page_key = self._maker_row_preview_blueprint_page_key(page_idx=page_idx)
+                cache = getattr(self, "_maker_row_preview_blueprint_cache", None)
+                if not isinstance(cache, dict):
+                    cache = {}
+                    self._maker_row_preview_blueprint_cache = cache
+                page_cache = cache.setdefault(page_key, {"rows": {}, "complete": False})
+                rows_cache = page_cache.setdefault("rows", {})
+                row_id = str(row.get("id") or "")
+                if row_id not in rows_cache:
+                    bp = self._maker_build_row_preview_blueprint(row, page=page)
+                    if isinstance(bp, dict):
+                        rows_cache[row_id] = bp
+                if row_id in rows_cache:
+                    built += 1
+                if n % 24 == 0:
+                    try:
+                        QApplication.processEvents()
+                    except Exception:
+                        pass
+            for page_idx, page, _row in targets:
+                page_key = self._maker_row_preview_blueprint_page_key(page_idx=page_idx)
+                page_cache = (getattr(self, "_maker_row_preview_blueprint_cache", {}) or {}).get(page_key)
+                if isinstance(page_cache, dict):
+                    expected = sum(1 for r in (page.get("data") or []) if isinstance(r, dict) and isinstance(r.get("maker_text_unit"), dict))
+                    page_cache["total"] = expected
+                    page_cache["built"] = len(page_cache.get("rows") or {})
+                    page_cache["complete"] = bool(len(page_cache.get("rows") or {}) >= expected)
+            if callable(progress_callback):
+                try:
+                    progress_callback(total, total, self.tr_ui("대사별 프리뷰 구조 생성 완료"))
+                except Exception:
+                    pass
+            if bool(save_to_disk):
+                self._maker_save_row_preview_blueprints_to_disk(reason=str(reason or "preview_blueprint_build"))
+            try:
+                self.audit_boundary_event("MAKER_ROW_PREVIEW_PROJECT_BUILD_DONE", total=total, built=built, reason=str(reason or ""))
+            except Exception:
+                pass
+            return {"total": total, "built": built}
+        finally:
+            self._maker_preview_bulk_build_depth = max(0, int(getattr(self, "_maker_preview_bulk_build_depth", 1) or 1) - 1)
+            if previous_depth <= 0:
+                try:
+                    stats = dict(getattr(self, "_maker_preview_bulk_perf_stats", {}) or {})
+                    perf_log_elapsed(
+                        self,
+                        "PERF_MAKER_PREVIEW_BULK_BUILD_SUMMARY",
+                        t0,
+                        reason=str(reason or ""),
+                        total=total,
+                        built=built,
+                        **stats,
+                    )
+                except Exception:
+                    pass
+                self._maker_preview_bulk_perf_stats = {}
+
+    def schedule_maker_preview_selection_update(self, delay_ms=0):
+        """Update Maker preview in lockstep with the table cursor.
+
+        쯔꾸르붕이의 조작감은 우측 대사 행과 좌측 게임 프리뷰가 1:1로
+        따라오는 것이 우선이다. 이전 버전의 55~90ms 디바운스는 빠른 이동
+        렉을 줄이는 데는 도움이 됐지만, 행과 화면이 한 박자 어긋나 보였다.
+        이제 기본값은 즉시 갱신이며, 명시적으로 delay_ms > 0을 넘긴 일부
+        외부 호출에서만 타이머 경로를 사용할 수 있게 남겨둔다.
+        """
+        try:
+            if not self._is_current_maker_page():
+                return self.update_maker_preview_selection_from_table()
+        except Exception:
+            return None
+        try:
+            delay = int(delay_ms or 0)
+        except Exception:
+            delay = 0
+        if delay <= 0:
+            try:
+                timer = getattr(self, "_maker_preview_selection_timer", None)
+                if timer is not None:
+                    timer.stop()
+            except Exception:
+                pass
+            try:
+                return self.update_maker_preview_selection_from_table()
+            except Exception:
+                return None
+        try:
+            timer = getattr(self, "_maker_preview_selection_timer", None)
+            if timer is None:
+                timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.timeout.connect(self._flush_maker_preview_selection_update)
+                self._maker_preview_selection_timer = timer
+            timer.start(max(1, delay))
+        except Exception:
+            try:
+                return self.update_maker_preview_selection_from_table()
+            except Exception:
+                return None
+
+    def _flush_maker_preview_selection_update(self):
+        try:
+            return self.update_maker_preview_selection_from_table()
+        except Exception:
+            return None
+
+    def _schedule_maker_preview_state_warm_near_row(self, row, page=None, *, radius=4, delay_ms=140):
+        """Warm picture-state cache for nearby Maker rows after the UI has reacted.
+
+        Row selection must stay 1:1 and immediate, so this never blocks the current
+        preview render.  A single-shot timer waits for a short pause, then precomputes
+        a few adjacent rows from the same event/page.
+        """
+        try:
+            if not isinstance(row, dict) or not self._is_current_maker_page():
+                return False
+            self._maker_preview_state_warm_seed = (dict(row), page if isinstance(page, dict) else None, int(radius or 0))
+            timer = getattr(self, "_maker_preview_state_warm_timer", None)
+            if timer is None:
+                timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.timeout.connect(self._run_maker_preview_state_warm_near_row)
+                self._maker_preview_state_warm_timer = timer
+            timer.stop()
+            timer.start(max(30, int(delay_ms or 140)))
+            return True
+        except Exception:
+            return False
+
+    def _run_maker_preview_state_warm_near_row(self):
+        try:
+            if getattr(self, "is_page_loading", False) or getattr(self, "is_batch_running", False):
+                return
+            seed = getattr(self, "_maker_preview_state_warm_seed", None)
+            if not isinstance(seed, tuple) or len(seed) < 2:
+                return
+            row, page = seed[0], seed[1]
+            try:
+                radius = int(seed[2]) if len(seed) >= 3 else 4
+            except Exception:
+                radius = 4
+            if not isinstance(row, dict):
+                return
+            curr = page if isinstance(page, dict) else (self.data.get(self.idx) if isinstance(getattr(self, "data", None), dict) else None)
+            if not isinstance(curr, dict):
+                return
+            meta = row.get("maker_text_unit") if isinstance(row.get("maker_text_unit"), dict) else {}
+            if not meta:
+                return
+            try:
+                cur_cmd = int(meta.get("command_index") or 0)
+                map_file = str(meta.get("map_file") or "")
+                event_id = int(meta.get("event_id") or 0)
+                page_index = int(meta.get("page_index") or 0)
+                source_kind = str(meta.get("source_kind") or "").strip().lower()
+            except Exception:
+                return
+            candidates = []
+            for cand in (curr.get("data") or []):
+                if not isinstance(cand, dict):
+                    continue
+                cm = cand.get("maker_text_unit") if isinstance(cand.get("maker_text_unit"), dict) else {}
+                if not cm:
+                    continue
+                try:
+                    if str(cm.get("map_file") or "") != map_file:
+                        continue
+                    if int(cm.get("event_id") or 0) != event_id:
+                        continue
+                    if int(cm.get("page_index") or 0) != page_index:
+                        continue
+                    if str(cm.get("source_kind") or "").strip().lower() != source_kind:
+                        continue
+                    ci = int(cm.get("command_index") or 0)
+                except Exception:
+                    continue
+                dist = abs(ci - cur_cmd)
+                if dist <= 0 or dist > max(1, radius) * 8:
+                    continue
+                candidates.append((dist, ci, cand))
+            candidates.sort(key=lambda x: (x[0], x[1]))
+            warmed = 0
+            for _dist, _ci, cand in candidates[:max(1, radius)]:
+                try:
+                    self._maker_preview_collect_picture_state_for_row(cand, page=curr)
+                    warmed += 1
+                except Exception:
+                    pass
+            try:
+                if warmed:
+                    perf_log(self, "PERF_MAKER_PREVIEW_STATE_WARM", warmed=warmed, radius=radius, command_index=cur_cmd)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def update_maker_preview_selection_from_table(self, *args, **kwargs):
+        if hasattr(self, "is_maker_preview_enabled") and not self.is_maker_preview_enabled():
+            return False
+        try:
+            if hasattr(self, "_is_maker_text_mutation_active") and self._is_maker_text_mutation_active():
+                try:
+                    self.audit_boundary_event("MAKER_PREVIEW_BLOCKED_TEXT_MUTATION", reason=str(getattr(self, "_maker_text_mutation_reason", "") or "text_mutation"))
+                except Exception:
+                    pass
+                return False
+        except Exception:
+            pass
+        _perf_t0 = perf_counter()
+        _perf_action_id = next_action_id("update_maker_preview_selection_from_table")
+        _perf_ok = False
+        try:
+            _res = self._perf_impl_update_maker_preview_selection_from_table(*args, **kwargs)
+            _perf_ok = True
+            return _res
+        finally:
+            try:
+                perf_log_elapsed(self, "PERF_MAKER_PREVIEW_TOTAL", _perf_t0, action="update_maker_preview_selection_from_table", action_id=_perf_action_id, ok=bool(_perf_ok), args_count=len(args), kwargs=','.join(sorted([str(k) for k in kwargs.keys()])))
+            except Exception:
+                pass
+
+    def _perf_impl_update_maker_preview_selection_from_table(self, row_override=None, fixed_restore=False, preview_blueprint=None):
         """Render the selected RPG Maker text as a fixed game-screen preview.
 
         The left pane is not a direct-edit canvas here.  It is a generated RPG
@@ -5304,17 +9195,70 @@ class MainWindowProjectPagesMixin:
         table is the editor; the left pane is the result preview.
         """
         if not self._is_current_maker_page():
-            self._clear_maker_preview_selection_overlay()
+            self._clear_maker_preview_selection_overlay(force=True, include_dialogue=True, reason="not_maker_page")
             return False
         scene = self._safe_graphics_scene() if hasattr(self, "_safe_graphics_scene") else getattr(getattr(self, "view", None), "scene", None)
         if scene is None:
             return False
-        row = self._maker_current_selected_row_item()
-        self._clear_maker_preview_selection_overlay()
+
+        # 다중 선택/선택 없음은 텍스트 표 작업이다. 이 상태에서 좌측
+        # 프리뷰를 새 선택 기준으로 비우거나 다시 그리면 메시지 박스가
+        # 사라진다. 프리뷰 박스는 마지막 단일 대사 기준으로 고정하고,
+        # 실제 단일 대사 선택 또는 내부 복원 호출일 때만 내용을 바꾼다.
+        row = row_override if isinstance(row_override, dict) else None
+        if row is None:
+            try:
+                selected_ids = self.selected_table_text_ids()
+            except Exception:
+                selected_ids = []
+            if len(selected_ids) != 1:
+                try:
+                    if hasattr(self, "audit_boundary_event"):
+                        self.audit_boundary_event(
+                            "MAKER_SELECTION_PREVIEW_PRESERVED",
+                            reason="no_single_row",
+                            selected_count=int(len(selected_ids or [])),
+                            fixed_preview=bool(self._maker_preview_overlay_is_alive() if hasattr(self, "_maker_preview_overlay_is_alive") else False),
+                        )
+                except Exception:
+                    pass
+                try:
+                    self._maker_restore_fixed_preview_overlay_if_needed(reason="no_single_row_selection")
+                except Exception:
+                    pass
+                return False
+
+            row = self._maker_current_selected_row_item()
+        else:
+            try:
+                selected_ids = [str(row.get("id"))]
+            except Exception:
+                selected_ids = []
+
         if not isinstance(row, dict):
+            try:
+                if hasattr(self, "audit_boundary_event"):
+                    self.audit_boundary_event("MAKER_SELECTION_PREVIEW_PRESERVED", reason="no_row_item", selected_count=1)
+            except Exception:
+                pass
+            try:
+                self._maker_restore_fixed_preview_overlay_if_needed(reason="no_row_item")
+            except Exception:
+                pass
             return False
+
+        # Build the next visible preview while the current one remains alive.
+        # Selection must never create a blank frame: old items are removed only
+        # after the replacement preview has been fully constructed.
+        old_transient_overlay = list(getattr(self, "_maker_preview_overlay_items", []) or [])
+        old_dialogue_overlay = list(getattr(self, "_maker_dialogue_overlay_items", []) or [])
         curr = self.data.get(self.idx) if isinstance(getattr(self, "data", None), dict) else None
         overlay = []
+        body_items = []
+        name_items = []
+        body_render_context = None
+        speaker_render_context = None
+        name_box = None
         profile = {}
         window_skin_diag = {}
         picture_state_diag = {}
@@ -5333,6 +9277,15 @@ class MainWindowProjectPagesMixin:
             meta = row.get("maker_text_unit") or {}
             if not isinstance(meta, dict):
                 meta = {}
+            blueprint = preview_blueprint if isinstance(preview_blueprint, dict) else None
+            if blueprint is None:
+                try:
+                    blueprint = self._maker_row_preview_blueprint_for_row(row, page=curr, build_if_missing=False)
+                except Exception:
+                    blueprint = None
+            # Text is never read from the structure blueprint.  Always build the
+            # live payload from current project data so paste/delete/translation
+            # changes are visible without invalidating plugin/picture caches.
             preview_payload = self._maker_preview_payload_for_row(row, curr)
             try:
                 project_dir_p = Path(str(getattr(self, "project_dir", "") or ""))
@@ -5376,19 +9329,22 @@ class MainWindowProjectPagesMixin:
 
             # Keep a small event highlight for map pages only.  This is not a
             # camera operation: do not center/zoom the viewer when the row changes.
-            pos = self._maker_event_scene_position_for_row(row, page=curr) if page_type in {"", "map"} else None
+            if isinstance(blueprint, dict) and blueprint.get("event_pos") is not None:
+                pos = blueprint.get("event_pos")
+            else:
+                pos = self._maker_event_scene_position_for_row(row, page=curr) if page_type in {"", "map"} else None
             if pos is not None:
                 px, py = pos
                 halo = QGraphicsEllipseItem(QRectF(px - 18, py - 18, 36, 36))
                 halo.setPen(QPen(QColor(255, 210, 80), 3))
                 halo.setBrush(QBrush(QColor(255, 210, 80, 44)))
-                halo.setZValue(100000)
+                halo.setZValue(self._maker_preview_layer_z("map_marker"))
                 scene.addItem(halo)
                 overlay.append(halo)
                 center = QGraphicsEllipseItem(QRectF(px - 5, py - 5, 10, 10))
                 center.setPen(QPen(QColor(255, 255, 255), 2))
                 center.setBrush(QBrush(QColor(255, 80, 80, 230)))
-                center.setZValue(100001)
+                center.setZValue(self._maker_preview_layer_z("map_marker", order=1))
                 scene.addItem(center)
                 overlay.append(center)
 
@@ -5396,8 +9352,33 @@ class MainWindowProjectPagesMixin:
             # left pane from a debug grid into a scene preview for VN-style Maker
             # games that layer standing illustrations via picture slots.
             try:
-                pictures, picture_state_diag = self._maker_preview_collect_picture_state_for_row(row, page=curr)
-                picture_items, rendered_picture_diag = self._maker_preview_add_picture_layers(scene, pictures, z_base=99000, settings=st)
+                if isinstance(blueprint, dict) and isinstance(blueprint.get("pictures"), list):
+                    pictures = [dict(x) for x in (blueprint.get("pictures") or []) if isinstance(x, dict)]
+                    picture_state_diag = dict(blueprint.get("picture_state_diag") or {})
+                    picture_state_diag["row_blueprint_cache"] = "hit"
+                else:
+                    pictures, picture_state_diag = self._maker_preview_collect_picture_state_for_row(row, page=curr)
+                active_picture_slots, duplicate_picture_slots = self._maker_preview_active_picture_slots(pictures)
+                try:
+                    picture_state_diag = dict(picture_state_diag or {})
+                    picture_state_diag["active_picture_slots"] = active_picture_slots
+                    picture_state_diag["duplicate_picture_slots"] = duplicate_picture_slots
+                except Exception:
+                    pass
+                try:
+                    self.audit_boundary_event(
+                        "MAKER_ROW_PREVIEW_ACTIVE_PICTURES",
+                        row_id=str((row or {}).get("id") or ""),
+                        map_file=str((meta or {}).get("map_file") or ""),
+                        event_id=int((meta or {}).get("event_id") or 0),
+                        event_page_index=int((meta or {}).get("page_index") or 0),
+                        command_index=int((meta or {}).get("command_index") or 0),
+                        active_slots=active_picture_slots,
+                        duplicate_slots=duplicate_picture_slots,
+                    )
+                except Exception:
+                    pass
+                picture_items, rendered_picture_diag = self._maker_preview_add_picture_layers(scene, pictures, z_base=self._maker_preview_layer_z("picture"), settings=st)
                 overlay.extend(picture_items)
             except Exception as _pic_e:
                 picture_state_diag = {"enabled": False, "reason": "error", "error": str(_pic_e), "error_type": type(_pic_e).__name__}
@@ -5431,6 +9412,21 @@ class MainWindowProjectPagesMixin:
                 max_lines = max(1, min(12, int(st.get("message_lines") or 4)))
             except Exception:
                 max_lines = 4
+            mpp_message_default = self._maker_preview_mpp_message_default_config()
+            mpp_name_window = self._maker_preview_mpp_name_window_config()
+            try:
+                plugin_rows = int((mpp_message_default or {}).get("Message Row") or 0)
+                if plugin_rows > 0:
+                    max_lines = max(1, min(12, plugin_rows))
+            except Exception:
+                pass
+            try:
+                plugin_outline = (mpp_message_default or {}).get("Outline Width")
+                if plugin_outline is not None and str(plugin_outline).strip() != "":
+                    st = dict(st)
+                    st["outline_width"] = int(float(plugin_outline))
+            except Exception:
+                pass
             # MV/MZ scene preview must follow the game runtime values only.
             # Do not apply YSB text-object correction values such as char_height
             # or line_spacing here; those are editor text-object controls, not
@@ -5440,15 +9436,51 @@ class MainWindowProjectPagesMixin:
 
             text_type = str(preview_payload.get("text_type") or meta.get("text_type") or "text")
             choice_group = {"enabled": False, "reason": "not_choice", "choices": [], "selected_index": 0}
+            previous_message_row = None
+            message_command_info = {"enabled": False, "reason": "not_message_command"}
             if self._maker_preview_text_type_is_choice(text_type):
-                choice_group = self._maker_preview_choice_group_for_row(row, curr)
-                previous_message_row = self._maker_preview_previous_message_for_choice(row, curr)
-                if isinstance(previous_message_row, dict):
+                if isinstance(blueprint, dict) and isinstance(blueprint.get("choice_group"), dict):
+                    choice_group = dict(blueprint.get("choice_group") or {})
+                    previous_message_row = self._maker_previous_message_row_from_blueprint(blueprint, curr)
+                    message_command_info = dict(blueprint.get("previous_message_command_info") or {}) if isinstance(blueprint.get("previous_message_command_info"), dict) else message_command_info
+                    # Choice box/plugin structure is cached, but choice/help text
+                    # remains live editor data.  Merge only text-bearing fields.
+                    try:
+                        live_choice_group = self._maker_preview_choice_group_for_row(row, curr)
+                    except Exception:
+                        live_choice_group = None
+                    if isinstance(live_choice_group, dict):
+                        for _key in ("choices", "selected_index", "choice_help_text", "choice_help_diag"):
+                            if _key in live_choice_group:
+                                choice_group[_key] = live_choice_group.get(_key)
+                else:
+                    choice_group = self._maker_preview_choice_group_for_row(row, curr)
+                    previous_message_row = self._maker_preview_previous_message_for_choice(row, curr)
+                    if isinstance(previous_message_row, dict):
+                        try:
+                            message_command_info = self._maker_preview_message_command_info_for_row(previous_message_row)
+                        except Exception:
+                            pass
+                choice_help_text = str((choice_group or {}).get("choice_help_text") or "")
+                if choice_help_text.strip():
+                    # MPP_ChoiceEX and similar plugins store selected-choice help
+                    # in original event comments.  When the game provides it,
+                    # preview that runtime help instead of reusing the previous
+                    # Show Text line.
+                    body, source_label = choice_help_text, self.tr_ui("선택지 도움말")
+                elif isinstance(previous_message_row, dict):
                     body, source_label = self._maker_preview_message_body_for_row(previous_message_row)
                     source_label = self.tr_ui("선택지 이전 대사")
                 else:
                     body, source_label = "", self.tr_ui("선택지")
             else:
+                if isinstance(blueprint, dict) and isinstance(blueprint.get("message_command_info"), dict):
+                    message_command_info = dict(blueprint.get("message_command_info") or {})
+                else:
+                    try:
+                        message_command_info = self._maker_preview_message_command_info_for_row(row)
+                    except Exception:
+                        message_command_info = {"enabled": False, "reason": "error"}
                 body = str(preview_payload.get("body_for_preview") or "")
                 source_label = self.tr_ui("번역문") if str((row or {}).get("translated_text") or "").strip() else self.tr_ui("원문")
                 if not body.strip():
@@ -5457,11 +9489,21 @@ class MainWindowProjectPagesMixin:
                 # Overflow warnings are translation-review annotations.  Original
                 # text can be shown as a fallback preview, but it should not ask the
                 # user to insert line breaks into an untranslated row.
-                has_translation_for_warning = bool(str((row or {}).get("translated_text") or "").strip())
-                if self._maker_preview_text_type_is_choice(text_type) and isinstance(previous_message_row, dict):
-                    has_translation_for_warning = bool(str(previous_message_row.get("translated_text") or "").strip())
+                def _needs_api_translation_review(target_row):
+                    if not isinstance(target_row, dict):
+                        return False
+                    translated_value = bool(str(target_row.get("translated_text") or "").strip())
+                    origin = str(target_row.get("maker_translation_origin") or "").strip().lower()
+                    return bool(translated_value and origin == "api_translation")
+
+                has_translation_for_warning = _needs_api_translation_review(row)
+                if self._maker_preview_text_type_is_choice(text_type):
+                    if str((choice_group or {}).get("choice_help_text") or "").strip():
+                        has_translation_for_warning = False
+                    elif isinstance(previous_message_row, dict):
+                        has_translation_for_warning = _needs_api_translation_review(previous_message_row)
             except Exception:
-                has_translation_for_warning = bool(str((row or {}).get("translated_text") or "").strip())
+                has_translation_for_warning = False
             body_font = self._maker_preview_font(st, text_type=text_type, bold=False)
             body_font_load_diag_snapshot = dict(getattr(self, "_last_maker_preview_font_load_diag", {}) or {})
             try:
@@ -5506,7 +9548,17 @@ class MainWindowProjectPagesMixin:
                 raw_y = int(st.get("message_y") if st.get("message_y") is not None else -1)
             except Exception:
                 raw_y = -1
-            if raw_y < 0:
+            try:
+                message_position_type = int((message_command_info or {}).get("position_type")) if bool((message_command_info or {}).get("enabled")) else None
+            except Exception:
+                message_position_type = None
+            if message_position_type == 0:
+                box_y = max(0, int(margin))
+            elif message_position_type == 1:
+                box_y = max(0, int((canvas_h - box_h) / 2))
+            elif message_position_type == 2:
+                box_y = max(0, int(canvas_h - box_h - margin))
+            elif raw_y < 0:
                 box_y = max(0, int(canvas_h - box_h - margin))
             else:
                 box_y = max(0, min(int(canvas_h - box_h), raw_y))
@@ -5517,18 +9569,55 @@ class MainWindowProjectPagesMixin:
                 win_opacity = max(0, min(255, int(st.get("window_opacity") or 205)))
             except Exception:
                 win_opacity = 205
-            box, window_skin_diag = self._maker_preview_add_window_item(
-                scene,
-                box_x,
-                box_y,
-                message_w,
-                box_h,
-                z=100000,
-                opacity=win_opacity,
-                profile=profile,
-                fallback_pen=QPen(QColor(150, 185, 255, 230), 3),
-                fallback_brush=QBrush(QColor(8, 10, 12, win_opacity)),
-            )
+            try:
+                message_background_type = int((message_command_info or {}).get("background")) if bool((message_command_info or {}).get("enabled")) else 0
+            except Exception:
+                message_background_type = 0
+            if message_background_type == 2:
+                # RPG Maker transparent message background: keep the geometry as
+                # a tagged invisible item so text/name/choice layout still has a
+                # stable structural owner, but draw no frame or fill.
+                box = QGraphicsRectItem(QRectF(float(box_x), float(box_y), float(message_w), float(box_h)))
+                box.setPen(QPen(Qt.PenStyle.NoPen))
+                box.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+                box.setZValue(self._maker_preview_layer_z("message_window"))
+                scene.addItem(box)
+                window_skin_diag = {
+                    "mode": "show_text_transparent",
+                    "background_type": 2,
+                    "position_type": message_position_type,
+                }
+            elif message_background_type == 1:
+                # RPG Maker dim background.  It is not Window.png; using a dark
+                # borderless panel keeps the format distinct from normal windows.
+                box = QGraphicsRectItem(QRectF(float(box_x), float(box_y), float(message_w), float(box_h)))
+                box.setPen(QPen(Qt.PenStyle.NoPen))
+                box.setBrush(QBrush(QColor(0, 0, 0, max(90, min(220, int(win_opacity * 0.78))))))
+                box.setZValue(self._maker_preview_layer_z("message_window"))
+                scene.addItem(box)
+                window_skin_diag = {
+                    "mode": "show_text_dim",
+                    "background_type": 1,
+                    "position_type": message_position_type,
+                }
+            else:
+                box, window_skin_diag = self._maker_preview_add_window_item(
+                    scene,
+                    box_x,
+                    box_y,
+                    message_w,
+                    box_h,
+                    z=self._maker_preview_layer_z("message_window"),
+                    opacity=win_opacity,
+                    profile=profile,
+                    fallback_pen=QPen(QColor(150, 185, 255, 230), 3),
+                    fallback_brush=QBrush(QColor(8, 10, 12, win_opacity)),
+                    window_class="Window_Message",
+                )
+            try:
+                box.setData(1, "maker_dialogue_message_box")
+            except Exception:
+                pass
             overlay.append(box)
 
             # Name window.  Only render when we actually have a speaker; Unknown
@@ -5559,29 +9648,57 @@ class MainWindowProjectPagesMixin:
                 try:
                     maker_item_padding = max(0, int(st.get("item_padding") or 8))
                     maker_win_padding = max(0, int(st.get("message_padding") or 12))
-                    name_pad_x = max(0, int(st.get("name_padding_x") or (maker_win_padding + maker_item_padding)))
-                    name_pad_y = max(0, int(st.get("name_padding_y") or maker_win_padding))
+                    plugin_name_padding = (mpp_name_window or {}).get("Padding")
+                    name_pad_x = max(0, int(float(plugin_name_padding))) if plugin_name_padding not in (None, "") else max(0, int(st.get("name_padding_x") or (maker_win_padding + maker_item_padding)))
+                    name_pad_y = max(0, int(float(plugin_name_padding))) if plugin_name_padding not in (None, "") else max(0, int(st.get("name_padding_y") or maker_win_padding))
                     name_min_w = max(32, int(st.get("name_min_width") or 96))
                     name_min_h = max(24, int(st.get("name_min_height") or (base_line_h + maker_win_padding * 2)))
                     name_overlap = int(st.get("name_overlap") or 0)
+                    fixed_w = int(float((mpp_name_window or {}).get("Fixed Width") or 0))
+                    name_offset_x = int(float((mpp_name_window or {}).get("Offset X") or 0))
+                    name_offset_y = int(float((mpp_name_window or {}).get("Offset Y") or 0))
                 except Exception:
                     name_pad_x, name_pad_y, name_min_w, name_min_h, name_overlap = 20, 12, 96, 60, 0
+                    fixed_w, name_offset_x, name_offset_y = 0, 0, 0
                 name_h = max(name_min_h, name_text_h + name_pad_y * 2)
-                name_w = min(max(name_min_w, name_text_w + name_pad_x * 2), max(name_min_w, int(message_w * 0.62)))
-                name_x = box_x + 0
-                name_y = max(0, box_y - name_h + name_overlap)
-                name_box, name_window_skin_diag = self._maker_preview_add_window_item(
-                    scene,
-                    name_x,
-                    name_y,
-                    name_w,
-                    name_h,
-                    z=100001,
-                    opacity=win_opacity,
-                    profile=profile,
-                    fallback_pen=QPen(QColor(150, 185, 255, 230), 3),
-                    fallback_brush=QBrush(QColor(8, 10, 12, 218)),
-                )
+                if fixed_w > 0:
+                    name_w = min(max(name_min_w, fixed_w), int(canvas_w))
+                else:
+                    name_w = min(max(name_min_w, name_text_w + name_pad_x * 2), max(name_min_w, int(message_w * 0.62)))
+                name_x = max(0, min(int(canvas_w - name_w), int(box_x + name_offset_x)))
+                name_y = max(0, int(box_y - name_h + name_overlap + name_offset_y))
+                if message_background_type == 2:
+                    name_box = QGraphicsRectItem(QRectF(float(name_x), float(name_y), float(name_w), float(name_h)))
+                    name_box.setPen(QPen(Qt.PenStyle.NoPen))
+                    name_box.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+                    name_box.setZValue(self._maker_preview_layer_z("name_window"))
+                    scene.addItem(name_box)
+                    name_window_skin_diag = {"mode": "show_text_transparent", "background_type": 2}
+                elif message_background_type == 1:
+                    name_box = QGraphicsRectItem(QRectF(float(name_x), float(name_y), float(name_w), float(name_h)))
+                    name_box.setPen(QPen(Qt.PenStyle.NoPen))
+                    name_box.setBrush(QBrush(QColor(0, 0, 0, max(90, min(220, int(win_opacity * 0.78))))))
+                    name_box.setZValue(self._maker_preview_layer_z("name_window"))
+                    scene.addItem(name_box)
+                    name_window_skin_diag = {"mode": "show_text_dim", "background_type": 1}
+                else:
+                    name_box, name_window_skin_diag = self._maker_preview_add_window_item(
+                        scene,
+                        name_x,
+                        name_y,
+                        name_w,
+                        name_h,
+                        z=self._maker_preview_layer_z("name_window"),
+                        opacity=win_opacity,
+                        profile=profile,
+                        fallback_pen=QPen(QColor(150, 185, 255, 230), 3),
+                        fallback_brush=QBrush(QColor(8, 10, 12, 218)),
+                        window_class="Window_NameBox",
+                    )
+                try:
+                    name_box.setData(1, "maker_dialogue_name_box")
+                except Exception:
+                    pass
                 overlay.append(name_box)
                 try:
                     # Qt text items use top-left glyph bounds; MZ Window_NameBox
@@ -5617,10 +9734,26 @@ class MainWindowProjectPagesMixin:
                     # QGraphicsTextItem a wrapping width here; if the name is
                     # wider, the window width calculation above must grow.
                     width=None,
-                    z=100003,
+                    z=self._maker_preview_layer_z("message_text", order=1),
                     height_scale=height_scale,
                 )
+                for _it in name_items:
+                    try:
+                        _it.setData(1, "maker_dialogue_speaker_text")
+                    except Exception:
+                        pass
                 overlay.extend(name_items)
+                speaker_render_context = {
+                    "x": name_text_x,
+                    "y": name_text_y,
+                    "font": QFont(name_font),
+                    "text_color": QColor(self._maker_preview_color(st.get("text_color"), "#FFFFFF")),
+                    "outline_color": QColor(self._maker_preview_color(st.get("outline_color"), "#202020")),
+                    "outline_width": self._maker_preview_effective_outline_width(st, st.get("outline_width") or 0),
+                    "width": None,
+                    "z": self._maker_preview_layer_z("message_text", order=1),
+                    "height_scale": height_scale,
+                }
 
             # Main message text.
             text_color = self._maker_preview_color(st.get("text_color"), "#FFFFFF")
@@ -5653,7 +9786,7 @@ class MainWindowProjectPagesMixin:
                     width=body_width,
                     max_lines=max_lines,
                     line_height=line_h,
-                    z=100004,
+                    z=self._maker_preview_layer_z("message_text"),
                     profile=profile,
                     height_scale=height_scale,
                 )
@@ -5672,7 +9805,7 @@ class MainWindowProjectPagesMixin:
                     outline_color=outline_color,
                     outline_width=outline_width,
                     width=None,
-                    z=100004,
+                    z=self._maker_preview_layer_z("message_text"),
                     height_scale=height_scale,
                 )
                 control_text_diag = {
@@ -5685,7 +9818,24 @@ class MainWindowProjectPagesMixin:
                     "error": str(_text_e),
                     "error_type": type(_text_e).__name__,
                 }
+            for _it in body_items:
+                try:
+                    _it.setData(1, "maker_dialogue_body_text")
+                except Exception:
+                    pass
             overlay.extend(body_items)
+            body_render_context = {
+                "x": body_x,
+                "y": body_y,
+                "settings": dict(st or {}),
+                "base_font": QFont(body_font),
+                "width": body_width,
+                "max_lines": max_lines,
+                "line_height": line_h,
+                "z": self._maker_preview_layer_z("message_text"),
+                "profile": dict(profile or {}),
+                "height_scale": height_scale,
+            }
             try:
                 renderer_width_overflow = bool((control_text_diag or {}).get("width_overflow"))
                 renderer_line_overflow = bool((control_text_diag or {}).get("line_count", line_count) and int((control_text_diag or {}).get("line_count") or line_count) > max_lines)
@@ -5709,6 +9859,11 @@ class MainWindowProjectPagesMixin:
                         canvas_h=canvas_h,
                         message_box=(box_x, box_y, message_w, box_h),
                         profile=profile,
+                        layout_spec=(
+                            ((blueprint.get("render_spec") or {}).get("choice_window"))
+                            if isinstance(blueprint, dict) and isinstance(blueprint.get("render_spec"), dict)
+                            else None
+                        ),
                     )
                     overlay.extend(choice_items)
                 else:
@@ -5756,6 +9911,10 @@ class MainWindowProjectPagesMixin:
                     warn_y = max(0, box_y - 20)
                 warn_item.setPos(box_x + padding, warn_y)
                 warn_item.setZValue(100006)
+                try:
+                    warn_item.setData(1, "maker_dialogue_text_warning")
+                except Exception:
+                    pass
                 scene.addItem(warn_item)
                 overlay.append(warn_item)
 
@@ -5788,6 +9947,8 @@ class MainWindowProjectPagesMixin:
                         "margin": margin, "padding": padding, "max_lines": max_lines,
                         "body_width": body_width, "configured_height": configured_h, "natural_height": natural_h,
                         "window_opacity": win_opacity,
+                        "background_type": message_background_type,
+                        "position_type": message_position_type,
                     },
                     "name_window": {
                         "enabled": bool(speaker),
@@ -5796,6 +9957,7 @@ class MainWindowProjectPagesMixin:
                         "pad_x": locals().get("name_pad_x", None), "pad_y": locals().get("name_pad_y", None),
                     },
                     "window_skin": window_skin_diag,
+                    "message_command": message_command_info,
                     "picture_state": picture_state_diag,
                     "picture_layers": rendered_picture_diag,
                     "choice_preview": choice_preview_diag,
@@ -5818,27 +9980,210 @@ class MainWindowProjectPagesMixin:
             except Exception:
                 pass
 
+            # Persist the actual non-text layout produced for this row.  This is
+            # the complete visual blueprint boundary: plugin pictures, message
+            # and name window geometry/background, and choice-window structure
+            # are structural; only body/speaker/choice strings remain live.
+            try:
+                if isinstance(blueprint, dict):
+                    blueprint["render_spec"] = {
+                        "screen": {"width": int(canvas_w), "height": int(canvas_h)},
+                        "message_window": {
+                            "x": int(box_x), "y": int(box_y),
+                            "width": int(message_w), "height": int(box_h),
+                            "padding": int(padding), "max_lines": int(max_lines),
+                            "background_type": int(message_background_type),
+                            "position_type": message_position_type,
+                            "window_skin_mode": str((window_skin_diag or {}).get("mode") or "window_skin"),
+                        },
+                        "name_window": {
+                            "enabled": bool(speaker),
+                            "x": locals().get("name_x"), "y": locals().get("name_y"),
+                            "width": locals().get("name_w"), "height": locals().get("name_h"),
+                        },
+                        "choice_window": dict(choice_preview_diag or {}),
+                        "message_command": dict(message_command_info or {}),
+                    }
+            except Exception:
+                pass
+
+            # Strongly separate the fixed dialogue UI layer from transient preview
+            # decorations.  Message/name/choice windows and their text are not
+            # disposable preview layers; they survive selection changes and base
+            # image rebuilds.
+            transient_overlay = []
+            dialogue_overlay = []
+            try:
+                preview_generation = int(getattr(self, "_maker_preview_generation", 0) or 0) + 1
+            except Exception:
+                preview_generation = 1
+            self._maker_preview_generation = preview_generation
+            preview_row_id = str((row or {}).get("id") or "")
             try:
                 for _ov in overlay:
                     try:
-                        _ov.setData(0, "maker_preview_overlay")
+                        z = float(_ov.zValue())
                     except Exception:
-                        pass
+                        z = 0.0
+                    try:
+                        if z >= 100000.0:
+                            _ov.setData(0, "maker_dialogue_overlay")
+                            dialogue_overlay.append(_ov)
+                        else:
+                            _ov.setData(0, "maker_preview_overlay")
+                            transient_overlay.append(_ov)
+                        _ov.setData(2, int(preview_generation))
+                        _ov.setData(3, preview_row_id)
+                        _ov.setData(4, "maker_dynamic_preview")
+                    except Exception:
+                        try:
+                            transient_overlay.append(_ov)
+                        except Exception:
+                            pass
+            except Exception:
+                transient_overlay = list(overlay or [])
+                dialogue_overlay = []
+            # Atomic swap: now that every new item exists, remove the previous
+            # transient/dialogue objects in one blocked scene update.  The text box
+            # therefore never disappears between selection and preview rendering.
+            try:
+                self._maker_remove_stale_dynamic_preview_items(
+                    scene,
+                    keep_items=list(transient_overlay or []) + list(dialogue_overlay or []),
+                    reason=f"row_blueprint_apply:{preview_row_id}",
+                )
+            except Exception:
+                # Compatibility fallback for environments where the scene scan
+                # itself fails: at least remove the latest tracked generation.
+                try:
+                    old_items = list(old_transient_overlay or []) + list(old_dialogue_overlay or [])
+                    new_ids = {id(x) for x in (list(transient_overlay or []) + list(dialogue_overlay or []))}
+                    for _old in old_items:
+                        try:
+                            if _old is not None and id(_old) not in new_ids and _old.scene() is scene:
+                                _old.setVisible(False)
+                                scene.removeItem(_old)
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+            self._maker_preview_overlay_items = transient_overlay
+            self._maker_dialogue_overlay_items = dialogue_overlay
+            try:
+                _aux_text_items = []
+                for _item in list(dialogue_overlay or []):
+                    try:
+                        if str(_item.data(1) or "") in {"maker_dialogue_text_warning", "maker_dialogue_choice_text"}:
+                            _aux_text_items.append(_item)
+                    except Exception:
+                        continue
+                self._maker_dialogue_text_items = {
+                    "body": list(body_items or []),
+                    "speaker": list(name_items or []),
+                    "aux": _aux_text_items,
+                    "choice": [],
+                }
+                self._maker_dialogue_text_render_context = {
+                    "body": body_render_context,
+                    "speaker": speaker_render_context,
+                    "name_box": name_box,
+                    "page_idx": int(getattr(self, "idx", 0) or 0),
+                }
+                self._maker_dialogue_current_row_id = str((row or {}).get("id") or "")
             except Exception:
                 pass
-            self._maker_preview_overlay_items = overlay
+            try:
+                self._maker_dialogue_overlay_preserve_enabled = bool(dialogue_overlay)
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "audit_boundary_event"):
+                    self.audit_boundary_event("MAKER_DIALOGUE_OVERLAY_ISOLATED", transient_count=len(transient_overlay), dialogue_count=len(dialogue_overlay), throttle_ms=200)
+            except Exception:
+                pass
+            try:
+                row_id = row.get("id") if isinstance(row, dict) else None
+                if row_id is not None:
+                    self._maker_fixed_preview_last_row_id = str(row_id)
+                    self._maker_fixed_preview_last_page_idx = int(getattr(self, "idx", 0) or 0)
+                    self._maker_fixed_preview_last_map_file = str(((row.get("maker_text_unit") or {}) if isinstance(row, dict) else {}).get("map_file") or "")
+            except Exception:
+                pass
+            try:
+                self._maker_current_preview_is_fallback = False
+            except Exception:
+                pass
             try:
                 scene.update()
             except Exception:
                 pass
+            # No background cache warming from table selection.  Selection and
+            # visible preview rendering end here; unseen rows are prepared only
+            # when the user actually opens them.
             return True
         except Exception as e:
+            # A failed full render must be diagnosable.  Previous builds only
+            # recorded that a fallback was used, which hid the actual command
+            # and exception responsible for unsupported windows.
+            try:
+                import traceback as _traceback
+                _trace = _traceback.format_exc(limit=40)
+            except Exception:
+                _trace = ""
+            try:
+                _meta = (row or {}).get("maker_text_unit") if isinstance(row, dict) else {}
+                if not isinstance(_meta, dict):
+                    _meta = {}
+                _failure_payload = {
+                    "row_id": str((row or {}).get("id") or "") if isinstance(row, dict) else "",
+                    "page_idx": int(getattr(self, "idx", 0) or 0),
+                    "map_file": str(_meta.get("map_file") or ""),
+                    "event_id": _meta.get("event_id"),
+                    "event_page_index": _meta.get("page_index"),
+                    "command_index": _meta.get("command_index"),
+                    "command_code": _meta.get("code"),
+                    "text_type": str(_meta.get("text_type") or (row or {}).get("type") or "") if isinstance(row, dict) else "",
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                    "traceback": str(_trace or "")[-5000:],
+                    "blueprint_present": bool(isinstance(locals().get("blueprint"), dict)),
+                }
+            except Exception:
+                _failure_payload = {"error_type": type(e).__name__, "error": str(e)}
             try:
                 self.log(self.tr_ui("⚠️ 쯔꾸르 선택 프리뷰 갱신 실패: {error}", error=e))
             except Exception:
                 pass
-            # Last-resort fallback: keep the already-rendered map base, but draw
-            # the selected row's message box so users can still inspect the text.
+            try:
+                self.audit_boundary_event("MAKER_ROW_PREVIEW_RENDER_FAILED", **_failure_payload)
+            except Exception:
+                pass
+            try:
+                self._append_maker_preview_diagnostic("scene_preview_render_failed", _failure_payload)
+            except Exception:
+                pass
+
+            # Remove every object belonging to the half-built replacement
+            # generation.  The old complete scene remains visible until the
+            # fallback has been fully created.
+            try:
+                old_ids = {
+                    id(x) for x in (list(old_transient_overlay or []) + list(old_dialogue_overlay or []))
+                    if x is not None
+                }
+                for _new in list(overlay or []):
+                    try:
+                        if _new is not None and id(_new) not in old_ids and _new.scene() is scene:
+                            _new.setVisible(False)
+                            scene.removeItem(_new)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            # The emergency fallback participates in exactly the same generation
+            # lifecycle as a normal blueprint.  This is what prevents fallback
+            # text/window children from surviving into the next row.
             try:
                 fallback_items, fallback_diag = self._maker_preview_add_minimal_message_fallback(
                     scene, row, curr, locals().get("st", {}) or {},
@@ -5848,9 +10193,69 @@ class MainWindowProjectPagesMixin:
                     reason=f"full_preview_failed:{type(e).__name__}",
                 )
                 if fallback_items:
-                    self._maker_preview_overlay_items = list(fallback_items)
+                    fallback_generation = int(getattr(self, "_maker_preview_generation", 0) or 0) + 1
+                    fallback_row_id = str((row or {}).get("id") or "") if isinstance(row, dict) else ""
+                    for _root in list(fallback_items or []):
+                        self._maker_tag_dynamic_preview_tree(
+                            _root,
+                            marker="maker_dialogue_overlay",
+                            generation=fallback_generation,
+                            row_id=fallback_row_id,
+                            role="maker_dialogue_fallback_item",
+                        )
                     try:
-                        self._append_maker_preview_diagnostic("scene_preview_render_fallback", fallback_diag)
+                        _purge = self._maker_remove_stale_dynamic_preview_items(
+                            scene,
+                            keep_items=list(fallback_items),
+                            reason=f"row_preview_fallback:{fallback_row_id}",
+                        )
+                    except Exception:
+                        _purge = None
+                    self._maker_preview_generation = fallback_generation
+                    self._maker_preview_overlay_items = []
+                    self._maker_dialogue_overlay_items = list(fallback_items)
+                    _fallback_body = []
+                    for _item in list(fallback_items):
+                        try:
+                            if str(_item.data(1) or "") == "maker_dialogue_body_text":
+                                _fallback_body.append(_item)
+                        except Exception:
+                            continue
+                    self._maker_dialogue_text_items = {
+                        "body": _fallback_body,
+                        "speaker": [],
+                        "aux": [],
+                        "choice": [],
+                    }
+                    self._maker_dialogue_text_render_context = None
+                    self._maker_dialogue_current_row_id = fallback_row_id
+                    self._maker_dialogue_overlay_preserve_enabled = True
+                    self._maker_current_preview_is_fallback = True
+                    try:
+                        self._maker_fixed_preview_last_row_id = fallback_row_id
+                        self._maker_fixed_preview_last_page_idx = int(getattr(self, "idx", 0) or 0)
+                        self._maker_fixed_preview_last_map_file = str(_failure_payload.get("map_file") or "")
+                    except Exception:
+                        pass
+                    try:
+                        _diag = dict(fallback_diag or {})
+                        _diag.update({
+                            "row_id": fallback_row_id,
+                            "generation": fallback_generation,
+                            "render_failure": _failure_payload,
+                        })
+                        self._append_maker_preview_diagnostic("scene_preview_render_fallback", _diag)
+                    except Exception:
+                        pass
+                    try:
+                        self.audit_boundary_event(
+                            "MAKER_ROW_PREVIEW_FALLBACK_APPLIED",
+                            row_id=fallback_row_id,
+                            generation=fallback_generation,
+                            item_count=len(fallback_items),
+                            purge_result=str(_purge),
+                            source_error=f"{type(e).__name__}: {e}",
+                        )
                     except Exception:
                         pass
                     try:
@@ -5858,65 +10263,114 @@ class MainWindowProjectPagesMixin:
                     except Exception:
                         pass
                     return True
+            except Exception as fallback_error:
+                try:
+                    import traceback as _traceback
+                    _fallback_trace = _traceback.format_exc(limit=30)
+                except Exception:
+                    _fallback_trace = ""
+                try:
+                    self.audit_boundary_event(
+                        "MAKER_ROW_PREVIEW_FALLBACK_FAILED",
+                        row_id=str((row or {}).get("id") or "") if isinstance(row, dict) else "",
+                        error_type=type(fallback_error).__name__,
+                        error=str(fallback_error),
+                        traceback=str(_fallback_trace or "")[-5000:],
+                    )
+                except Exception:
+                    pass
+
+            # If even the fallback cannot be created, preserve the last complete
+            # preview rather than clearing the dialogue layer.
+            try:
+                if not bool(fixed_restore):
+                    self._maker_restore_fixed_preview_overlay_if_needed(reason="render_failed_keep_fixed_box")
             except Exception:
                 pass
-            self._clear_maker_preview_selection_overlay()
             return False
 
     def selected_table_text_ids(self):
-        if not hasattr(self, 'tab'):
+        if not hasattr(self, 'tab') or self.tab is None:
             return []
-        rows = sorted({idx.row() for idx in self.tab.selectedIndexes() if idx.row() > 0})
+        rows = set()
+        # selectedIndexes()는 넓은 범위 선택에서 셀 수만큼 QModelIndex를
+        # 만들기 때문에 300행 x 여러 열 선택 시 불필요하게 무겁다.
+        # 행 단위 판단은 selectedRanges()로 먼저 처리한다.
+        try:
+            ranges = list(self.tab.selectedRanges() or [])
+        except Exception:
+            ranges = []
+        if ranges:
+            for r in ranges:
+                try:
+                    top = max(1, int(r.topRow()))
+                    bottom = int(r.bottomRow())
+                    for row in range(top, bottom + 1):
+                        rows.add(row)
+                except Exception:
+                    continue
+        else:
+            try:
+                rows = {idx.row() for idx in self.tab.selectedIndexes() if idx.row() > 0}
+            except Exception:
+                rows = set()
         ids = []
-        for row in rows:
-            item = self.tab.item(row, 0)
+        for row in sorted(rows):
+            try:
+                item = self.tab.item(row, 0)
+            except Exception:
+                item = None
             if item:
                 ids.append(item.text().strip())
         return ids
 
-    def on_table_selection_changed(self):
+    def on_table_selection_changed(self, *args, **kwargs):
+        _perf_t0 = perf_counter()
+        _perf_action_id = next_action_id("on_table_selection_changed")
+        _perf_ok = False
+        try:
+            _res = self._perf_impl_on_table_selection_changed(*args, **kwargs)
+            _perf_ok = True
+            return _res
+        finally:
+            try:
+                perf_log_elapsed(self, "PERF_USER_ACTION", _perf_t0, action="on_table_selection_changed", action_id=_perf_action_id, ok=bool(_perf_ok), args_count=len(args), kwargs=','.join(sorted([str(k) for k in kwargs.keys()])))
+            except Exception:
+                pass
+
+    def _perf_impl_on_table_selection_changed(self):
+        """Handle table selection as selection only.
+
+        This path intentionally does exactly three things for Maker pages:
+        collect selected rows, cache them for commands such as translate/copy,
+        and repaint the row marker overlay.  Preview rendering is committed by a
+        separate mouse/key action after selection has settled.
+        """
         if self._syncing_selection:
             return
         if getattr(self, "_app_is_closing", False) or getattr(self, "_closing_confirmed", False):
             return
         try:
-            if hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode():
+            if hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode():
+                self.refresh_maker_table_current_row_marker()
                 try:
-                    self.refresh_maker_table_current_row_marker()
+                    self._maker_last_selected_translate_rows = set(getattr(self, "_maker_table_current_marker_rows", set()) or set())
                 except Exception:
-                    pass
-                self.refresh_maker_database_preview_from_selection()
+                    self._maker_last_selected_translate_rows = set()
                 return
         except Exception:
             pass
         try:
             if self._is_current_maker_page():
-                # Keep the table Excel-like: the selected cell/range remains real
-                # selection, while the current row is only repainted as a marker.
+                self.refresh_maker_table_current_row_marker()
                 try:
-                    self.refresh_maker_table_current_row_marker()
+                    self._maker_last_selected_translate_rows = set(getattr(self, "_maker_table_current_marker_rows", set()) or set())
                 except Exception:
-                    pass
-                self.update_maker_preview_selection_from_table()
-                try:
-                    if str(getattr(self, "maker_control_code_display_mode", "hidden") or "hidden") == "current":
-                        if not bool(getattr(self, "_maker_control_selection_refresh_lock", False)):
-                            self._maker_control_selection_refresh_lock = True
-                            try:
-                                if hasattr(self, "refresh_maker_control_code_source_cells"):
-                                    self.refresh_maker_control_code_source_cells()
-                            finally:
-                                self._maker_control_selection_refresh_lock = False
-                except Exception:
-                    try:
-                        self._maker_control_selection_refresh_lock = False
-                    except Exception:
-                        pass
-                # Maker 표 선택은 좌측 scene에 역동기화하지 않는다.
-                # 이 return이 없으면 drag range가 select_table_rows_by_ids()/scene sync에 의해 즉시 깨진다.
+                    self._maker_last_selected_translate_rows = set()
                 return
         except Exception:
             pass
+        # Non-Maker image/text pages keep their original scene-selection sync.
         if self.cb_mode.currentIndex() != 4:
             return
         scene = self._safe_graphics_scene()
@@ -5942,8 +10396,270 @@ class MainWindowProjectPagesMixin:
             pass
         finally:
             self._syncing_selection = False
-        # 우측 스타일 칸은 첫 선택 항목 기준으로 맞춘다.
         self.on_scene_selection_changed()
+
+    def schedule_maker_table_selection_commit(self, source="mouse_single"):
+        """Queue only the latest explicit single-row activation.
+
+        Arrow-key repeats and mouse/keyboard events can leave several zero-delay
+        callbacks pending.  Each callback now carries a request, page, and preview
+        lifecycle token so an older row can never overwrite the newest row.
+        """
+        if hasattr(self, "is_maker_preview_enabled") and not self.is_maker_preview_enabled():
+            return False
+        try:
+            if hasattr(self, "_is_maker_text_mutation_active") and self._is_maker_text_mutation_active():
+                return False
+            epoch = int(getattr(self, "_maker_preview_commit_epoch", 0) or 0)
+            request_id = int(getattr(self, "_maker_single_activation_request_id", 0) or 0) + 1
+            self._maker_single_activation_request_id = request_id
+            page_idx = int(getattr(self, "idx", -1) or -1)
+            lifecycle_token = int(getattr(self, "_maker_preview_lifecycle_token", 0) or 0)
+            QTimer.singleShot(
+                0,
+                lambda e=epoch, r=request_id, p=page_idx, l=lifecycle_token, s=str(source or "mouse_single"): self.on_maker_table_selection_committed(
+                    expected_epoch=e,
+                    expected_request_id=r,
+                    expected_page_idx=p,
+                    expected_lifecycle_token=l,
+                    source=s,
+                ),
+            )
+            return True
+        except Exception:
+            return False
+
+    def on_maker_table_selection_committed(
+        self,
+        expected_epoch=None,
+        expected_request_id=None,
+        expected_page_idx=None,
+        expected_lifecycle_token=None,
+        source="mouse_single",
+    ):
+        """Activate one Maker row from an explicit mouse or keyboard action.
+
+        Selection changes remain lightweight.  Preview/text activation is allowed
+        only after the input action has settled and exactly one visible Maker row
+        remains marked.  Plain mouse clicks and plain Space/Enter/arrow navigation
+        share this same single-row rule.
+        """
+        if hasattr(self, "is_maker_preview_enabled") and not self.is_maker_preview_enabled():
+            return False
+        try:
+            source = str(source or "")
+            if source not in {"mouse_single", "keyboard_single"}:
+                return False
+            current_request_id = int(getattr(self, "_maker_single_activation_request_id", 0) or 0)
+            if expected_request_id is not None and int(expected_request_id) != current_request_id:
+                try:
+                    self.audit_boundary_event(
+                        "MAKER_SINGLE_ROW_ACTIVATION_STALE_DROPPED",
+                        expected_request_id=int(expected_request_id),
+                        current_request_id=current_request_id,
+                        source=source,
+                    )
+                except Exception:
+                    pass
+                return False
+            if expected_page_idx is not None and int(expected_page_idx) != int(getattr(self, "idx", -1) or -1):
+                return False
+            if expected_lifecycle_token is not None and int(expected_lifecycle_token) != int(getattr(self, "_maker_preview_lifecycle_token", 0) or 0):
+                return False
+            if hasattr(self, "_is_maker_text_mutation_active") and self._is_maker_text_mutation_active():
+                return False
+            current_epoch = int(getattr(self, "_maker_preview_commit_epoch", 0) or 0)
+            if expected_epoch is not None and int(expected_epoch) != current_epoch:
+                try:
+                    self.audit_boundary_event(
+                        "MAKER_PREVIEW_COMMIT_STALE_DROPPED",
+                        expected_epoch=int(expected_epoch),
+                        current_epoch=int(current_epoch),
+                        source=str(source),
+                    )
+                except Exception:
+                    pass
+                return False
+            if self._syncing_selection or getattr(self, "_maker_bulk_text_editing", False):
+                return False
+            if not self._is_current_maker_page():
+                return False
+            rows = set(getattr(self, "_maker_table_current_marker_rows", set()) or set())
+            if len(rows) != 1:
+                return False
+            table_row = next(iter(rows))
+            if table_row <= 0:
+                return False
+            curr = self.data.get(self.idx) if isinstance(getattr(self, "data", None), dict) else None
+            data_rows = (curr or {}).get("data") or []
+            data_index = int(table_row) - 1
+            if data_index < 0 or data_index >= len(data_rows):
+                return False
+            row = data_rows[data_index]
+            if not isinstance(row, dict):
+                return False
+            # 프리뷰 OFF 뒤 처음 클릭한 행이라면 현재 페이지의 기준 이미지 한 장만
+            # 복구한다. 전체 페이지/전체 행 캐시는 만들지 않는다.
+            try:
+                self._ensure_current_maker_preview_base_for_single_row()
+            except Exception:
+                pass
+            had_pending_table_text = False
+            try:
+                if hasattr(self, "_maker_table_pending_refresh_rows"):
+                    had_pending_table_text = int(table_row) in set(self._maker_table_pending_refresh_rows(
+                        page_idx=int(getattr(self, "idx", 0) or 0), db_mode=False
+                    ))
+            except Exception:
+                had_pending_table_text = False
+            try:
+                if hasattr(self, "sync_maker_table_row_from_data"):
+                    self.sync_maker_table_row_from_data(
+                        table_row,
+                        page_idx=int(getattr(self, "idx", 0) or 0),
+                        db_mode=False,
+                        resize=True,
+                        force=False,
+                    )
+            except Exception:
+                pass
+            row_id = str(row.get("id"))
+
+            # Project open/import must finish every structural blueprint before
+            # the editor becomes interactive.  Row activation never opens a build
+            # progress dialog.  A missing entry is treated as cache corruption and
+            # repaired silently for that row only, then persisted for the next open.
+            try:
+                blueprint = self._maker_row_preview_blueprint_for_row(
+                    row,
+                    page=curr,
+                    build_if_missing=False,
+                )
+            except Exception:
+                blueprint = None
+            if not isinstance(blueprint, dict):
+                try:
+                    self.audit_boundary_event(
+                        "MAKER_ROW_PREVIEW_BLUEPRINT_MISSING_AT_ACTIVATION",
+                        row_id=row_id,
+                        page_idx=int(getattr(self, "idx", 0) or 0),
+                        source=source,
+                    )
+                except Exception:
+                    pass
+                try:
+                    blueprint = self._maker_build_row_preview_blueprint(row, page=curr)
+                    if isinstance(blueprint, dict):
+                        page_key = self._maker_row_preview_blueprint_page_key()
+                        cache = getattr(self, "_maker_row_preview_blueprint_cache", None)
+                        if not isinstance(cache, dict):
+                            cache = {}
+                            self._maker_row_preview_blueprint_cache = cache
+                        page_cache = cache.setdefault(page_key, {"rows": {}, "complete": False})
+                        page_cache.setdefault("rows", {})[row_id] = blueprint
+                        self._maker_save_row_preview_blueprints_to_disk(reason="activation_missing_cache_repair")
+                except Exception:
+                    blueprint = None
+
+            current_preview_row_id = str(getattr(self, "_maker_dialogue_current_row_id", "") or "")
+            overlay_ready = False
+            try:
+                overlay_ready = bool(self._maker_dialogue_overlay_items_alive())
+            except Exception:
+                overlay_ready = False
+
+            try:
+                preview_is_fallback = bool(getattr(self, "_maker_current_preview_is_fallback", False))
+            except Exception:
+                preview_is_fallback = False
+
+            # Different rows never share the first row's visual structure.  A
+            # fallback preview is also retried through the full blueprint path on
+            # the next explicit activation instead of using text-only refresh.
+            if (not overlay_ready) or current_preview_row_id != row_id or preview_is_fallback:
+                initialized = False
+                try:
+                    initialized = bool(self.update_maker_preview_selection_from_table(
+                        row_override=row,
+                        fixed_restore=True,
+                        preview_blueprint=blueprint,
+                    ))
+                except Exception:
+                    initialized = False
+                if initialized:
+                    self._maker_preview_committed_row_id = row_id
+                    try:
+                        self.audit_boundary_event(
+                            "MAKER_ROW_PREVIEW_BLUEPRINT_APPLIED",
+                            row_id=row_id,
+                            source=source,
+                            request_id=expected_request_id,
+                            cache_hit=bool(isinstance(blueprint, dict)),
+                            fallback_used=bool(getattr(self, "_maker_current_preview_is_fallback", False)),
+                        )
+                    except Exception:
+                        pass
+                    return True
+                try:
+                    self.audit_boundary_event(
+                        "MAKER_ROW_PREVIEW_BLUEPRINT_APPLY_FAILED",
+                        row_id=row_id,
+                        source=source,
+                        request_id=expected_request_id,
+                    )
+                except Exception:
+                    pass
+                return False
+
+            # Re-activating the already visible row after editing is the only
+            # text-only path.  The row's plugin/picture/window structure remains
+            # untouched while body/speaker text is replaced.
+            refreshed = False
+            try:
+                refreshed = bool(self._maker_refresh_dialogue_text_only(
+                    row,
+                    reason=f"{source}_same_row_text_refresh",
+                    request_id=expected_request_id,
+                ))
+            except Exception:
+                refreshed = False
+            if refreshed:
+                self._maker_preview_committed_row_id = row_id
+                return True
+            # Choice rows use their own cached choice-window structure and cannot
+            # be represented by the body/speaker-only updater.  Reapply only that
+            # row's cached blueprint when the same choice row is explicitly
+            # activated again.
+            try:
+                text_type = str(((row.get("maker_text_unit") or {}) if isinstance(row, dict) else {}).get("text_type") or row.get("type") or "")
+            except Exception:
+                text_type = ""
+            if self._maker_preview_text_type_is_choice(text_type):
+                try:
+                    ok = bool(self.update_maker_preview_selection_from_table(
+                        row_override=row,
+                        fixed_restore=True,
+                        preview_blueprint=blueprint,
+                    ))
+                except Exception:
+                    ok = False
+                if ok:
+                    self._maker_preview_committed_row_id = row_id
+                    return True
+            try:
+                self.audit_boundary_event(
+                    "MAKER_SINGLE_ROW_TEXT_REFRESH_SKIPPED",
+                    row_id=row_id,
+                    source=source,
+                    request_id=expected_request_id,
+                    had_pending_table_text=bool(had_pending_table_text),
+                    fixed_preview_ready=bool(overlay_ready),
+                )
+            except Exception:
+                pass
+            return False
+        except Exception:
+            return False
 
     def configure_live_text_numeric_inputs(self):
         """텍스트 스타일 숫자 입력은 조작 즉시 화면에 반영한다.
@@ -6423,11 +11139,11 @@ class MainWindowProjectPagesMixin:
         out_path = os.path.join(txt_dir, f"{page_label}.txt")
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(self.build_text_export_content(self.idx, mode))
-        self.log((f"📄 Source/translation export complete: {out_path}" if self.ui_language == LANG_EN else f"📄 원문/번역문 내보내기 완료: {out_path}"))
+        self.log((f"📄 Source/translation export complete: {out_path}" if self.ui_language == LANG_EN else f"📄 원문/번역문 저장 완료: {out_path}"))
         try:
             QMessageBox.information(
                 self,
-                self.tr_ui("원문/번역문 내보내기 완료"),
+                self.tr_ui("원문/번역문 저장 완료"),
                 f"{self.tr_ui('현재 페이지의 원문/번역문 TXT 내보내기가 완료되었습니다.')}\n{out_path}",
             )
         except Exception:
@@ -6510,7 +11226,21 @@ class MainWindowProjectPagesMixin:
 
         return result
 
-    def apply_translation_map_to_page(self, page_idx, trans_map):
+    def apply_translation_map_to_page(self, *args, **kwargs):
+        _perf_t0 = perf_counter()
+        _perf_action_id = next_action_id("apply_translation_map_to_page")
+        _perf_ok = False
+        try:
+            _res = self._perf_impl_apply_translation_map_to_page(*args, **kwargs)
+            _perf_ok = True
+            return _res
+        finally:
+            try:
+                perf_log_elapsed(self, "PERF_USER_ACTION", _perf_t0, action="apply_translation_map_to_page", action_id=_perf_action_id, ok=bool(_perf_ok), args_count=len(args), kwargs=','.join(sorted([str(k) for k in kwargs.keys()])))
+            except Exception:
+                pass
+
+    def _perf_impl_apply_translation_map_to_page(self, page_idx, trans_map):
         curr = self.data.get(page_idx)
         if not curr:
             return 0
@@ -7272,11 +12002,18 @@ class MainWindowProjectPagesMixin:
         # 여기서 일반 작업 캐시 자동 저장을 예약하면 대량 이미지 저장이 다시 걸릴 수 있으므로 하지 않는다.
 
     def import_translation_current(self):
-        """TXT 번역문을 불러온다.
+        """TXT 번역문을 진행창에서 순차 불러온다.
 
         1개 선택: 현재 페이지에 적용.
         여러 개 선택: 파일명과 페이지명을 매칭해 각 페이지에 적용.
+
+        대량 TXT는 전체 결과/페이지 스냅샷을 메모리에 쌓지 않는다. 한 번에 한 파일만
+        열고, 일정 줄/항목만 처리한 뒤 이벤트 루프에 제어를 돌려 UI 프리징을 막는다.
+        이 외부 일괄 반영은 Undo 대상이 아니며 시작/종료 시 Undo 경계를 끊는다.
         """
+        if getattr(self, "is_batch_running", False):
+            QMessageBox.information(self, self.tr_ui("일괄 작업 중"), self.tr_msg("이미 일괄 작업이 진행 중입니다.\n현재 작업이 끝난 뒤 다시 실행해 주세요."))
+            return
         if not self.paths:
             return
         if self.idx not in self.data:
@@ -7313,50 +12050,403 @@ class MainWindowProjectPagesMixin:
                 QMessageBox.warning(self, self.tr_ui("번역문 불러오기"), self.tr_ui("선택한 번역문 파일명과 일치하는 페이지를 찾지 못했습니다."))
                 return
 
-        selected_indices = list(target_map.keys())
-        undo_rec = self.make_batch_page_data_undo_record(title, selected_indices)
-        changed = False
-        total_count = 0
+        selected_indices = [int(i) for i in target_map.keys() if 0 <= int(i) < len(self.paths)]
+        if not selected_indices:
+            return
+        self._start_streaming_translation_import(title, target_map, selected_indices, selected_label)
 
-        def process_page(page_idx):
-            nonlocal changed, total_count
-            curr = self.data.get(page_idx)
-            if not curr or not curr.get('data'):
-                return "skipped", "텍스트 데이터 없음"
-            path = target_map.get(page_idx)
-            if not path:
-                return "skipped", "매칭 파일 없음"
-            valid_ids = [str(x.get('id', n + 1)) for n, x in enumerate(curr.get('data', []))]
-            if not valid_ids:
-                return "skipped", "불러올 텍스트 번호 없음"
-            trans_map = self.parse_translation_txt(path, valid_ids)
-            if not trans_map:
-                return "skipped", "맞는 텍스트 번호 없음"
-            count = self.apply_translation_map_to_page(page_idx, trans_map)
-            if count <= 0:
-                return "skipped", "변경된 번역문 없음"
-            changed = True
-            total_count += count
-            return "done", f"{count}개 적용"
+    def _start_streaming_translation_import(self, title, target_map, selected_indices, selected_label):
+        """Start a timer-driven, memory-bounded translation TXT import."""
+        old_idx = int(getattr(self, "idx", 0) or 0)
+        old_mode = int(self.cb_mode.currentIndex()) if hasattr(self, "cb_mode") else 0
+        result = self._batch_result_new(title, "import_translation", selected_indices, selected_label)
+        self._batch_result = result
+        self._long_task_cancel_requested = False
+        self.is_batch_running = True
+        self.current_batch_mode = "import_translation"
+        self._translation_import_state = {
+            "title": str(title or "번역문 불러오기"),
+            "target_map": dict(target_map or {}),
+            "indices": list(selected_indices or []),
+            "page_pos": 0,
+            "processed_pages": 0,
+            "total_count": 0,
+            "changed": False,
+            "cancelled": False,
+            "old_idx": old_idx,
+            "old_mode": old_mode,
+            "file": None,
+            "current_page_idx": None,
+            "current_path": "",
+            "id_to_items": {},
+            "current_id": None,
+            "current_buf": [],
+            "current_page_changed": 0,
+            "current_page_matched": 0,
+            "current_page_items": 0,
+            "lines_read": 0,
+        }
+        try:
+            self.begin_busy_state(title)
+        except Exception:
+            pass
+        try:
+            self.set_project_action_interlock(True)
+        except Exception:
+            pass
+        try:
+            self.undo_break_boundary("translation_import", title)
+        except Exception:
+            try:
+                self.undo_clear_all_pages("translation TXT import")
+                self.undo_clear_project("translation TXT import")
+            except Exception:
+                pass
+        detail = self._translation_import_progress_detail()
+        self.show_task_progress_overlay(self.tr_ui(title), detail, total=len(selected_indices), cancellable=True)
+        try:
+            self.log(self.tr_ui("▶️ 번역문 불러오기 시작: 대상 {pages}페이지 ({label}) / Undo 미지원").format(pages=len(selected_indices), label=selected_label))
+        except Exception:
+            pass
+        QTimer.singleShot(0, self._translation_import_start_next_page)
 
-        result = self.run_page_queue_batch(title, "import_translation", selected_indices, selected_label, process_page, visual=False, cancellable=True)
+    def _translation_import_progress_detail(self, extra=""):
+        state = getattr(self, "_translation_import_state", None) or {}
+        total_pages = len(state.get("indices") or [])
+        processed = int(state.get("processed_pages") or 0)
+        page_idx = state.get("current_page_idx")
+        lines = [
+            self.tr_ui("선택 페이지 진행: {current}/{total}").format(current=processed, total=total_pages),
+        ]
+        if page_idx is None:
+            lines.append(self.tr_ui("현재 페이지: 대기 중"))
+        else:
+            lines.append(self.tr_ui("현재 페이지: {page}").format(page=self.batch_page_display_label(page_idx)))
+            lines.append(
+                self.tr_ui("현재 페이지 적용: {changed}개 / 전체 항목 {total}개").format(
+                    changed=int(state.get("current_page_changed") or 0),
+                    total=int(state.get("current_page_items") or 0),
+                )
+            )
+        lines.append(self.tr_ui("누적 적용: {count}개").format(count=int(state.get("total_count") or 0)))
+        lines.append(self.tr_ui("번역문 불러오기는 Undo를 지원하지 않습니다."))
+        if extra:
+            lines.append(str(extra))
+        return "\n".join(lines)
 
+    def _translation_import_close_current_file(self):
+        state = getattr(self, "_translation_import_state", None)
+        if not isinstance(state, dict):
+            return
+        fp = state.get("file")
+        state["file"] = None
+        if fp is not None:
+            try:
+                fp.close()
+            except Exception:
+                pass
+
+    def _translation_import_start_next_page(self):
+        state = getattr(self, "_translation_import_state", None)
+        if not isinstance(state, dict):
+            return
+        if bool(getattr(self, "_long_task_cancel_requested", False)):
+            state["cancelled"] = True
+            self._finish_streaming_translation_import()
+            return
+        indices = state.get("indices") or []
+        pos = int(state.get("page_pos") or 0)
+        if pos >= len(indices):
+            self._finish_streaming_translation_import()
+            return
+
+        page_idx = int(indices[pos])
+        state["current_page_idx"] = page_idx
+        state["current_path"] = str((state.get("target_map") or {}).get(page_idx) or "")
+        state["current_id"] = None
+        state["current_buf"] = []
+        state["current_page_changed"] = 0
+        state["current_page_matched"] = 0
+        state["current_page_items"] = 0
+        state["lines_read"] = 0
+
+        curr = (getattr(self, "data", {}) or {}).get(page_idx)
+        data_list = (curr or {}).get("data", []) if isinstance(curr, dict) else []
+        if not data_list:
+            self._batch_result_record(page_idx, status="skipped", message=self.tr_ui("텍스트 데이터 없음"))
+            state["processed_pages"] = int(state.get("processed_pages") or 0) + 1
+            state["page_pos"] = pos + 1
+            self.update_task_progress_overlay(
+                current=state["processed_pages"],
+                total=len(indices),
+                detail=self._translation_import_progress_detail(self.tr_ui("텍스트 데이터가 없어 건너뜁니다.")),
+            )
+            QTimer.singleShot(0, self._translation_import_start_next_page)
+            return
+
+        id_to_items = {}
+        for n, item in enumerate(data_list, 1):
+            try:
+                text_id = str(item.get("id", n))
+                id_to_items.setdefault(text_id, []).append(item)
+            except Exception:
+                continue
+        if not id_to_items:
+            self._batch_result_record(page_idx, status="skipped", message=self.tr_ui("불러올 텍스트 번호 없음"))
+            state["processed_pages"] = int(state.get("processed_pages") or 0) + 1
+            state["page_pos"] = pos + 1
+            QTimer.singleShot(0, self._translation_import_start_next_page)
+            return
+
+        path = state.get("current_path")
+        if not path:
+            self._batch_result_record(page_idx, status="skipped", message=self.tr_ui("매칭 파일 없음"))
+            state["processed_pages"] = int(state.get("processed_pages") or 0) + 1
+            state["page_pos"] = pos + 1
+            QTimer.singleShot(0, self._translation_import_start_next_page)
+            return
+        try:
+            state["file"] = open(path, "r", encoding="utf-8-sig")
+        except Exception as e:
+            self._batch_result_record(page_idx, status="failed", message=str(e))
+            state["processed_pages"] = int(state.get("processed_pages") or 0) + 1
+            state["page_pos"] = pos + 1
+            self.update_task_progress_overlay(
+                current=state["processed_pages"],
+                total=len(indices),
+                detail=self._translation_import_progress_detail(self.tr_ui("TXT 파일을 읽지 못했습니다: {error}").format(error=e)),
+            )
+            QTimer.singleShot(0, self._translation_import_start_next_page)
+            return
+
+        state["id_to_items"] = id_to_items
+        state["current_page_items"] = len(data_list)
+        self.update_task_progress_overlay(
+            current=state["processed_pages"],
+            total=len(indices),
+            detail=self._translation_import_progress_detail(self.tr_ui("번역문을 순차 적용하는 중...")),
+        )
+        QTimer.singleShot(1, self._translation_import_process_tick)
+
+    def _translation_import_finalize_entry(self):
+        state = getattr(self, "_translation_import_state", None)
+        if not isinstance(state, dict):
+            return 0
+        text_id = state.get("current_id")
+        buf = state.get("current_buf") or []
+        state["current_buf"] = []
+        if not text_id or not buf:
+            return 0
+        new_text = "\n".join(buf).strip()
+        if not new_text:
+            return 0
+        targets = (state.get("id_to_items") or {}).get(str(text_id)) or []
+        if not targets:
+            return 0
+        state["current_page_matched"] = int(state.get("current_page_matched") or 0) + 1
+        changed = 0
+        for item in targets:
+            try:
+                old_text = str(item.get("translated_text", "") or "")
+                if old_text == new_text:
+                    continue
+                item["translated_text"] = new_text
+                try:
+                    self.shrink_text_rect_to_content(item)
+                except Exception:
+                    pass
+                changed += 1
+            except Exception:
+                continue
+        if changed:
+            state["current_page_changed"] = int(state.get("current_page_changed") or 0) + changed
+            state["total_count"] = int(state.get("total_count") or 0) + changed
+            state["changed"] = True
+        return changed
+
+    def _translation_import_process_tick(self):
+        """Read/apply a bounded amount, then yield to the Qt event loop."""
+        state = getattr(self, "_translation_import_state", None)
+        if not isinstance(state, dict):
+            return
+        if bool(getattr(self, "_long_task_cancel_requested", False)):
+            state["cancelled"] = True
+            self._finish_streaming_translation_import()
+            return
+        fp = state.get("file")
+        if fp is None:
+            self._translation_import_finish_current_page(failed_message=self.tr_ui("TXT 파일 핸들이 없습니다."))
+            return
+
+        valid = state.get("id_to_items") or {}
+
+        def marker_to_id(line):
+            token = str(line or "").strip()
+            if len(token) >= 3 and token.startswith("[") and token.endswith("]"):
+                inner = token[1:-1].strip()
+                if inner.isdigit() and inner in valid:
+                    return inner
+            return None
+
+        max_lines = 250
+        max_entries = 20
+        consumed = 0
+        finalized = 0
+        eof = False
+        try:
+            while consumed < max_lines and finalized < max_entries:
+                raw = fp.readline()
+                if raw == "":
+                    eof = True
+                    break
+                consumed += 1
+                state["lines_read"] = int(state.get("lines_read") or 0) + 1
+                line = raw.rstrip("\r\n")
+                text_id = marker_to_id(line)
+                if text_id:
+                    if state.get("current_id") is not None:
+                        self._translation_import_finalize_entry()
+                        finalized += 1
+                    state["current_id"] = text_id
+                    state["current_buf"] = []
+                    continue
+                if state.get("current_id") is not None and line.strip():
+                    state.setdefault("current_buf", []).append(line.rstrip())
+        except Exception as e:
+            self._translation_import_finish_current_page(failed_message=str(e))
+            return
+
+        if eof:
+            if state.get("current_id") is not None:
+                self._translation_import_finalize_entry()
+            self._translation_import_finish_current_page()
+            return
+
+        self.update_task_progress_overlay(
+            current=int(state.get("processed_pages") or 0),
+            total=len(state.get("indices") or []),
+            detail=self._translation_import_progress_detail(self.tr_ui("번역문을 순차 적용하는 중...")),
+        )
+        QTimer.singleShot(1, self._translation_import_process_tick)
+
+    def _translation_import_finish_current_page(self, failed_message=""):
+        state = getattr(self, "_translation_import_state", None)
+        if not isinstance(state, dict):
+            return
+        page_idx = state.get("current_page_idx")
+        self._translation_import_close_current_file()
+        changed = int(state.get("current_page_changed") or 0)
+        matched = int(state.get("current_page_matched") or 0)
+        if failed_message:
+            self._batch_result_record(page_idx, status="failed", message=str(failed_message))
+        elif matched <= 0:
+            self._batch_result_record(page_idx, status="skipped", message=self.tr_ui("맞는 텍스트 번호 없음"))
+        elif changed <= 0:
+            self._batch_result_record(page_idx, status="skipped", message=self.tr_ui("변경된 번역문 없음"))
+        else:
+            self._batch_result_record(page_idx, status="done", message=self.tr_ui("{count}개 적용").format(count=changed))
+            try:
+                self.mark_page_data_dirty_explicit(page_idx, "translated_text")
+            except Exception:
+                pass
+
+        state["id_to_items"] = {}
+        state["current_id"] = None
+        state["current_buf"] = []
+        state["processed_pages"] = int(state.get("processed_pages") or 0) + 1
+        state["page_pos"] = int(state.get("page_pos") or 0) + 1
+        self.update_task_progress_overlay(
+            current=state["processed_pages"],
+            total=len(state.get("indices") or []),
+            detail=self._translation_import_progress_detail(self.tr_ui("현재 페이지 반영 완료")),
+        )
+        if state["processed_pages"] % 10 == 0:
+            try:
+                __import__("gc").collect()
+            except Exception:
+                pass
+        QTimer.singleShot(0, self._translation_import_start_next_page)
+
+    def _finish_streaming_translation_import(self):
+        state = getattr(self, "_translation_import_state", None)
+        if not isinstance(state, dict):
+            return
+        self._translation_import_close_current_file()
+        result = getattr(self, "_batch_result", None)
+        if isinstance(result, dict) and bool(state.get("cancelled")):
+            result["cancelled"] = True
+        changed = bool(state.get("changed"))
+        total_count = int(state.get("total_count") or 0)
+        try:
+            self.update_task_progress_overlay(
+                current=int(state.get("processed_pages") or 0),
+                total=len(state.get("indices") or []),
+                detail=self._translation_import_progress_detail(self.tr_ui("현재 페이지 표와 행 높이를 갱신하는 중...")),
+            )
+        except Exception:
+            pass
         if changed:
             try:
-                self.undo_push_project(undo_rec)
+                self.has_unsaved_changes = True
+                self.update_window_title()
             except Exception:
                 pass
         try:
             self.ref_tab()
-            if self.cb_mode.currentIndex() == 4:
+            if hasattr(self, "cb_mode") and self.cb_mode.currentIndex() == 4:
                 self.mode_chg(4)
+        except Exception as e:
+            try:
+                self.log(self.tr_ui("⚠️ 번역문 불러오기 화면 갱신 실패: {error}").format(error=e))
+            except Exception:
+                pass
+        try:
+            self.undo_break_boundary("translation_import", state.get("title") or "번역문 불러오기")
+        except Exception:
+            try:
+                self.undo_clear_all_pages("translation TXT import finish")
+                self.undo_clear_project("translation TXT import finish")
+            except Exception:
+                pass
+        self.is_batch_running = False
+        self.current_batch_mode = None
+        try:
+            self.set_project_action_interlock(False)
         except Exception:
             pass
         try:
-            self.schedule_deferred_auto_save_project(200)
+            self.end_busy_state(state.get("title") or "번역문 불러오기")
         except Exception:
-            self.auto_save_project()
-        self.log(f"📥 번역문 불러오기 완료: {total_count}개")
+            pass
+        try:
+            self.hide_task_progress_overlay()
+        except Exception:
+            pass
+        try:
+            if changed:
+                self.schedule_deferred_auto_save_project(200)
+        except Exception:
+            if changed:
+                try:
+                    self.auto_save_project()
+                except Exception:
+                    pass
+        if bool(state.get("cancelled")):
+            self.log(self.tr_ui("⏹️ 번역문 불러오기 취소: {count}개까지 반영 / Undo 미지원").format(count=total_count))
+        else:
+            self.log(self.tr_ui("📥 번역문 불러오기 완료: {count}개 / Undo 미지원").format(count=total_count))
+        self._translation_import_state = None
+        try:
+            __import__("gc").collect()
+        except Exception:
+            pass
+        if isinstance(result, dict):
+            try:
+                summary = self._batch_summary_text(result)
+                self.log(summary.replace("\n", " | "))
+                self.show_batch_result_summary(result)
+            except Exception:
+                pass
 
     def import_translation_batch(self):
         """구버전 호환용 래퍼.
@@ -7367,7 +12457,21 @@ class MainWindowProjectPagesMixin:
         return self.import_translation_current()
 
 
-    def clear_translation_current(self):
+    def clear_translation_current(self, *args, **kwargs):
+        _perf_t0 = perf_counter()
+        _perf_action_id = next_action_id("clear_translation_current")
+        _perf_ok = False
+        try:
+            _res = self._perf_impl_clear_translation_current(*args, **kwargs)
+            _perf_ok = True
+            return _res
+        finally:
+            try:
+                perf_log_elapsed(self, "PERF_USER_ACTION", _perf_t0, action="clear_translation_current", action_id=_perf_action_id, ok=bool(_perf_ok), args_count=len(args), kwargs=','.join(sorted([str(k) for k in kwargs.keys()])))
+            except Exception:
+                pass
+
+    def _perf_impl_clear_translation_current(self):
         """현재 페이지의 번역문 칸을 모두 비운다."""
         if not self.paths or self.idx not in self.data:
             return
@@ -7397,7 +12501,21 @@ class MainWindowProjectPagesMixin:
         self.auto_save_project()
         self.log(f"🧹 번역문 내용 지우기 완료: {count}개")
 
-    def clear_translation_batch(self):
+    def clear_translation_batch(self, *args, **kwargs):
+        _perf_t0 = perf_counter()
+        _perf_action_id = next_action_id("clear_translation_batch")
+        _perf_ok = False
+        try:
+            _res = self._perf_impl_clear_translation_batch(*args, **kwargs)
+            _perf_ok = True
+            return _res
+        finally:
+            try:
+                perf_log_elapsed(self, "PERF_USER_ACTION", _perf_t0, action="clear_translation_batch", action_id=_perf_action_id, ok=bool(_perf_ok), args_count=len(args), kwargs=','.join(sorted([str(k) for k in kwargs.keys()])))
+            except Exception:
+                pass
+
+    def _perf_impl_clear_translation_batch(self):
         """선택한 페이지의 번역문 칸을 모두 비운다."""
         if not self.paths:
             return
@@ -7852,7 +12970,7 @@ class MainWindowProjectPagesMixin:
             except Exception:
                 pass
         # 다중/전체 이미지 작업은 여기서 일반 작업 캐시 저장을 예약하지 않는다.
-        # 정식 반영은 사용자가 [프로젝트 내보내기]을 눌렀을 때 처리한다.
+        # 정식 반영은 사용자가 [프로젝트 저장]을 눌렀을 때 처리한다.
         try:
             if single_current:
                 self.mode_chg(current_mode if current_mode >= 0 else self.cb_mode.currentIndex())
@@ -8123,15 +13241,117 @@ class MainWindowProjectPagesMixin:
         except Exception:
             pass
 
+    def _confirm_current_long_task_cancel(self):
+        """Ask once before cancelling a running long task from the progress overlay."""
+        try:
+            if bool(getattr(self, "_long_task_cancel_confirm_open", False)):
+                return False
+            self._long_task_cancel_confirm_open = True
+        except Exception:
+            pass
+        try:
+            mode = str(getattr(self, "current_batch_mode", "") or "")
+            is_batch = bool(getattr(self, "is_batch_running", False))
+            is_translation = bool(getattr(self, "translation_worker", None) is not None or getattr(self, "_active_long_task_kind", "") == "translation")
+            if is_batch and mode == "translate":
+                title = self.tr_ui("일괄 번역 취소")
+                text = self.tr_ui(
+                    "정말 일괄 번역을 취소하시겠습니까?\n\n"
+                    "이미 번역이 끝나 반영된 맵은 유지합니다.\n"
+                    "현재 API 요청 중인 맵은 응답이 돌아와도 반영하지 않습니다.\n"
+                    "아직 시작하지 않은 맵은 번역하지 않습니다."
+                )
+            elif is_translation:
+                title = self.tr_ui("번역 취소")
+                text = self.tr_ui(
+                    "정말 번역을 취소하시겠습니까?\n\n"
+                    "이미 완료되어 반영된 청크는 유지합니다.\n"
+                    "현재 API 요청은 응답이 돌아와도 반영하지 않고, 이후 청크는 시작하지 않습니다."
+                )
+            else:
+                title = self.tr_ui("작업 취소")
+                text = self.tr_ui("정말 현재 작업을 취소하시겠습니까?\n\n현재 처리 중인 항목이 끝난 뒤 중단됩니다.")
+
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Question)
+            msg.setWindowTitle(title)
+            msg.setText(text)
+            msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            yes_btn = msg.button(QMessageBox.StandardButton.Yes)
+            no_btn = msg.button(QMessageBox.StandardButton.No)
+            try:
+                if yes_btn is not None:
+                    yes_btn.setText(self.tr_ui("취소하기"))
+                if no_btn is not None:
+                    no_btn.setText(self.tr_ui("계속하기"))
+            except Exception:
+                pass
+            msg.setDefaultButton(QMessageBox.StandardButton.No)
+            msg.setEscapeButton(QMessageBox.StandardButton.No)
+            try:
+                msg.setWindowModality(Qt.WindowModality.ApplicationModal)
+                msg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+            except Exception:
+                pass
+            try:
+                apply_message_box_palette(msg, False)
+            except Exception:
+                pass
+            try:
+                QTimer.singleShot(0, msg.raise_)
+                QTimer.singleShot(0, msg.activateWindow)
+            except Exception:
+                pass
+            result = msg.exec()
+            return result == QMessageBox.StandardButton.Yes
+        except Exception:
+            return False
+        finally:
+            try:
+                self._long_task_cancel_confirm_open = False
+            except Exception:
+                pass
+
     def request_current_long_task_cancel(self):
         """Cancel button handler for the center progress overlay.
 
         Long OCR/API/local-model calls cannot always be interrupted in the middle of
         the current request.  Workers stop before the next page/chunk/step.
         """
+        try:
+            if bool(getattr(self, "_long_task_cancel_requested", False)):
+                self.update_task_progress_overlay(detail=self.tr_ui("취소 요청됨. 현재 처리 중인 응답은 반영하지 않고 중단합니다."))
+                return
+        except Exception:
+            pass
+        if not self._confirm_current_long_task_cancel():
+            try:
+                self.log("↩️ 작업 취소를 취소했습니다.")
+            except Exception:
+                pass
+            return
+
         self._long_task_cancel_requested = True
+        try:
+            if isinstance(getattr(self, "_batch_result", None), dict) and bool(getattr(self, "is_batch_running", False)):
+                self._batch_result["cancelled"] = True
+        except Exception:
+            pass
+        try:
+            if bool(getattr(self, "is_batch_running", False)) and str(getattr(self, "current_batch_mode", "") or "") == "translate":
+                if hasattr(self, "_cancel_active_batch_job"):
+                    self._cancel_active_batch_job("overlay_cancel_confirmed")
+        except Exception:
+            pass
+        try:
+            if (getattr(self, "_active_long_task_kind", "") == "translation" or getattr(self, "translation_worker", None) is not None) and not bool(getattr(self, "is_batch_running", False)):
+                if hasattr(self, "_cancel_active_translation_job"):
+                    self._cancel_active_translation_job("overlay_cancel_confirmed")
+                    return
+        except Exception:
+            pass
         worker = None
-        for name in ("translation_worker", "bw", "iw", "w"):
+        for name in ("bw", "translation_worker", "iw", "w"):
             try:
                 candidate = getattr(self, name, None)
             except Exception:
@@ -8143,18 +13363,21 @@ class MainWindowProjectPagesMixin:
                 except Exception:
                     pass
         try:
-            if getattr(self, "_active_long_task_kind", "") == "save":
+            if bool(getattr(self, "is_batch_running", False)) and str(getattr(self, "current_batch_mode", "") or "") == "translate":
+                detail = "일괄 번역 취소 요청됨. 완료된 맵은 유지하고, 현재 API 응답은 돌아와도 반영하지 않습니다."
+                log_text = "⏹️ 일괄 번역 취소 요청됨: 완료된 맵은 유지하고 현재 API 응답은 폐기합니다."
+            elif getattr(self, "_active_long_task_kind", "") == "save":
                 detail = "취소 요청됨. 현재 저장 항목이 끝난 뒤 중단됩니다."
                 log_text = "⏹️ 내보내기 취소 요청됨: 현재 저장 항목이 끝난 뒤 중단됩니다."
             elif getattr(self, "_active_long_task_kind", "") == "open_extract":
                 detail = "취소 요청됨. 현재 압축 해제 항목이 끝난 뒤 중단됩니다."
                 log_text = "⏹️ YSBG 열기 취소 요청됨: 현재 압축 해제 항목이 끝난 뒤 중단됩니다."
             else:
-                detail = "취소 요청됨. 현재 페이지 작업이 끝난 뒤 중단됩니다."
-                log_text = "⏹️ 취소 요청됨. 현재 페이지 작업이 끝난 뒤 중단됩니다."
+                detail = "취소 요청됨. 현재 처리 중인 응답은 반영하지 않고 중단합니다."
+                log_text = "⏹️ 취소 요청됨. 현재 처리 중인 응답은 반영하지 않고 중단합니다."
         except Exception:
-            detail = "취소 요청됨. 현재 페이지 작업이 끝난 뒤 중단됩니다."
-            log_text = "⏹️ 취소 요청됨: 현재 페이지 작업이 끝난 뒤 중단됩니다."
+            detail = "취소 요청됨. 현재 처리 중인 응답은 반영하지 않고 중단합니다."
+            log_text = "⏹️ 취소 요청됨: 현재 처리 중인 응답은 반영하지 않고 중단합니다."
         self.update_task_progress_overlay(detail=detail)
         try:
             self.log(log_text)
@@ -8328,6 +13551,10 @@ class MainWindowProjectPagesMixin:
             pass
         try:
             self.delete_temp_project_if_needed()
+        except Exception:
+            pass
+        try:
+            self.clear_maker_writeback_dirty(save_state=False)
         except Exception:
             pass
         self.has_unsaved_changes = False
@@ -9146,9 +14373,12 @@ class MainWindowProjectPagesMixin:
         layout = QVBoxLayout(popup)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        db_mode = bool(self.is_maker_database_mode()) if hasattr(self, "is_maker_database_mode") else False
+        db_mode = bool(self.is_maker_special_table_mode()) if hasattr(self, "is_maker_special_table_mode") else False
+        plugin_mode = bool(self.is_maker_plugin_mode()) if hasattr(self, "is_maker_plugin_mode") else False
         visible_pages = self.current_tab_page_indices() if hasattr(self, "current_tab_page_indices") else list(range(len(getattr(self, "paths", []) or [])))
-        title = QLabel(self.tr_ui("데이터베이스 목록" if db_mode else "맵 목록"), popup)
+        speaker_mode = bool(self.is_maker_speaker_mode()) if hasattr(self, "is_maker_speaker_mode") else False
+        list_title = "플러그인 목록" if plugin_mode else ("화자 목록" if speaker_mode else ("데이터베이스 목록" if db_mode else "맵 목록"))
+        title = QLabel(self.tr_ui(list_title), popup)
         layout.addWidget(title)
 
         page_list = QListWidget(popup)
@@ -9163,7 +14393,8 @@ class MainWindowProjectPagesMixin:
         current_page_item = None
         current_row_in_list = -1
         if not visible_pages:
-            item = QListWidgetItem(self.tr_ui("데이터베이스 항목 없음" if db_mode else "맵 없음"))
+            empty_text = "플러그인 항목 없음" if plugin_mode else ("화자 데이터가 없습니다." if speaker_mode else ("데이터베이스 항목 없음" if db_mode else "맵 없음"))
+            item = QListWidgetItem(self.tr_ui(empty_text))
             item.setFlags(Qt.ItemFlag.NoItemFlags)
             page_list.addItem(item)
         else:
@@ -9187,7 +14418,8 @@ class MainWindowProjectPagesMixin:
                         page = self._page_data_for_index_safe(i) or {}
                         meta = page.get("maker_page") or {} if isinstance(page, dict) else {}
                         original = str(meta.get("source_file") or meta.get("page_type") or label)
-                        item.setToolTip(f"{self.tr_ui('데이터베이스 탭')} {display_row + 1} / {len(visible_pages)}\n{original}")
+                        tab_name = self.tr_ui("플러그인 탭" if plugin_mode else ("화자 탭" if speaker_mode else "데이터베이스 탭"))
+                        item.setToolTip(f"{tab_name} {display_row + 1} / {len(visible_pages)}\n{original}")
                     else:
                         item.setToolTip(self.page_display_name(i, include_ext=True))
                 except Exception:
@@ -9273,7 +14505,7 @@ class MainWindowProjectPagesMixin:
             return
         if page_idx < 0 or page_idx >= len(getattr(self, "paths", []) or []):
             return
-        db_mode = bool(self.is_maker_database_mode()) if hasattr(self, "is_maker_database_mode") else False
+        db_mode = bool(self.is_maker_special_table_mode()) if hasattr(self, "is_maker_special_table_mode") else False
         visible_pages = self.current_tab_page_indices() if hasattr(self, "current_tab_page_indices") else list(range(len(getattr(self, "paths", []) or [])))
         if page_idx not in visible_pages:
             return
@@ -9306,10 +14538,6 @@ class MainWindowProjectPagesMixin:
             except Exception:
                 pass
             try:
-                self.refresh_maker_database_preview_from_selection()
-            except Exception:
-                pass
-            try:
                 self.update_page_position_label_for_current_tab_layer()
             except Exception:
                 pass
@@ -9322,8 +14550,28 @@ class MainWindowProjectPagesMixin:
                 pass
         self.on_page_tab_changed(display_idx)
 
+    def maker_translation_layer_mode(self):
+        mode = str(getattr(self, "maker_translation_layer", "") or "").strip().lower()
+        if mode in {"database", "plugin", "speaker"}:
+            return mode
+        return "database" if bool(getattr(self, "maker_database_mode_enabled", False)) else "normal"
+
     def is_maker_database_mode(self):
-        return bool(getattr(self, "maker_database_mode_enabled", False))
+        return self.maker_translation_layer_mode() == "database"
+
+    def is_maker_plugin_mode(self):
+        return self.maker_translation_layer_mode() == "plugin"
+
+    def is_maker_speaker_mode(self):
+        return self.maker_translation_layer_mode() == "speaker"
+
+    def is_maker_special_table_mode(self):
+        """DB/플러그인/화자 각 독립 레이어가 공용 표 UI를 쓰는지 판정한다."""
+        return self.maker_translation_layer_mode() in {"database", "plugin", "speaker"}
+
+    def is_maker_db_layer_mode(self):
+        return self.maker_translation_layer_mode() == "database"
+
 
     def _ensure_maker_database_layer_storage(self):
         """DB 번역 레이어 저장소를 보장한다.
@@ -9357,6 +14605,40 @@ class MainWindowProjectPagesMixin:
                     continue
                 unit = row.get("maker_text_unit") or {}
                 if isinstance(unit, dict) and str(unit.get("source_kind") or "").strip().lower() == "database":
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _maker_page_is_plugin_page(self, page):
+        try:
+            if not isinstance(page, dict):
+                return False
+            meta = page.get("maker_page") or {}
+            if str(meta.get("page_type") or "").strip().lower() == "plugin":
+                return True
+            for row in (page.get("data") or []):
+                if not isinstance(row, dict):
+                    continue
+                unit = row.get("maker_text_unit") or {}
+                if isinstance(unit, dict) and str(unit.get("source_kind") or "").strip().lower().startswith("plugin"):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _maker_page_is_speaker_page(self, page):
+        try:
+            if not isinstance(page, dict):
+                return False
+            meta = page.get("maker_page") or {}
+            if str(meta.get("page_type") or "").strip().lower() == "speaker":
+                return True
+            for row in (page.get("data") or []):
+                if not isinstance(row, dict):
+                    continue
+                unit = row.get("maker_text_unit") or {}
+                if isinstance(unit, dict) and str(unit.get("source_kind") or "").strip().lower() == "speaker":
                     return True
         except Exception:
             pass
@@ -9558,13 +14840,15 @@ class MainWindowProjectPagesMixin:
         try:
             page = self._page_data_for_index_safe(page_idx)
             meta = page.get("maker_page") or {}
-            if str(meta.get("page_type") or "") == "database":
+            if str(meta.get("page_type") or "").strip().lower() in {"database", "plugin", "speaker"}:
                 return True
             for row in (page.get("data") or []):
                 if isinstance(row, dict):
                     m = row.get("maker_text_unit") or {}
-                    if isinstance(m, dict) and str(m.get("source_kind") or "") == "database":
-                        return True
+                    if isinstance(m, dict):
+                        source_kind = str(m.get("source_kind") or "").strip().lower()
+                        if source_kind == "database" or source_kind.startswith("plugin"):
+                            return True
             try:
                 paths = getattr(self, "paths", []) or []
                 raw_path = str(paths[int(page_idx)] if 0 <= int(page_idx) < len(paths) else "")
@@ -9580,6 +14864,14 @@ class MainWindowProjectPagesMixin:
         try:
             page = page if isinstance(page, dict) else {}
             meta = page.get("maker_page") or {}
+            page_type = str(meta.get("page_type") or "").strip().lower()
+            if page_type == "plugin":
+                raw = str(meta.get("plugin_name") or meta.get("page_title") or meta.get("source_file") or fallback or "Plugin").strip()
+                raw = raw.replace("Plugin Events - ", "Events_").replace("Plugin Notes - ", "Notes_").replace("Plugin - ", "")
+                name = Path(raw).stem if raw else "Plugin"
+                return name if name.lower().startswith("plug_") else f"PLUG_{name}"
+            if page_type == "speaker":
+                return self.tr_ui("화자 목록")
             raw = str(meta.get("source_file") or meta.get("title") or meta.get("page_title") or "").strip()
             name = Path(raw).stem if raw else ""
             if not name:
@@ -9614,36 +14906,21 @@ class MainWindowProjectPagesMixin:
     def _maker_project_data_dir_for_database_pages(self):
         try:
             root = Path(str(getattr(self, "project_dir", "") or ""))
-            if not root:
+            if not str(root):
                 return None
-
-            # MV exported games normally live under maker_game/www/data, while
-            # MZ projects usually use maker_game/data.  The previous generic
-            # ordering checked maker_game/data first even for MV projects, so a
-            # stale/partial data folder could hide Troops.json and keep the
-            # Troops DB tab from being rebuilt.
-            engine = ""
-            try:
-                engine = str(self._maker_database_engine_key() or "").lower()
-            except Exception:
-                engine = ""
-            mv_candidates = [
-                root / "maker_game" / "www" / "data",
-                root / "www" / "data",
-                root / "maker_game" / "data",
-                root / "data",
-            ]
-            mz_candidates = [
-                root / "maker_game" / "data",
-                root / "data",
-                root / "maker_game" / "www" / "data",
-                root / "www" / "data",
-            ]
-            candidates = mv_candidates if engine == "mv" else mz_candidates
-
-            # Prefer a folder with System.json, then fall back to any JSON folder.
+            resolved = self._maker_preview_resolved_project_paths()
+            primary = Path(resolved.get("data_dir") or (root / "maker_game" / "data"))
+            candidates = [primary, root / "data"]
+            seen = set()
             json_candidates = []
             for cand in candidates:
+                try:
+                    key = str(cand.resolve()) if cand.exists() else str(cand)
+                except Exception:
+                    key = str(cand)
+                if key in seen:
+                    continue
+                seen.add(key)
                 try:
                     if cand.is_dir() and any(cand.glob("*.json")):
                         if (cand / "System.json").is_file():
@@ -9988,9 +15265,9 @@ class MainWindowProjectPagesMixin:
                 project_dir = Path("")
             lines.append(f"project_dir: {project_dir if str(project_dir) else 'NOT SET'}")
             try:
+                resolved = self._maker_preview_resolved_project_paths()
                 candidates = [
-                    project_dir / "maker_game" / "data",
-                    project_dir / "maker_game" / "www" / "data",
+                    Path(resolved.get("data_dir") or (project_dir / "maker_game" / "data")),
                     project_dir / "data",
                 ]
                 for cand in candidates:
@@ -10004,7 +15281,7 @@ class MainWindowProjectPagesMixin:
             data_dir = self._maker_project_data_dir_for_database_pages()
             lines.append(f"selected_data_dir: {data_dir if data_dir else 'NOT FOUND'}")
             if data_dir is None:
-                msg = "데이터 폴더를 찾지 못했습니다. 프로젝트 안에 maker_game/data 또는 maker_game/www/data가 있는지 확인해 주세요."
+                msg = self.tr_ui("데이터 폴더를 찾지 못했습니다. 선택한 게임 폴더 아래에 RPG Maker MV/MZ의 data/MapInfos.json이 있는지 확인해 주세요.")
                 lines.append(msg)
                 try:
                     self.log("🧪 DB_SCAN_DIAG | " + " | ".join(lines))
@@ -10074,7 +15351,7 @@ class MainWindowProjectPagesMixin:
             except Exception:
                 pass
             try:
-                if self.is_maker_database_mode():
+                if self.is_maker_special_table_mode():
                     self.force_rebuild_page_tabs_for_current_layer(reason="manual db page check")
                     self.refresh_maker_database_view()
             except Exception:
@@ -10177,9 +15454,11 @@ class MainWindowProjectPagesMixin:
                             lines.append(f"tileset_name: {entry.get('name') or ''}")
                             lines.append("tilesetNames: " + ", ".join([n for n in names if n][:12]))
                             root = Path(str(project_root or ""))
+                            resolved = self._maker_preview_resolved_project_paths()
+                            content_root = Path(resolved.get("content_root") or (root / "maker_game"))
                             image_roots = [
-                                root / "maker_game" / "img" / "tilesets",
-                                root / "maker_game" / "www" / "img" / "tilesets",
+                                content_root / "img" / "tilesets",
+                                content_root / "tilesets",
                                 root / "img" / "tilesets",
                             ]
                             for n in names:
@@ -10262,22 +15541,23 @@ class MainWindowProjectPagesMixin:
             return False
 
     def current_tab_page_indices(self):
-        """현재 모드에서 탭바가 표시해야 하는 실제 self.paths 인덱스 목록.
-
-        일반 모드: page_type != database
-        DB 모드: page_type == database
-        두 경우 모두 원본은 게임 가져오기 때 만들어진 self.paths/self.data다.
-        """
+        """Return page indices for the active map/database/plugin layer."""
         try:
             total = len(getattr(self, "paths", []) or [])
-            db_mode = bool(self.is_maker_database_mode()) if hasattr(self, "is_maker_database_mode") else False
+            mode = self.maker_translation_layer_mode() if hasattr(self, "maker_translation_layer_mode") else ("database" if self.is_maker_special_table_mode() else "normal")
             out = []
             for i in range(total):
                 page = self._page_data_for_index_safe(i) if hasattr(self, "_page_data_for_index_safe") else (getattr(self, "data", {}) or {}).get(i, {})
                 is_db = bool(self._maker_page_is_database_page(page))
-                if db_mode and is_db:
+                is_plugin = bool(self._maker_page_is_plugin_page(page)) if hasattr(self, "_maker_page_is_plugin_page") else False
+                is_speaker = bool(self._maker_page_is_speaker_page(page)) if hasattr(self, "_maker_page_is_speaker_page") else False
+                if mode == "database" and is_db:
                     out.append(i)
-                elif (not db_mode) and (not is_db):
+                elif mode == "plugin" and is_plugin:
+                    out.append(i)
+                elif mode == "speaker" and is_speaker:
+                    out.append(i)
+                elif mode == "normal" and not is_db and not is_plugin and not is_speaker:
                     out.append(i)
             return out
         except Exception:
@@ -10286,7 +15566,7 @@ class MainWindowProjectPagesMixin:
     def current_tab_display_index_for_page(self, page_idx=None):
         try:
             pages = self.current_tab_page_indices()
-            if self.is_maker_database_mode():
+            if self.is_maker_special_table_mode():
                 actual = int(getattr(self, "maker_database_idx", 0) if page_idx is None else page_idx)
             else:
                 actual = int(self.idx if page_idx is None else page_idx)
@@ -10297,7 +15577,7 @@ class MainWindowProjectPagesMixin:
     def update_page_position_label_for_current_tab_layer(self):
         try:
             pages = self.current_tab_page_indices() if hasattr(self, "current_tab_page_indices") else list(range(len(getattr(self, "paths", []) or [])))
-            if self.is_maker_database_mode():
+            if self.is_maker_special_table_mode():
                 current = int(getattr(self, "maker_database_idx", 0) or 0)
             else:
                 current = int(getattr(self, "idx", 0) or 0)
@@ -10313,8 +15593,173 @@ class MainWindowProjectPagesMixin:
         except Exception:
             pass
 
+    def is_maker_preview_enabled(self):
+        """일반 대사 프리뷰의 실제 실행 가능 상태를 반환한다."""
+        try:
+            if hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode():
+                return False
+        except Exception:
+            return False
+        return bool(getattr(self, "maker_preview_enabled", True))
+
+    def _clear_maker_normal_preview_to_black(self, *, reason="preview_disabled"):
+        """일반 프리뷰 표시와 예약 작업만 끊고 프로젝트 데이터는 건드리지 않는다."""
+        try:
+            self._maker_single_activation_request_id = int(getattr(self, "_maker_single_activation_request_id", 0) or 0) + 1
+            self._maker_preview_commit_epoch = int(getattr(self, "_maker_preview_commit_epoch", 0) or 0) + 1
+        except Exception:
+            pass
+        for timer_attr in ("_maker_preview_selection_timer", "_maker_preview_state_warm_timer"):
+            try:
+                timer = getattr(self, timer_attr, None)
+                if timer is not None:
+                    timer.stop()
+            except Exception:
+                pass
+        try:
+            self._clear_maker_preview_selection_overlay(force=True, include_dialogue=True, reason=str(reason or "preview_disabled"))
+        except Exception:
+            pass
+        try:
+            self._maker_dialogue_current_row_id = None
+            self._maker_fixed_preview_last_row_id = None
+            self._maker_preview_committed_row_id = None
+            self._maker_preview_base_needs_restore = True
+        except Exception:
+            pass
+        try:
+            view = getattr(self, "view", None)
+            if view is not None:
+                view.set_image(None)
+                try:
+                    view.resetTransform()
+                    view.viewport().update()
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                scene = self._safe_graphics_scene() if hasattr(self, "_safe_graphics_scene") else None
+                if scene is not None:
+                    scene.clear()
+                    scene.setSceneRect(0, 0, 1, 1)
+            except Exception:
+                pass
+        return True
+
+    def _ensure_current_maker_preview_base_for_single_row(self):
+        """현재 행 표시용으로 현재 페이지의 기준 이미지 한 장만 복구한다."""
+        if not self.is_maker_preview_enabled():
+            return False
+        try:
+            if not self._is_current_maker_page():
+                return False
+        except Exception:
+            return False
+        if not bool(getattr(self, "_maker_preview_base_needs_restore", False)):
+            return True
+        try:
+            idx = int(getattr(self, "idx", 0) or 0)
+            self.ensure_page_runtime_loaded(
+                idx,
+                include_ori=True,
+                include_heavy=False,
+                include_masks=False,
+            )
+            img = None
+            try:
+                img = self.final_base_image_for_page(idx)
+            except Exception:
+                img = None
+            if img is None:
+                try:
+                    img = self.get_source_display_image(idx)
+                except Exception:
+                    img = None
+            view = getattr(self, "view", None)
+            if img is None or view is None:
+                return False
+            view.set_image(img, fit=True)
+            self._maker_preview_base_needs_restore = False
+            return True
+        except Exception:
+            return False
+
+    def _refresh_current_single_maker_row_preview_only(self, *, reason="preview_enabled"):
+        """현재 선택된 단일 대사 행만 기존 행 활성화 경로로 다시 표시한다.
+
+        프리뷰 OFF 동안 뷰의 기준 이미지도 비워지므로, ON 전환 시에는 현재
+        페이지의 기존 원본 프리뷰 한 장만 다시 읽는다. 다른 페이지나 전체
+        캐시를 준비하지 않으며, 그 뒤 현재 선택 행 하나만 기존 클릭 경로로
+        활성화한다.
+        """
+        if not self.is_maker_preview_enabled():
+            return False
+        try:
+            if not self._is_current_maker_page():
+                return False
+        except Exception:
+            return False
+        try:
+            self.refresh_maker_table_current_row_marker()
+        except Exception:
+            pass
+        rows = set(getattr(self, "_maker_table_current_marker_rows", set()) or set())
+        if len(rows) != 1 or next(iter(rows)) <= 0:
+            return False
+
+        # OFF 시 비워 둔 기준 화면만 현재 페이지 한 장으로 복구한다.
+        # 다른 페이지/마스크/편집 페이로드는 읽지 않는다.
+        self._ensure_current_maker_preview_base_for_single_row()
+
+        # 새 전체 갱신 경로를 만들지 않는다. 이미 대사 클릭에 쓰이는 단일행
+        # commit 경로를 한 번 예약해 해당 행의 캐시만 재사용/보정한다.
+        return bool(self.schedule_maker_table_selection_commit(source="mouse_single"))
+
+    def on_maker_preview_visibility_toggled(self, checked):
+        """[프리뷰 보기] 전환. OFF는 연산 차단, ON은 현재 단일 행만 갱신한다."""
+        checked = bool(checked)
+        self.maker_preview_enabled = checked
+        try:
+            self.app_options["maker_preview_enabled"] = checked
+            self.save_app_options_cache()
+        except Exception:
+            pass
+        try:
+            action = (getattr(self, "actions", {}) or {}).get("work_refresh_maker_preview")
+            if action is not None:
+                action.setEnabled(bool(checked and not self.is_maker_special_table_mode() and self.has_open_project()))
+        except Exception:
+            pass
+        if not checked:
+            try:
+                self.stop_progressive_page_loader()
+            except Exception:
+                pass
+            self._clear_maker_normal_preview_to_black(reason="preview_checkbox_off")
+            try:
+                self.log(self.tr_ui("🖥️ 프리뷰 보기: OFF"))
+            except Exception:
+                pass
+            return True
+        try:
+            split = getattr(self, "source_compare_splitter", None)
+            if split is not None and not self.is_maker_special_table_mode():
+                split.setVisible(True)
+        except Exception:
+            pass
+        refreshed = self._refresh_current_single_maker_row_preview_only(reason="preview_checkbox_on")
+        try:
+            self.log(self.tr_ui("🖥️ 프리뷰 보기: ON — 현재 선택된 단일 대사만 갱신" if refreshed else "🖥️ 프리뷰 보기: ON — 단일 대사를 선택하면 표시"))
+        except Exception:
+            pass
+        return True
+
     def set_maker_database_preview_visible(self, enabled):
-        """DB 모드 전용 좌측 프리뷰와 일반 맵 프리뷰를 전환한다."""
+        """특수 데이터 모드의 검은 빈 캔버스와 일반 대사 프리뷰를 전환한다.
+
+        DB/플러그인/화자 모드에서는 화면 프리뷰를 만들지 않는다. 이 함수는
+        위젯 표시만 바꾸며 DB 렌더, 런타임 실행, 캐시 준비를 호출하지 않는다.
+        """
         enabled = bool(enabled)
         try:
             panel = getattr(self, "maker_database_preview_panel", None)
@@ -10326,13 +15771,6 @@ class MainWindowProjectPagesMixin:
             split = getattr(self, "source_compare_splitter", None)
             if split is not None:
                 split.setVisible(not enabled)
-        except Exception:
-            pass
-        try:
-            if enabled:
-                if hasattr(self, "_apply_maker_database_preview_fixed_ratio"):
-                    self._apply_maker_database_preview_fixed_ratio()
-                self.refresh_maker_database_preview_from_selection()
         except Exception:
             pass
 
@@ -10388,9 +15826,9 @@ class MainWindowProjectPagesMixin:
             pass
         try:
             root = Path(str(getattr(self, "project_dir", "") or ""))
+            resolved = self._maker_preview_resolved_project_paths()
             for cand in (
-                root / "maker_game" / "data",
-                root / "maker_game" / "www" / "data",
+                Path(resolved.get("data_dir") or (root / "maker_game" / "data")),
                 root / "data",
             ):
                 try:
@@ -10500,6 +15938,14 @@ class MainWindowProjectPagesMixin:
             value = str(row_data.get("text") or row_data.get("source_text") or "")
             source_file = str(unit.get("source_file") or unit.get("map_file") or "").lower()
             source_kind = str(unit.get("source_kind") or "").strip().lower()
+            if source_kind.startswith("plugin"):
+                # Plugin extraction is already conservative and stores only safe
+                # player-facing values.  DB code/path exclusions must not hide it.
+                return True
+            if source_kind == "speaker":
+                # A speaker layer contains names only. ASCII character names are
+                # valid translation targets and must not be mistaken for file/code paths.
+                return bool(value.strip())
             banned = {
                 "formula", "script", "code", "note", "meta", "damage", "traits", "effects",
                 "params", "parameters", "condition", "conditions", "advanced", "switches",
@@ -10689,9 +16135,22 @@ class MainWindowProjectPagesMixin:
                 return None
             root = Path(str(getattr(self, "project_dir", "") or ""))
             candidates = []
-            for game_root in (root / "maker_game", root / "maker_game" / "www", root):
-                for img_root in (game_root / "img" / folder_name,):
-                    for ext in (".png", ".PNG", ".png_", ".PNG_", ".rpgmvp", ".rpgmvp_", ".webp", ".webp_", ".jpg", ".jpg_", ".jpeg", ".jpeg_"):
+            resolved = self._maker_preview_resolved_project_paths()
+            content_root = Path(resolved.get("content_root") or (root / "maker_game"))
+            game_root = Path(resolved.get("game_root") or (root / "maker_game"))
+            resource_roots = (
+                content_root,
+                game_root,
+                root,
+            )
+            exts = (".png", ".PNG", ".png_", ".PNG_", ".rpgmvp", ".rpgmvp_", ".webp", ".webp_", ".jpg", ".jpg_", ".jpeg", ".jpeg_")
+            for game_root in resource_roots:
+                # PATCH: database preview assets must follow the same resource
+                # compatibility as map/picture preview.  Some users import img.zip
+                # contents directly, so faces/system/characters may sit directly
+                # under the game root rather than under img/.
+                for img_root in (game_root / "img" / folder_name, game_root / folder_name):
+                    for ext in exts:
                         candidates.append(img_root / (base_name + ext))
                     try:
                         if img_root.is_dir():
@@ -11323,396 +16782,105 @@ class MainWindowProjectPagesMixin:
         except Exception:
             pass
 
-    def _maker_render_actor_database_canvas_mz(self, row_data, unit, db_kind, rec_id, field, record, src, shown):
-        """Render the Actor status preview by porting RPG Maker MZ's status scene.
+    def _maker_render_actor_data_canvas(self, row_data, unit, db_kind, rec_id, field, record, src, shown):
+        """Render an exact, neutral Actors.json data preview.
 
-        The DB preview is a game-screen reconstruction: labels come from
-        System.json terms, actor/class/equipment data comes from the game DB, the
-        font is resolved through the WOFF->TTF cache, and windows/colors are taken
-        from Window.png whenever available.
+        This deliberately does not imitate Scene_Status.  Plugin/theme-driven games
+        can replace the runtime status scene completely, so the editor shows only
+        values that are actually present in the project data.
         """
+        record = record if isinstance(record, dict) else {}
+        unit = unit if isinstance(unit, dict) else {}
         pix = self._maker_database_new_canvas()
         painter = QPainter(pix)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        w, h = pix.width(), pix.height()
-        sx, sy = w / 1280.0, h / 720.0
-        ss = min(sx, sy)
-        profile = self._maker_database_runtime_profile()
-        win = profile.get("window") if isinstance(profile.get("window"), dict) else {}
-        font_prof = profile.get("font") if isinstance(profile.get("font"), dict) else {}
-        try:
-            padding = int(win.get("padding") or 12)
-        except Exception:
-            padding = 12
-        try:
-            line_h = int((profile.get("message_window") if isinstance(profile.get("message_window"), dict) else {}).get("line_height") or 36)
-        except Exception:
-            line_h = 36
-        try:
-            font_size = int(font_prof.get("size") or 28)
-        except Exception:
-            font_size = 28
-        try:
-            box_margin = int((profile.get("message_window") if isinstance(profile.get("message_window"), dict) else {}).get("box_margin") or 4)
-        except Exception:
-            box_margin = 4
+        w, h = max(1, pix.width()), max(1, pix.height())
+        painter.fillRect(QRectF(0, 0, w, h), QColor("#111318"))
+        painter.fillRect(QRectF(0, 0, w, max(58, int(h * 0.10))), QColor("#20242c"))
 
-        record = record if isinstance(record, dict) else {}
-        system = self._load_maker_database_json_runtime("System.json") or {}
-        classes = self._maker_db_record_list("Classes.json")
-        weapons = self._maker_db_record_list("Weapons.json")
-        armors = self._maker_db_record_list("Armors.json")
+        margin = max(18, int(min(w, h) * 0.028))
+        header_h = max(58, int(h * 0.10))
+        normal = "#f2f4f8"
+        muted = "#aeb6c4"
+        accent = "#7fb0ff"
+        good = "#8ed6a4"
+        self._maker_db_draw_text(
+            painter, QRectF(margin, 0, w - margin * 2, header_h),
+            self.tr_ui("배우 데이터 미리보기"), max(18, int(header_h * 0.42)),
+            normal, True, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            False, wrap=False,
+        )
 
-        # Background: the actual Scene_Status blurs the current scene.  In DB mode
-        # there is no live scene stack, so use the same darkened canvas base and
-        # keep all foreground coordinates as real MZ screen pixels.
-        self._maker_db_draw_pattern_bg(painter, QRectF(0, 0, w, h))
-
-        # MZ Scene_Status layout.  This follows the engine relationship rather
-        # than hand-tuned panel coordinates:
-        # profile = calcWindowHeight(2), params/equip = calcWindowHeight(6),
-        # status window fills from mainAreaTop to the params row.
-        def calc_window_height(num_lines):
-            return int(line_h * int(num_lines) + padding * 2)
-
-        show_touch_buttons = bool(system.get("optTouchUI", True))
-        button_area_h = 52 if show_touch_buttons else 0
-        status_y = box_margin + button_area_h
-        profile_h = calc_window_height(2)
-        params_h = calc_window_height(6)
-        profile_y = max(status_y + 120, h - box_margin - profile_h)
-        params_y = max(status_y + 120, profile_y - box_margin - params_h)
-        status_h = max(96, params_y - box_margin - status_y)
-        wx = box_margin
-        ww = max(1, w - box_margin * 2)
-        params_w = int(round(300 * sx))
-        top_rect = QRectF(wx, status_y, ww, status_h)
-        param_rect = QRectF(wx, params_y, params_w, params_h)
-        equip_rect = QRectF(wx + params_w + box_margin, params_y, max(1, ww - params_w - box_margin), params_h)
-        profile_rect = QRectF(wx, profile_y, ww, profile_h)
-
-        if show_touch_buttons:
-            self._maker_db_draw_mz_button(painter, QRectF(box_margin + 8, box_margin + 2, 50 * sx, 48 * sy), "<")
-            self._maker_db_draw_mz_button(painter, QRectF(box_margin + 66, box_margin + 2, 50 * sx, 48 * sy), ">")
-            self._maker_db_draw_mz_button(painter, QRectF(w - box_margin - 62 * sx, box_margin + 2, 54 * sx, 48 * sy), "↩")
-
-        for r in (top_rect, param_rect, equip_rect, profile_rect):
-            self._maker_db_draw_window(painter, r, width=max(2, int(3 * ss)), profile=profile)
-
-        normal = self._maker_db_mz_text_color(0, "#ffffff")
-        system_color = self._maker_db_mz_text_color(16, "#80aaff")
-        hp1 = self._maker_db_mz_text_color(20, "#e08040")
-        hp2 = self._maker_db_mz_text_color(21, "#f0c040")
-        mp1 = self._maker_db_mz_text_color(22, "#4080c0")
-        mp2 = self._maker_db_mz_text_color(23, "#40c0f0")
-        tp1 = self._maker_db_mz_text_color(28, "#8060c0")
-        tp2 = self._maker_db_mz_text_color(29, "#c060ff")
-        text_size = max(12, int(font_size * ss))
-        small_size = max(11, int((font_size - 4) * ss))
-
-        name = self._maker_database_effective_value("Actors", rec_id, "name", record.get("name") or shown)
-        nickname = self._maker_database_effective_value("Actors", rec_id, "nickname", record.get("nickname") or "")
-        profile_text = self._maker_database_effective_value("Actors", rec_id, "profile", record.get("profile") or "")
-        level = int(record.get("initialLevel") or 1)
+        classes = self._load_maker_database_json_runtime("Classes.json") or []
         class_name = ""
         try:
             cid = int(record.get("classId") or 0)
-            if 0 <= cid < len(classes) and classes[cid]:
-                class_name = self._maker_database_effective_value("Classes", cid, "name", (classes[cid] or {}).get("name") or "")
+            if isinstance(classes, list) and 0 <= cid < len(classes) and isinstance(classes[cid], dict):
+                class_name = self._maker_database_effective_value("Classes", cid, "name", classes[cid].get("name") or "")
         except Exception:
-            pass
-        vals = self._maker_db_actor_param_values_with_equips(record, classes, weapons, armors, level)
-
-        # Content origins are Window_Base.innerRect origins: window x/y + padding.
-        cx = top_rect.x() + padding * sx
-        cy = top_rect.y() + padding * sy
-        lh = line_h * sy
-        pad_x = padding * sx
-
-        # Window_Status.drawBlock1() equivalent.
-        y1 = cy
-        self._maker_db_draw_text(painter, QRectF(cx + 6 * sx, y1, 168 * sx, lh), name, text_size, normal, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-        self._maker_db_draw_text(painter, QRectF(cx + 192 * sx, y1, 168 * sx, lh), class_name, text_size, normal, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-        self._maker_db_draw_text(painter, QRectF(cx + 432 * sx, y1, 270 * sx, lh), nickname, text_size, normal, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-
-        # Window_Status.drawBlock2(): face, basic info, exp info.
-        block2_y = cy + line_h * 2 * sy
-        face = self._maker_database_preview_face_pixmap(record.get("faceName"), record.get("faceIndex"))
-        if face and not face.isNull():
-            # Face graphics must stay square.  Custom MV/MZ screen sizes can make
-            # sx and sy differ, so use the uniform status scale for image assets.
-            face_size = 144 * ss
-            painter.drawPixmap(QRectF(cx + 12 * sx, block2_y, face_size, face_size).toRect(), face)
-
-        basic_x = cx + 204 * sx
-        exp_x = cx + 456 * sx
-        level_a = self._maker_db_mz_basic_term(system, 1, "Lv") or "Lv"
-        hp_a = self._maker_db_mz_basic_term(system, 3, "HP") or "HP"
-        mp_a = self._maker_db_mz_basic_term(system, 5, "MP") or "MP"
-        tp_a = self._maker_db_mz_basic_term(system, 7, "TP") or "TP"
-        exp_name = self._maker_db_mz_basic_term(system, 8, "EXP") or "EXP"
-        level_name = self._maker_db_mz_basic_term(system, 0, "Level") or "Level"
-        exp_total_t = self._maker_db_mz_message_term(system, "expTotal", "現在の%1")
-        exp_next_t = self._maker_db_mz_message_term(system, "expNext", "次の%1まで")
-        exp_total = self._maker_db_mz_format_term(exp_total_t, exp_name)
-        exp_next = self._maker_db_mz_format_term(exp_next_t, level_name)
-
-        self._maker_db_draw_text(painter, QRectF(basic_x, block2_y, 48 * sx, lh), level_a, text_size, system_color, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-        self._maker_db_draw_text(painter, QRectF(basic_x + 84 * sx, block2_y, 48 * sx, lh), str(level), text_size, normal, False, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-
-        gauge_x = basic_x
-        gauge_w = 128 * sx
-        gauge_h = max(6, int(12 * sy))
-        for row_i, (label, value, c1, c2, ratio) in enumerate((
-            (hp_a, vals[0], hp1, hp2, 1.0),
-            (mp_a, vals[1], mp1, mp2, 1.0),
-            (tp_a, "", tp1, tp2, 0.0),
-        )):
-            gy = block2_y + (2 + row_i) * lh
-            self._maker_db_draw_text(painter, QRectF(gauge_x, gy, 44 * sx, lh), label, small_size, system_color, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-            self._maker_db_draw_gauge_gradient(painter, gauge_x + 34 * sx, gy + 20 * sy, gauge_w, gauge_h, ratio, c1, c2)
-            if value != "":
-                self._maker_db_draw_text(painter, QRectF(gauge_x + 34 * sx, gy - 1 * sy, gauge_w, lh), str(value), small_size, normal, False, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-
-        self._maker_db_draw_text(painter, QRectF(exp_x, block2_y, 270 * sx, lh), exp_total, text_size, system_color, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-        self._maker_db_draw_text(painter, QRectF(exp_x, block2_y + lh, 270 * sx, lh), "-------", text_size, normal, False, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-        self._maker_db_draw_text(painter, QRectF(exp_x, block2_y + lh * 2, 270 * sx, lh), exp_next, text_size, system_color, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-        self._maker_db_draw_text(painter, QRectF(exp_x, block2_y + lh * 3, 270 * sx, lh), "-------", text_size, normal, False, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-
-        # Window_StatusParams.drawItem(): six params from ATK to LUK, including
-        # equipment bonuses so the preview matches the game's status screen.
-        pcx = param_rect.x() + padding * sx
-        pcy = param_rect.y() + padding * sy
-        for row_i, idx in enumerate([2, 3, 4, 5, 6, 7]):
-            y = pcy + row_i * lh
-            label = self._maker_db_mz_param_term(system, idx, str(idx))
-            self._maker_db_draw_text(painter, QRectF(pcx + 8 * sx, y, 150 * sx, lh), label, text_size, system_color, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-            self._maker_db_draw_text(painter, QRectF(pcx + 160 * sx, y, 92 * sx, lh), str(vals[idx] or ""), text_size, normal, False, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-
-        # Window_StatusEquip.drawItem().  Slot labels use System.json equipTypes;
-        # item names/icons use Weapons/Armors records, with translated DB rows if present.
-        ecx = equip_rect.x() + padding * sx
-        ecy = equip_rect.y() + padding * sy
-        equip_types = system.get("equipTypes") if isinstance(system.get("equipTypes"), list) else []
-        equips = []
-        try:
-            for pos, eid in enumerate(record.get("equips") or []):
-                eid = int(eid or 0)
-                if eid <= 0:
-                    item = None
-                else:
-                    src_list = weapons if pos == 0 else armors
-                    item = dict(src_list[eid]) if 0 <= eid < len(src_list) and src_list[eid] else None
-                    if item is not None:
-                        k = "Weapons" if pos == 0 else "Armors"
-                        item["_preview_name"] = self._maker_database_effective_value(k, eid, "name", item.get("name") or "")
-                etype_id = 1
-                try:
-                    if item is not None and int(item.get("etypeId") or 0) > 0:
-                        etype_id = int(item.get("etypeId") or 0)
-                    elif pos + 1 < len(equip_types):
-                        etype_id = pos + 1
-                except Exception:
-                    etype_id = pos + 1
-                slot = self._maker_db_mz_equip_type_name(system, etype_id, f"Equip {pos + 1}")
-                equips.append((slot, item))
-        except Exception:
-            pass
-        slot_w = 138 * sx
-        for i, (slot, item) in enumerate(equips[:6]):
-            y = ecy + i * lh
-            self._maker_db_draw_text(painter, QRectF(ecx + 8 * sx, y, slot_w, lh), slot, text_size, system_color, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-            if item:
-                self._maker_db_draw_icon_item_name_mz(painter, item, ecx + 8 * sx + slot_w, y, max(1, equip_rect.width() - padding * 2 * sx - 8 * sx - slot_w), text_size, normal, sx=sx, sy=sy)
-
-        # Profile window.  MZ drawTextEx handles wrapping through escape processing;
-        # here we keep the game text and use the game font inside the real profile
-        # window rectangle.
-        prx = profile_rect.x() + padding * sx
-        pry = profile_rect.y() + padding * sy
-        self._maker_db_draw_text(painter, QRectF(prx + 8 * sx, pry, profile_rect.width() - padding * 2 * sx - 16 * sx, profile_rect.height() - padding * 2 * sy), profile_text, max(12, text_size), normal, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, False, wrap=False, outline=True)
-        self._maker_db_canvas_finalize(painter)
-        return pix
-
-
-    def _maker_render_actor_database_canvas_mv(self, row_data, unit, db_kind, rec_id, field, record, src, shown):
-        """Render the Actor status preview by porting RPG Maker MV Window_Status.
-
-        MV and MZ are intentionally kept separate here.  MV's database/status
-        screen is a single Window_Status with drawBlock1~4 and 816x624 default
-        coordinates; it must not reuse the MZ split-window layout.
-        """
-        pix = self._maker_database_new_canvas()
-        painter = QPainter(pix)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        w, h = pix.width(), pix.height()
-        sx, sy = w / 816.0, h / 624.0
-        ss = min(sx, sy)
-        profile = self._maker_database_runtime_profile()
-        win = profile.get("window") if isinstance(profile.get("window"), dict) else {}
-        font_prof = profile.get("font") if isinstance(profile.get("font"), dict) else {}
-        msg = profile.get("message_window") if isinstance(profile.get("message_window"), dict) else {}
-        try:
-            padding = int(win.get("padding") or 18)
-        except Exception:
-            padding = 18
-        try:
-            line_h0 = int(msg.get("line_height") or 36)
-        except Exception:
-            line_h0 = 36
-        try:
-            font_size0 = int(font_prof.get("size") or 28)
-        except Exception:
-            font_size0 = 28
-        pad_x, pad_y = padding * sx, padding * sy
-        line_h = line_h0 * sy
-        text_size = max(12, int(font_size0 * ss))
-        small_size = max(11, int((font_size0 - 4) * ss))
-
-        record = record if isinstance(record, dict) else {}
-        system = self._load_maker_database_json_runtime("System.json") or {}
-        classes = self._maker_db_record_list("Classes.json")
-        weapons = self._maker_db_record_list("Weapons.json")
-        armors = self._maker_db_record_list("Armors.json")
-
-        # Scene_Status has no game map background; it displays the status window
-        # over a dark scene background.  Keep one real Window_Status rectangle.
-        self._maker_db_draw_pattern_bg(painter, QRectF(0, 0, w, h))
-        full_rect = QRectF(0, 0, w, h)
-        self._maker_db_draw_window(painter, full_rect, width=max(1, int(2 * ss)), profile=profile)
-
-        normal = self._maker_db_mz_text_color(0, "#ffffff")
-        system_color = self._maker_db_mz_text_color(16, "#80aaff")
-        hp1 = self._maker_db_mz_text_color(20, "#e08040")
-        hp2 = self._maker_db_mz_text_color(21, "#f0c040")
-        mp1 = self._maker_db_mz_text_color(22, "#4080c0")
-        mp2 = self._maker_db_mz_text_color(23, "#40c0f0")
-
-        name = self._maker_database_effective_value("Actors", rec_id, "name", record.get("name") or shown)
+            class_name = ""
+        name = self._maker_database_effective_value("Actors", rec_id, "name", record.get("name") or "")
         nickname = self._maker_database_effective_value("Actors", rec_id, "nickname", record.get("nickname") or "")
-        profile_text = self._maker_database_effective_value("Actors", rec_id, "profile", record.get("profile") or "")
-        level = int(record.get("initialLevel") or 1)
-        class_name = ""
-        try:
-            cid = int(record.get("classId") or 0)
-            if 0 <= cid < len(classes) and classes[cid]:
-                class_name = self._maker_database_effective_value("Classes", cid, "name", (classes[cid] or {}).get("name") or "")
-        except Exception:
-            pass
-        vals = self._maker_db_actor_param_values_with_equips(record, classes, weapons, armors, level)
+        profile = self._maker_database_effective_value("Actors", rec_id, "profile", record.get("profile") or "")
+        level = str(record.get("initialLevel") or "")
 
-        def rx(v):
-            return pad_x + float(v) * sx
-        def ry(v):
-            return pad_y + float(v) * sy
-        def rw(v):
-            return float(v) * sx
-        def rh(v):
-            return float(v) * sy
-
-        def draw_horz_line(y_base):
-            try:
-                y = ry(y_base) + line_h / 2 - 1
-                x1 = rx(0)
-                x2 = w - pad_x
-                painter.save()
-                c = self._db_preview_qcolor(normal)
-                c.setAlpha(70)
-                painter.setPen(QPen(c, max(1, int(2 * ss))))
-                painter.drawLine(QPointF(x1, y), QPointF(x2, y))
-                painter.restore()
-            except Exception:
-                pass
-
-        # Window_Status.drawBlock1(y=0)
-        y0 = 0
-        self._maker_db_draw_text(painter, QRectF(rx(6), ry(y0), rw(168), line_h), name, text_size, normal, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-        self._maker_db_draw_text(painter, QRectF(rx(192), ry(y0), rw(168), line_h), class_name, text_size, normal, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-        self._maker_db_draw_text(painter, QRectF(rx(432), ry(y0), rw(270), line_h), nickname, text_size, normal, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-        draw_horz_line(line_h0)
-
-        # Window_Status.drawBlock2(y=lineHeight*2)
-        block2_y = line_h0 * 2
+        body_top = header_h + margin
+        face_size = min(max(120, int(min(w, h) * 0.23)), max(120, int(h * 0.30)))
+        face_rect = QRectF(margin, body_top, face_size, face_size)
+        painter.fillRect(face_rect, QColor("#181c23"))
+        painter.setPen(QPen(QColor("#394252"), 1))
+        painter.drawRect(face_rect)
         face = self._maker_database_preview_face_pixmap(record.get("faceName"), record.get("faceIndex"))
-        if face and not face.isNull():
-            # Keep the actor face aspect ratio exactly like RPG Maker's 144x144
-            # face blit.  The status window coordinates may stretch with the
-            # project screen, but the face itself must not be non-uniformly scaled.
-            face_size = 144 * ss
-            painter.drawPixmap(QRectF(rx(12), ry(block2_y), face_size, face_size).toRect(), face)
+        if face is not None and not face.isNull():
+            painter.drawPixmap(face_rect.toRect(), face)
+        else:
+            self._maker_db_draw_text(painter, face_rect, self.tr_ui("얼굴 이미지 없음"), 16, muted, False,
+                                     Qt.AlignmentFlag.AlignCenter, False, wrap=True)
 
-        basic_x = 204
-        exp_x = 456
-        level_a = self._maker_db_mz_basic_term(system, 1, "Lv") or "Lv"
-        hp_a = self._maker_db_mz_basic_term(system, 3, "HP") or "HP"
-        mp_a = self._maker_db_mz_basic_term(system, 5, "MP") or "MP"
-        exp_name = self._maker_db_mz_basic_term(system, 8, "EXP") or "EXP"
-        level_name = self._maker_db_mz_basic_term(system, 0, "Level") or "Level"
-        exp_total = self._maker_db_mz_format_term(self._maker_db_mz_message_term(system, "expTotal", "Current %1"), exp_name)
-        exp_next = self._maker_db_mz_format_term(self._maker_db_mz_message_term(system, "expNext", "To Next %1"), level_name)
+        info_x = face_rect.right() + margin
+        info_w = max(120, w - info_x - margin)
+        line_h = max(34, int(h * 0.055))
+        rows = [
+            (self.tr_ui("이름"), name),
+            (self.tr_ui("별명"), nickname),
+            (self.tr_ui("직업"), class_name),
+            (self.tr_ui("초기 레벨"), level),
+        ]
+        for i, (label, value) in enumerate(rows):
+            y = body_top + i * line_h
+            painter.fillRect(QRectF(info_x, y, info_w, line_h - 4), QColor("#181c23"))
+            self._maker_db_draw_text(painter, QRectF(info_x + 10, y, info_w * 0.28, line_h - 4), label, 16, accent, True,
+                                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False)
+            self._maker_db_draw_text(painter, QRectF(info_x + info_w * 0.30, y, info_w * 0.67, line_h - 4), value, 18, normal, False,
+                                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False)
 
-        # drawActorLevel
-        self._maker_db_draw_text(painter, QRectF(rx(basic_x), ry(block2_y), rw(48), line_h), level_a, text_size, system_color, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-        self._maker_db_draw_text(painter, QRectF(rx(basic_x + 84), ry(block2_y), rw(48), line_h), str(level), text_size, normal, False, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
+        profile_top = max(face_rect.bottom() + margin, body_top + len(rows) * line_h + margin)
+        selected_h = max(96, int(h * 0.18))
+        profile_h = max(80, h - profile_top - selected_h - margin * 2)
+        painter.fillRect(QRectF(margin, profile_top, w - margin * 2, profile_h), QColor("#181c23"))
+        self._maker_db_draw_text(painter, QRectF(margin + 10, profile_top + 6, w - margin * 2 - 20, 30), self.tr_ui("프로필"), 16, accent, True,
+                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False)
+        self._maker_db_draw_text(painter, QRectF(margin + 10, profile_top + 38, w - margin * 2 - 20, profile_h - 44), profile, 17, normal, False,
+                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, False, wrap=True)
 
-        def draw_param_gauge(label, value, y_row, c1, c2):
-            gy = ry(y_row)
-            gx = rx(basic_x)
-            gw = rw(186)
-            self._maker_db_draw_text(painter, QRectF(gx, gy, rw(44), line_h), label, small_size, system_color, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-            self._maker_db_draw_gauge_gradient(painter, gx + rw(44), gy + line_h - rh(8), gw - rw(44), max(6, int(6 * sy)), 1.0, c1, c2)
-            self._maker_db_draw_text(painter, QRectF(gx + rw(44), gy, gw - rw(44), line_h), str(value), small_size, normal, False, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-
-        # MV default status shows HP/MP here.  TP is not inserted unless plugins do it.
-        draw_param_gauge(hp_a, vals[0], block2_y + line_h0 * 2, hp1, hp2)
-        draw_param_gauge(mp_a, vals[1], block2_y + line_h0 * 3, mp1, mp2)
-
-        self._maker_db_draw_text(painter, QRectF(rx(exp_x), ry(block2_y), rw(270), line_h), exp_total, text_size, system_color, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-        self._maker_db_draw_text(painter, QRectF(rx(exp_x), ry(block2_y + line_h0), rw(270), line_h), "-------", text_size, normal, False, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-        self._maker_db_draw_text(painter, QRectF(rx(exp_x), ry(block2_y + line_h0 * 2), rw(270), line_h), exp_next, text_size, system_color, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-        self._maker_db_draw_text(painter, QRectF(rx(exp_x), ry(block2_y + line_h0 * 3), rw(270), line_h), "-------", text_size, normal, False, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-        draw_horz_line(line_h0 * 6)
-
-        # Window_Status.drawBlock3(y=lineHeight*7)
-        block3_y = line_h0 * 7
-        for i, idx in enumerate([2, 3, 4, 5, 6, 7]):
-            y = block3_y + line_h0 * i
-            label = self._maker_db_mz_param_term(system, idx, str(idx))
-            self._maker_db_draw_text(painter, QRectF(rx(48), ry(y), rw(160), line_h), label, text_size, system_color, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-            self._maker_db_draw_text(painter, QRectF(rx(208), ry(y), rw(60), line_h), str(vals[idx] or ""), text_size, normal, False, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, False, wrap=False, outline=True)
-
-        equip_items = []
-        try:
-            for pos, eid in enumerate(record.get("equips") or []):
-                eid = int(eid or 0)
-                src_list = weapons if pos == 0 else armors
-                item = None
-                if eid > 0 and 0 <= eid < len(src_list) and src_list[eid]:
-                    item = dict(src_list[eid] or {})
-                    k = "Weapons" if pos == 0 else "Armors"
-                    item["_preview_name"] = self._maker_database_effective_value(k, eid, "name", item.get("name") or "")
-                equip_items.append(item)
-        except Exception:
-            pass
-        for i, item in enumerate(equip_items[:6]):
-            y = block3_y + line_h0 * i
-            if item:
-                self._maker_db_draw_icon_item_name_mz(painter, item, rx(432), ry(y), rw(300), text_size, normal, sx=sx, sy=sy)
-        draw_horz_line(line_h0 * 13)
-
-        # Window_Status.drawBlock4(y=lineHeight*14)
-        block4_y = line_h0 * 14
-        self._maker_db_draw_text(painter, QRectF(rx(6), ry(block4_y), w - pad_x * 2 - rw(12), h - ry(block4_y) - pad_y), profile_text, text_size, normal, False, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, False, wrap=False, outline=True)
+        selected_top = profile_top + profile_h + margin
+        painter.fillRect(QRectF(margin, selected_top, w - margin * 2, selected_h), QColor("#151920"))
+        self._maker_db_draw_text(painter, QRectF(margin + 10, selected_top + 6, w - margin * 2 - 20, 26),
+                                 self.tr_ui("선택 필드") + f": {field}", 15, accent, True,
+                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False)
+        self._maker_db_draw_text(painter, QRectF(margin + 10, selected_top + 34, w - margin * 2 - 20, 25),
+                                 self.tr_ui("원문") + f": {src}", 15, muted, False,
+                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False)
+        self._maker_db_draw_text(painter, QRectF(margin + 10, selected_top + 60, w - margin * 2 - 20, selected_h - 64),
+                                 self.tr_ui("표시값") + f": {shown}", 15, good, False,
+                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, False, wrap=True)
         self._maker_db_canvas_finalize(painter)
         return pix
 
     def _maker_render_actor_database_canvas(self, row_data, unit, db_kind, rec_id, field, record, src, shown):
-        engine = self._maker_database_engine_key()
-        if engine == "mz":
-            return self._maker_render_actor_database_canvas_mz(row_data, unit, db_kind, rec_id, field, record, src, shown)
-        if engine == "mv":
-            return self._maker_render_actor_database_canvas_mv(row_data, unit, db_kind, rec_id, field, record, src, shown)
-        return self._maker_render_actor_database_canvas_mv(row_data, unit, db_kind, rec_id, field, record, src, shown)
+        # The old MV/MZ Scene_Status replicas are intentionally bypassed.  Runtime
+        # scenes are plugin-dependent and will be handled later by runtime capture.
+        return self._maker_render_actor_data_canvas(row_data, unit, db_kind, rec_id, field, record, src, shown)
 
 
     def _maker_render_item_like_database_canvas_mv(self, row_data, unit, db_kind, rec_id, field, record, src, shown):
@@ -12150,17 +17318,82 @@ class MainWindowProjectPagesMixin:
 
         self._maker_db_canvas_finalize(painter)
         return pix
+    def _maker_render_neutral_data_canvas(self, *, title, category, source_file, field, path, src, shown, subtitle=""):
+        pix = self._maker_database_new_canvas()
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w, h = max(1, pix.width()), max(1, pix.height())
+        painter.fillRect(QRectF(0, 0, w, h), QColor("#111318"))
+        margin = max(18, int(min(w, h) * 0.03))
+        header_h = max(60, int(h * 0.11))
+        painter.fillRect(QRectF(0, 0, w, header_h), QColor("#20242c"))
+        self._maker_db_draw_text(painter, QRectF(margin, 0, w - margin * 2, header_h), title, max(18, int(header_h * 0.40)), "#f2f4f8", True,
+                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False)
+        y = header_h + margin
+        line_h = max(32, int(h * 0.052))
+        info = [
+            (self.tr_ui("종류"), category),
+            (self.tr_ui("원본 파일"), source_file),
+            (self.tr_ui("필드"), field),
+            (self.tr_ui("원본 위치"), path),
+        ]
+        if subtitle:
+            info.insert(1, (self.tr_ui("설명"), subtitle))
+        for label, value in info:
+            painter.fillRect(QRectF(margin, y, w - margin * 2, line_h - 3), QColor("#181c23"))
+            self._maker_db_draw_text(painter, QRectF(margin + 10, y, w * 0.18, line_h - 3), label, 15, "#7fb0ff", True,
+                                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False)
+            self._maker_db_draw_text(painter, QRectF(margin + w * 0.20, y, w - margin * 2 - w * 0.20 - 10, line_h - 3), value, 15, "#e4e8ef", False,
+                                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False)
+            y += line_h
+        block_gap = max(12, int(h * 0.02))
+        remaining = max(120, h - y - margin)
+        source_h = max(60, int((remaining - block_gap) * 0.48))
+        trans_h = max(60, remaining - source_h - block_gap)
+        painter.fillRect(QRectF(margin, y, w - margin * 2, source_h), QColor("#181c23"))
+        self._maker_db_draw_text(painter, QRectF(margin + 10, y + 6, w - margin * 2 - 20, 26), self.tr_ui("원문"), 16, "#aeb6c4", True,
+                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False)
+        self._maker_db_draw_text(painter, QRectF(margin + 10, y + 34, w - margin * 2 - 20, source_h - 40), src, 17, "#f2f4f8", False,
+                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, False, wrap=True)
+        y += source_h + block_gap
+        painter.fillRect(QRectF(margin, y, w - margin * 2, trans_h), QColor("#151920"))
+        self._maker_db_draw_text(painter, QRectF(margin + 10, y + 6, w - margin * 2 - 20, 26), self.tr_ui("번역문 / 표시값"), 16, "#8ed6a4", True,
+                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, False)
+        self._maker_db_draw_text(painter, QRectF(margin + 10, y + 34, w - margin * 2 - 20, trans_h - 40), shown, 17, "#d8f4df", False,
+                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, False, wrap=True)
+        self._maker_db_canvas_finalize(painter)
+        return pix
+
     def _maker_render_unsupported_database_canvas(self, row_data, unit, db_kind, rec_id, field, record, src, shown):
-        # Some database files do not have a single stable MZ runtime screen
-        # (System terms, Classes, CommonEvents, Troops, etc.).  For those, do not
-        # invent a fake database card.  The caller will clear the preview canvas.
-        return None
+        unit = unit if isinstance(unit, dict) else {}
+        source_file = str(unit.get("source_file") or "")
+        path = str(unit.get("json_path") or unit.get("db_path") or source_file)
+        return self._maker_render_neutral_data_canvas(
+            title=self.tr_ui("데이터 미리보기"), category=str(db_kind or "DB"),
+            source_file=source_file, field=str(field or ""), path=path,
+            src=str(src or ""), shown=str(shown or ""),
+            subtitle=self.tr_ui("실제 게임 화면을 흉내 내지 않고 원본 데이터만 표시합니다."),
+        )
 
     def _maker_render_system_database_canvas(self, row_data, unit, db_kind, rec_id, field, record, src, shown):
         return self._maker_render_unsupported_database_canvas(row_data, unit, db_kind, rec_id, field, record, src, shown)
 
     def _maker_render_generic_database_canvas(self, row_data, unit, db_kind, rec_id, field, record, src, shown):
         return self._maker_render_unsupported_database_canvas(row_data, unit, db_kind, rec_id, field, record, src, shown)
+
+    def _maker_render_plugin_data_canvas(self, row_data, unit, page, src, shown):
+        unit = unit if isinstance(unit, dict) else {}
+        meta_page = (page or {}).get("maker_page") or {}
+        plugin_name = str(unit.get("plugin_name") or meta_page.get("plugin_name") or unit.get("db_kind") or "Plugin")
+        plugin_kind = str(unit.get("plugin_kind") or unit.get("text_type") or "text")
+        source_file = str(unit.get("source_file") or meta_page.get("source_file") or "")
+        field = str(unit.get("db_field") or unit.get("text_type") or "")
+        path = str(unit.get("json_path") or unit.get("db_path") or source_file)
+        return self._maker_render_neutral_data_canvas(
+            title=self.tr_ui("플러그인 데이터 미리보기"), category=f"{plugin_name} · {plugin_kind}",
+            source_file=source_file, field=field, path=path, src=src, shown=shown,
+            subtitle=self.tr_ui("플러그인의 원본 위치와 번역값을 표시합니다."),
+        )
     def _maker_db_terms_value(self, system_data, key, default=""):
         try:
             if not isinstance(system_data, dict):
@@ -12234,11 +17467,11 @@ class MainWindowProjectPagesMixin:
         stat_html = " ".join([f"<span style='color:#84a8ff'>{esc(k)}</span> {esc(v)}" for k, v in params[:4]])
         equip_html = " / ".join(esc(x) for x in equips) if equips else "-"
         return {
-            "subtitle": "Actors.json을 읽어 상태창 형태로 재구성했습니다. 번역문이 있으면 표시값에 우선 반영됩니다.",
+            "subtitle": self.tr_ui("Actors.json의 실제 데이터만 표시합니다. 게임의 스테이터스 화면을 재현하지 않습니다."),
             "kind": f"<div style='font-size:20px; font-weight:800;'>{esc(name)}</div><div style='font-size:14px; color:#cfc7cf;'>{esc(nickname)} · {esc(class_name)} · Lv {esc(level)}</div><div style='margin-top:10px;'>{stat_html}</div>",
             "source": f"<b>장비</b><br>{equip_html}<br><br><b>프로필</b><br>{esc(profile)}",
             "translation": f"<div style='font-size:15px; color:#a8c6ff;'>선택 항목: {esc(field)}</div><div style='margin-top:4px;'>원문: {esc(src)}</div><div style='color:#8fd19e;'>표시값: {esc(shown)}</div>",
-            "hint": "MZ/MV 공통 Actors.json 구조를 기준으로 읽습니다. MZ 전용 advanced 값이 없어도 동작합니다.",
+            "hint": "",
         }
 
     def _maker_render_item_like_database_preview(self, row_data, unit, db_kind, rec_id, field, record, src, shown):
@@ -12321,6 +17554,12 @@ class MainWindowProjectPagesMixin:
         src = str(row_data.get("text") or row_data.get("source_text") or "")
         dst = str(row_data.get("translated_text") or "")
         shown = dst if dst.strip() else src
+        page_type = str(meta_page.get("page_type") or "").strip().lower()
+        source_kind = str(unit.get("source_kind") or "").strip().lower()
+        if page_type == "speaker" or source_kind == "speaker":
+            return self._maker_render_generic_database_canvas(row_data, unit, "Speaker", None, "name", {}, src, shown)
+        if page_type == "plugin" or source_kind.startswith("plugin"):
+            return self._maker_render_plugin_data_canvas(row_data, unit, page, src, shown)
         record, rec_id, path_field = self._maker_database_record_from_path(source_file, path)
         if not field:
             field = path_field
@@ -12345,6 +17584,34 @@ class MainWindowProjectPagesMixin:
         src = str(row_data.get("text") or row_data.get("source_text") or "")
         dst = str(row_data.get("translated_text") or "")
         shown = dst if dst.strip() else src
+        page_type = str(meta_page.get("page_type") or "").strip().lower()
+        source_kind = str(unit.get("source_kind") or "").strip().lower()
+        if page_type == "speaker" or source_kind == "speaker":
+            esc = self._db_preview_escape
+            self._maker_set_database_preview_pixmap(None, "Speaker")
+            original = str(unit.get("speaker_original") or src)
+            use_count = int(unit.get("speaker_usage_count") or 0)
+            raw_samples = [str(x) for x in (unit.get("speaker_raw_samples") or []) if str(x).strip()]
+            raw_html = "<br>".join(esc(x) for x in raw_samples[:5]) or "-"
+            return {
+                "subtitle": self.tr_ui("대사에서 수집한 화자명을 독립 레이어에서 관리합니다."),
+                "kind": f"<div style='font-size:18px; font-weight:800;'>{esc(original)}</div><div style='color:#cfc7cf;'>{self.tr_ui('사용 {count}회', count=use_count)}</div>",
+                "source": f"<b>{esc(self.tr_ui('원래 화자'))}</b><br>{esc(original)}<br><br><b>{esc(self.tr_ui('제어코드 포함 원본'))}</b><br>{raw_html}",
+                "translation": f"<b>{esc(self.tr_ui('번역/표시 이름'))}</b><br>{esc(shown)}",
+                "hint": self.tr_ui("수정한 화자명은 연결된 실제 대사에만 반영됩니다."),
+            }
+        if page_type == "plugin" or source_kind.startswith("plugin"):
+            esc = self._db_preview_escape
+            self._maker_set_database_preview_pixmap(None, "Plugin")
+            plugin_name = str(unit.get("plugin_name") or meta_page.get("plugin_name") or unit.get("db_kind") or "Plugin")
+            plugin_kind = str(unit.get("plugin_kind") or unit.get("text_type") or "text")
+            return {
+                "subtitle": self.tr_ui("플러그인의 원본 위치와 번역값을 표시합니다."),
+                "kind": f"<div style='font-size:18px; font-weight:800;'>{esc(plugin_name)}</div><div style='color:#cfc7cf;'>{esc(plugin_kind)} · {esc(field)}</div>",
+                "source": f"<b>{esc(self.tr_ui('원본 파일'))}</b><br>{esc(source_file)}<br><br><b>{esc(self.tr_ui('원본 위치'))}</b><br>{esc(path)}<br><br><b>{esc(self.tr_ui('원문'))}</b><br>{esc(src)}",
+                "translation": f"<b>{esc(self.tr_ui('번역문 / 표시값'))}</b><br>{esc(shown)}",
+                "hint": self.tr_ui("번역문은 원래 플러그인 데이터 위치에 다시 저장됩니다."),
+            }
         record, rec_id, path_field = self._maker_database_record_from_path(source_file, path)
         if not field:
             field = path_field
@@ -12373,87 +17640,62 @@ class MainWindowProjectPagesMixin:
         }
 
     def refresh_maker_database_preview_from_selection(self):
-        """오른쪽 DB 표 선택 행을 왼쪽 DB 프리뷰 패널에 반영한다."""
-        if not (hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode()):
-            return False
-        try:
-            page, row_data, data_index = self._current_database_preview_row_data()
-            meta_page = (page or {}).get("maker_page") or {}
-            label = self._database_tab_label_for_page(int(getattr(self, "maker_database_idx", 0) or 0)) if hasattr(self, "_database_tab_label_for_page") else str(meta_page.get("page_title") or "DB")
-            title = getattr(self, "lbl_maker_database_preview_title", None)
-            subtitle = getattr(self, "lbl_maker_database_preview_subtitle", None)
-            kind_lbl = getattr(self, "lbl_maker_database_preview_kind", None)
-            src_lbl = getattr(self, "lbl_maker_database_preview_source", None)
-            trans_lbl = getattr(self, "lbl_maker_database_preview_translation", None)
-            hint_lbl = getattr(self, "lbl_maker_database_preview_hint", None)
-            if title is not None:
-                title.setText(self.tr_ui("데이터베이스 프리뷰") + f"  |  {label}")
-            if row_data is None:
-                self._maker_set_database_preview_pixmap(None, "DB")
-                try:
-                    pix = self._maker_render_generic_database_canvas({}, {}, label, None, "", {}, "", self.tr_ui("이 DB 탭에는 표시할 텍스트가 없습니다."))
-                    self._maker_database_preview_set_canvas_pixmap(pix)
-                except Exception:
-                    pass
-                if subtitle is not None:
-                    subtitle.setText(self.tr_ui("이 DB 탭에는 표시할 텍스트가 없습니다."))
-                if kind_lbl is not None: kind_lbl.setText("")
-                if src_lbl is not None: src_lbl.setText("")
-                if trans_lbl is not None: trans_lbl.setText("")
-                if hint_lbl is not None: hint_lbl.setText("")
-                return True
-            # 3차 DB 프리뷰: 실제 게임창 비율의 이미지 캔버스를 다시 렌더링해서
-            # 일반 맵 프리뷰처럼 축소/확대 가능한 화면으로 표시한다.
-            try:
-                canvas = self._maker_build_database_preview_canvas(page, row_data, data_index)
-                self._maker_database_preview_set_canvas_pixmap(canvas)
-            except Exception as ce:
-                try:
-                    self.log(f"⚠️ DB 캔버스 프리뷰 렌더 실패: {type(ce).__name__}: {ce}")
-                except Exception:
-                    pass
-            payload = self._maker_build_database_preview_payload(page, row_data, data_index)
-            if subtitle is not None:
-                subtitle.setText(str(payload.get("subtitle") or ""))
-            if kind_lbl is not None:
-                kind_lbl.setText(str(payload.get("kind") or ""))
-            if src_lbl is not None:
-                src_lbl.setText(str(payload.get("source") or ""))
-            if trans_lbl is not None:
-                trans_lbl.setText(str(payload.get("translation") or ""))
-            if hint_lbl is not None:
-                hint_lbl.setText(str(payload.get("hint") or ""))
-            return True
-        except Exception as e:
-            try:
-                self.log(f"⚠️ DB 프리뷰 갱신 실패: {type(e).__name__}: {e}")
-            except Exception:
-                pass
-            return False
+        """DB/플러그인/화자 모드는 왼쪽 프리뷰 연산을 수행하지 않는다."""
+        return False
 
     def update_maker_database_mode_bar(self):
-        enabled = self.is_maker_database_mode()
+        """좌측 공통 옵션바를 현재 번역 레이어에 맞춰 갱신한다."""
+        enabled = self.is_maker_special_table_mode()
+        plugin_mode = bool(self.is_maker_plugin_mode()) if hasattr(self, "is_maker_plugin_mode") else False
+        speaker_mode = bool(self.is_maker_speaker_mode()) if hasattr(self, "is_maker_speaker_mode") else False
         try:
             bar = getattr(self, "maker_database_mode_bar", None)
             if bar is not None:
-                bar.setVisible(enabled)
+                bar.setVisible(True)
         except Exception:
             pass
         try:
+            mode_label = getattr(self, "lbl_maker_database_mode", None)
+            if mode_label is not None:
+                mode_label.setText(self.tr_ui("플러그인 번역 모드" if plugin_mode else ("화자 번역 모드" if speaker_mode else "데이터베이스 모드")))
+                mode_label.setVisible(enabled)
+            exit_btn = getattr(self, "btn_exit_maker_database_mode", None)
+            if exit_btn is not None:
+                exit_btn.setText(self.tr_ui("플러그인 번역 모드 나가기" if plugin_mode else ("화자 번역 모드 나가기" if speaker_mode else "데이터베이스 모드 나가기")))
+                exit_btn.setVisible(enabled)
             label = getattr(self, "lbl_maker_database_mode_detail", None)
             if label is not None:
                 current = self._database_tab_label_for_page(int(getattr(self, "maker_database_idx", 0) or 0)) if enabled else ""
-                label.setText(self.tr_ui("현재 탭의 DB 항목만 번역합니다.") + (f"  |  {current}" if current else ""))
+                detail = "현재 탭의 플러그인 항목만 번역합니다." if plugin_mode else ("현재 화자명만 번역합니다." if speaker_mode else "현재 탭의 DB 항목만 번역합니다.")
+                label.setText(self.tr_ui(detail) + (f"  |  {current}" if current else ""))
+                label.setVisible(enabled)
+            preview_cb = getattr(self, "cb_maker_preview_visible", None)
+            if preview_cb is not None:
+                old = preview_cb.blockSignals(True)
+                try:
+                    preview_cb.setChecked(bool(getattr(self, "maker_preview_enabled", True)))
+                    preview_cb.setVisible(not enabled)
+                finally:
+                    preview_cb.blockSignals(old)
         except Exception:
             pass
         try:
-            act = (getattr(self, "actions", {}) or {}).get("option_maker_database_translation")
-            if act is not None and hasattr(act, "setChecked"):
-                old = act.blockSignals(True)
-                try:
-                    act.setChecked(enabled)
-                finally:
-                    act.blockSignals(old)
+            actions = (getattr(self, "actions", {}) or {})
+            for action_key, checked in (
+                ("option_maker_database_translation", bool(enabled and not plugin_mode and not speaker_mode)),
+                ("db_maker_plugin_translation", bool(enabled and plugin_mode)),
+                ("db_maker_character_name_translation", bool(enabled and speaker_mode)),
+            ):
+                act = actions.get(action_key)
+                if act is not None and hasattr(act, "setChecked"):
+                    old = act.blockSignals(True)
+                    try:
+                        act.setChecked(checked)
+                    finally:
+                        act.blockSignals(old)
+            refresh_action = actions.get("work_refresh_maker_preview")
+            if refresh_action is not None:
+                refresh_action.setEnabled(bool((not enabled) and getattr(self, "maker_preview_enabled", True) and self.has_open_project()))
         except Exception:
             pass
         try:
@@ -12548,7 +17790,11 @@ class MainWindowProjectPagesMixin:
             tab.setItem(0, 2, self._make_table_item("", editable=False))
             tab.setItem(0, 3, self._make_table_item("", editable=False))
             tab.setItem(0, 4, self._make_table_item("", editable=False))
-            tab.setItem(0, 5, self._make_table_item(self.tr_ui("현재 DB 텍스트") + f" · {len(filtered)}", editable=False))
+            if hasattr(self, "is_maker_speaker_mode") and self.is_maker_speaker_mode():
+                layer_summary = self.tr_ui("현재 화자명")
+            else:
+                layer_summary = self.tr_ui("현재 플러그인 텍스트" if (hasattr(self, "is_maker_plugin_mode") and self.is_maker_plugin_mode()) else "현재 DB 텍스트")
+            tab.setItem(0, 5, self._make_table_item(layer_summary + f" · {len(filtered)}", editable=False))
             tab.setItem(0, 6, self._make_table_item(f"{self.tr_ui('번역완료')} {translated} / {self.tr_ui('미번역')} {max(0, len(visible_rows)-translated)}", editable=False))
             tab.setItem(0, 7, self._make_table_item("", editable=False))
             try:
@@ -12579,14 +17825,26 @@ class MainWindowProjectPagesMixin:
                         speaker_text = str(row_data.get("maker_speaker_plain") or row_data.get("maker_speaker") or "")
                 db_kind = str(meta.get("db_kind") or meta.get("source_file") or "")
                 db_field = str(meta.get("db_field") or meta.get("text_type") or "")
+                speaker_layer = bool(hasattr(self, "is_maker_speaker_mode") and self.is_maker_speaker_mode())
+                if speaker_layer:
+                    speaker_text = ""
+                    db_kind = "Speaker"
+                    db_field = "name"
                 db_id = meta.get("db_id")
                 source_file = str(meta.get("source_file") or "")
                 event_bits = []
                 if source_file:
                     event_bits.append(source_file)
-                if db_id not in (None, ""):
+                if hasattr(self, "is_maker_plugin_mode") and self.is_maker_plugin_mode():
+                    plugin_name = str(meta.get("plugin_name") or db_kind or "")
+                    if plugin_name and plugin_name not in event_bits:
+                        event_bits.append(plugin_name)
+                elif db_id not in (None, ""):
                     event_bits.append(f"#{db_id}")
-                event_text = " · ".join(event_bits)
+                if speaker_layer:
+                    event_text = self.tr_ui("사용 {count}회", count=int(meta.get("speaker_usage_count") or 0))
+                else:
+                    event_text = " · ".join(event_bits)
                 memo_text = str(row_data.get("maker_memo") or "")
 
                 id_text = str(row_data.get("id", i))
@@ -12594,7 +17852,7 @@ class MainWindowProjectPagesMixin:
                 id_item.setData(Qt.ItemDataRole.UserRole, source_index)
                 tab.setItem(i, 0, id_item)
                 tab.setItem(i, 1, self._make_table_item(status_text, editable=True, center=True, user_value=status_text))
-                tab.setItem(i, 2, self._make_table_item(speaker_text, editable=True, user_value=speaker_text))
+                tab.setItem(i, 2, self._make_table_item(speaker_text, editable=not speaker_layer, user_value=speaker_text))
                 tab.setItem(i, 3, self._make_table_item(db_field or db_kind, editable=False, center=True, user_value=db_field or db_kind))
                 tab.setItem(i, 4, self._make_table_item(event_text, editable=False, user_value=event_text))
                 # DB source/original text is project input data.  The visible DB table
@@ -12656,10 +17914,6 @@ class MainWindowProjectPagesMixin:
         try:
             if len(rows) > 0 and tab.currentRow() < 1:
                 tab.setCurrentCell(1, 6 if tab.columnCount() > 6 else 0)
-        except Exception:
-            pass
-        try:
-            self.refresh_maker_database_preview_from_selection()
         except Exception:
             pass
         try:
@@ -12768,13 +18022,19 @@ class MainWindowProjectPagesMixin:
                 self.mark_project_structure_dirty("maker_database_page_edit")
             except Exception:
                 pass
-            try:
-                self.apply_maker_writeback_to_clone(mark_dirty=False, log_result=False, backup=False, page_indices=[actual_idx])
-            except Exception as e:
+            if hasattr(self, "is_maker_speaker_mode") and self.is_maker_speaker_mode():
                 try:
-                    self.log(f"⚠️ DB 텍스트 JSON 실시간 반영 실패: {e}")
+                    self.apply_maker_speaker_layer_to_dialogues(actual_idx, reason="speaker table commit")
                 except Exception:
                     pass
+            else:
+                try:
+                    self.mark_maker_writeback_dirty(page_indices=[actual_idx], reason="maker_page_edit")
+                except Exception as e:
+                    try:
+                        self.log(f"⚠️ DB 텍스트 JSON 반영 대기 처리 실패: {e}")
+                    except Exception:
+                        pass
         return changed
 
     def audit_maker_database_mode_event(self, event, **fields):
@@ -12798,10 +18058,10 @@ class MainWindowProjectPagesMixin:
             self.audit_maker_database_mode_event(
                 "DB_MODE_TABBAR_REBUILT",
                 reason=reason,
-                db_mode=bool(self.is_maker_database_mode()) if hasattr(self, "is_maker_database_mode") else False,
+                db_mode=bool(self.is_maker_special_table_mode()) if hasattr(self, "is_maker_special_table_mode") else False,
                 tabbar_count=(getattr(self, "page_tab_bar", None).count() if getattr(self, "page_tab_bar", None) is not None else None),
                 layer_count=len(pages),
-                first=(self._database_tab_label_for_page(pages[0]) if pages and self.is_maker_database_mode() else (self.page_display_name(pages[0]) if pages and hasattr(self, "page_display_name") else "")),
+                first=(self._database_tab_label_for_page(pages[0]) if pages and self.is_maker_special_table_mode() else (self.page_display_name(pages[0]) if pages and hasattr(self, "page_display_name") else "")),
             )
             return len(pages)
         except Exception as e:
@@ -12811,12 +18071,460 @@ class MainWindowProjectPagesMixin:
                 pass
             return 0
 
+    def ensure_maker_plugin_pages(self, *, save_project=True, reason="plugin mode"):
+        """Ensure isolated plugin translation virtual pages exist.
+
+        New imports create them in build_maker_pages.  Existing projects are repaired
+        lazily from maker_game without touching map/database pages.
+        """
+        try:
+            paths = list(getattr(self, "paths", []) or [])
+            data = getattr(self, "data", {}) or {}
+            if not isinstance(data, dict):
+                data = {}
+            existing_keys = set()
+            count = 0
+            for i in range(len(paths)):
+                page = self._page_data_for_index_safe(i) if hasattr(self, "_page_data_for_index_safe") else data.get(i, {})
+                if not self._maker_page_is_plugin_page(page):
+                    continue
+                count += 1
+                meta = (page or {}).get("maker_page") or {}
+                key = str(meta.get("plugin_key") or meta.get("page_title") or meta.get("source_file") or "")
+                if key:
+                    existing_keys.add(key)
+            if count > 0:
+                return count
+
+            project_dir = Path(str(getattr(self, "project_dir", "") or ""))
+            resolved = self._maker_preview_resolved_project_paths()
+            game_root = Path(resolved.get("game_root") or (project_dir / "maker_game"))
+            data_dir = self._maker_project_data_dir_for_database_pages()
+            engine_info = resolved.get("engine") if isinstance(resolved.get("engine"), dict) else None
+            if not game_root.is_dir() or data_dir is None:
+                return 0
+            try:
+                plugin_pages = extract_plugin_text_units(game_root, Path(data_dir), engine_info)
+            except Exception as e:
+                try:
+                    self.log(self.tr_ui("⚠️ 플러그인 텍스트 추출 실패: {error}", error=f"{type(e).__name__}: {e}"))
+                except Exception:
+                    pass
+                return 0
+            try:
+                preview_settings = load_maker_preview_settings(project_dir)
+            except Exception:
+                preview_settings = {}
+            images_dir = project_dir / "images"
+            images_dir.mkdir(parents=True, exist_ok=True)
+            added = 0
+            for pos, (plugin_key, units) in enumerate((plugin_pages or {}).items(), start=1):
+                if not units or str(plugin_key) in existing_keys:
+                    continue
+                first = units[0]
+                plugin_name = str(getattr(first, "plugin_name", "") or getattr(first, "db_kind", "") or plugin_key).strip()
+                if str(plugin_key).startswith("plugin:"):
+                    title = f"Plugin - {plugin_name}"
+                elif str(plugin_key).startswith("event:"):
+                    title = f"Plugin Events - {Path(str(getattr(first, 'source_file', '') or plugin_key)).stem}"
+                elif str(plugin_key).startswith("note:"):
+                    title = f"Plugin Notes - {Path(str(getattr(first, 'source_file', '') or plugin_key)).stem}"
+                else:
+                    title = f"Plugin - {plugin_name or plugin_key}"
+                safe = re.sub(r"[^0-9A-Za-z가-힣ぁ-んァ-ン一-龥._-]+", "_", title).strip("_.") or f"Plugin{pos:03d}"
+                image_path = images_dir / f"{safe}.png"
+                try:
+                    _virtual_page_placeholder_image(
+                        image_path, title=title,
+                        subtitle=str(getattr(first, "source_file", "") or "plugin data"),
+                        text_count=len(units), engine_label="RPG Maker",
+                        preview_settings=preview_settings,
+                    )
+                except Exception:
+                    pass
+                text_items = [_ysb_text_item_from_unit(unit, i, preview_settings=preview_settings) for i, unit in enumerate(units)]
+                new_idx = len(paths)
+                paths.append(str(image_path))
+                data[new_idx] = {
+                    "ori": None, "data": text_items, "original_name": image_path.name,
+                    "maker_preview_settings": dict(preview_settings or {}),
+                    "maker_runtime_profile": {},
+                    "maker_page": {
+                        "page_type": "plugin", "page_title": title,
+                        "source_file": str(getattr(first, "source_file", "") or ""),
+                        "plugin_key": str(plugin_key), "plugin_name": plugin_name,
+                        "map_id": 0, "map_name": title,
+                        "map_file": str(getattr(first, "source_file", "") or ""),
+                        "width": 20, "height": 11, "event_count": 0,
+                        "text_unit_count": len(text_items), "events": [],
+                    },
+                }
+                existing_keys.add(str(plugin_key))
+                added += 1
+            if added:
+                self.paths = paths
+                self.data = data
+                try:
+                    self.mark_project_structure_dirty("maker_plugin_pages_created")
+                except Exception:
+                    pass
+                if save_project:
+                    try:
+                        self.save_workspace_project_json_light(reason="maker_plugin_pages_created")
+                    except Exception:
+                        pass
+                try:
+                    self.log(self.tr_ui("🧩 플러그인 번역 레이어 생성: {count}개 ({reason})", count=added, reason=reason))
+                except Exception:
+                    pass
+            return count + added
+        except Exception as e:
+            try:
+                self.log(self.tr_ui("⚠️ 플러그인 번역 레이어 확인 실패: {error}", error=f"{type(e).__name__}: {e}"))
+            except Exception:
+                pass
+            return 0
+
+    def ensure_maker_speaker_pages(self, *, save_project=True, reason="speaker mode"):
+        """실제 대사 화자만 모은 독립 화자 번역 레이어를 생성/갱신한다."""
+        try:
+            from ysb.tools.maker_project import strip_maker_control_codes
+        except Exception:
+            def strip_maker_control_codes(value):
+                return str(value or "")
+        try:
+            paths = list(getattr(self, "paths", []) or [])
+            data = getattr(self, "data", {}) or {}
+            if not isinstance(data, dict):
+                data = {}
+            existing_idx = None
+            old_translations = {}
+            for i in range(len(paths)):
+                page = self._page_data_for_index_safe(i)
+                if not self._maker_page_is_speaker_page(page):
+                    continue
+                existing_idx = int(i)
+                for row in (page.get("data") or []):
+                    if not isinstance(row, dict):
+                        continue
+                    unit = row.get("maker_text_unit") if isinstance(row.get("maker_text_unit"), dict) else {}
+                    original = str(unit.get("speaker_original") or row.get("text") or "").strip()
+                    if original:
+                        old_translations[original] = str(row.get("translated_text") or "").strip()
+                break
+
+            entries = {}
+            for page_idx, page in list(data.items()):
+                try:
+                    actual_idx = int(page_idx)
+                except Exception:
+                    continue
+                if not isinstance(page, dict) or self._maker_page_is_database_page(page) or self._maker_page_is_plugin_page(page) or self._maker_page_is_speaker_page(page):
+                    continue
+                page_meta = page.get("maker_page") if isinstance(page.get("maker_page"), dict) else {}
+                page_type = str(page_meta.get("page_type") or "map").strip().lower()
+                source_file = str(page_meta.get("source_file") or page_meta.get("map_file") or "").strip()
+                if page_type not in ("", "map", "common_events") or source_file in ("System.json", "Troops.json") or source_file.startswith("DB_"):
+                    continue
+                for data_index, row in enumerate(page.get("data") or []):
+                    if not isinstance(row, dict):
+                        continue
+                    unit = row.get("maker_text_unit") if isinstance(row.get("maker_text_unit"), dict) else {}
+                    legacy = row.get("maker_meta") if isinstance(row.get("maker_meta"), dict) else {}
+                    plain_current = str(
+                        row.get("maker_speaker_plain")
+                        or unit.get("speaker_plain")
+                        or strip_maker_control_codes(row.get("maker_speaker") or "")
+                        or strip_maker_control_codes(legacy.get("speaker") or "")
+                        or strip_maker_control_codes(row.get("speaker") or "")
+                        or ""
+                    ).strip()
+                    if not plain_current or plain_current.lower() == "unknown":
+                        continue
+                    original = str(
+                        row.get("maker_speaker_original")
+                        or unit.get("speaker_original")
+                        or unit.get("speaker_plain")
+                        or legacy.get("speaker_original")
+                        or plain_current
+                    ).strip()
+                    if not original or original.lower() == "unknown":
+                        continue
+                    raw_visible = str(unit.get("speaker_raw_visible") or "").strip()
+                    info = entries.setdefault(original, {"current": plain_current, "count": 0, "raw_samples": set(), "refs": []})
+                    # Speaker translation is a fully independent layer.  It reads
+                    # the current speaker name from dialogue rows only and never
+                    # treats Actors DB translation as its master value.
+                    info["current"] = plain_current
+                    info["count"] = int(info.get("count") or 0) + 1
+                    info["refs"].append({"page_idx": actual_idx, "data_index": int(data_index), "row_id": row.get("id")})
+                    if raw_visible:
+                        info["raw_samples"].add(raw_visible)
+            if not entries:
+                return 0
+
+            rows = []
+            for n, original in enumerate(sorted(entries.keys(), key=lambda x: x.casefold()), start=1):
+                info = entries[original]
+                current = str(info.get("current") or original).strip() or original
+                translated = str(old_translations.get(original) or "").strip()
+                if not translated and current != original:
+                    translated = current
+                raw_samples = sorted(info.get("raw_samples") or [], key=lambda x: (len(x), x))
+                rows.append({
+                    "id": n,
+                    "text": original,
+                    "source_text": original,
+                    "translated_text": translated,
+                    "maker_status": self.tr_ui("번역완료") if translated else self.tr_ui("미번역"),
+                    "maker_speaker": "",
+                    "maker_speaker_plain": "",
+                    "maker_memo": self.tr_ui("사용 {count}회", count=int(info.get("count") or 0)),
+                    "maker_text_unit": {
+                        "source_kind": "speaker",
+                        "source_file": "",
+                        "db_kind": "Speaker",
+                        "db_field": "name",
+                        "text_type": "speaker_name",
+                        "speaker_original": original,
+                        "speaker_usage_count": int(info.get("count") or 0),
+                        "speaker_actor_master": False,
+                        "speaker_raw_samples": raw_samples[:10],
+                        "speaker_refs": list(info.get("refs") or []),
+                    },
+                })
+            page = {
+                "ori": None,
+                "data": rows,
+                "original_name": "Speaker_Translation.png",
+                "maker_page": {
+                    "page_type": "speaker",
+                    "page_title": "Speaker Translation",
+                    "source_file": "",
+                    "map_id": 0,
+                    "map_name": "Speaker Translation",
+                    "map_file": "",
+                    "width": 20,
+                    "height": 11,
+                    "event_count": 0,
+                    "text_unit_count": len(rows),
+                    "events": [],
+                },
+            }
+            if existing_idx is None:
+                project_dir = Path(str(getattr(self, "project_dir", "") or ""))
+                images_dir = project_dir / "images"
+                images_dir.mkdir(parents=True, exist_ok=True)
+                image_path = images_dir / "Speaker_Translation.png"
+                try:
+                    _virtual_page_placeholder_image(image_path, title="Speaker Translation", subtitle="Speaker names", text_count=len(rows), engine_label="RPG Maker")
+                except Exception:
+                    pass
+                existing_idx = len(paths)
+                paths.append(str(image_path))
+            data[int(existing_idx)] = page
+            self.paths = paths
+            self.data = data
+            self.maker_speaker_idx = int(existing_idx)
+            try:
+                self.mark_project_structure_dirty("maker_speaker_layer_created")
+            except Exception:
+                pass
+            if save_project:
+                try:
+                    self.save_workspace_project_json_light(reason="maker_speaker_layer_created")
+                except Exception:
+                    pass
+            try:
+                self.log(self.tr_ui("👤 화자 번역 레이어 생성: {count}개 ({reason})", count=len(rows), reason=reason))
+            except Exception:
+                pass
+            return 1
+        except Exception as e:
+            try:
+                self.log(self.tr_ui("⚠️ 화자 번역 레이어 확인 실패: {error}", error=f"{type(e).__name__}: {e}"))
+            except Exception:
+                pass
+            return 0
+
+    def apply_maker_speaker_layer_to_dialogues(self, page_idx=None, *, reason="speaker layer apply"):
+        """화자 레이어 번역값을 연결된 실제 대사 행에만 반영한다."""
+        try:
+            idx = int(self.maker_speaker_idx if page_idx is None else page_idx)
+        except Exception:
+            return 0
+        page = self._page_data_for_index_safe(idx)
+        if not self._maker_page_is_speaker_page(page):
+            return 0
+        changed = 0
+        touched_pages = set()
+        for speaker_row in (page.get("data") or []):
+            if not isinstance(speaker_row, dict):
+                continue
+            unit = speaker_row.get("maker_text_unit") if isinstance(speaker_row.get("maker_text_unit"), dict) else {}
+            original = str(unit.get("speaker_original") or speaker_row.get("text") or "").strip()
+            if not original:
+                continue
+            new_name = str(speaker_row.get("translated_text") or "").strip() or original
+            for ref in (unit.get("speaker_refs") or []):
+                if not isinstance(ref, dict):
+                    continue
+                try:
+                    target_page_idx = int(ref.get("page_idx"))
+                    data_index = int(ref.get("data_index"))
+                except Exception:
+                    continue
+                target_page = self._page_data_for_index_safe(target_page_idx)
+                rows = target_page.get("data") or [] if isinstance(target_page, dict) else []
+                if data_index < 0 or data_index >= len(rows) or not isinstance(rows[data_index], dict):
+                    continue
+                row = rows[data_index]
+                row_unit = row.get("maker_text_unit") if isinstance(row.get("maker_text_unit"), dict) else {}
+                legacy = row.get("maker_meta") if isinstance(row.get("maker_meta"), dict) else {}
+                before = str(row.get("maker_speaker_plain") or row.get("maker_speaker") or "")
+                if row.get("maker_speaker_original") is None:
+                    row["maker_speaker_original"] = original
+                row["maker_speaker"] = new_name
+                row["maker_speaker_plain"] = new_name
+                row["maker_speaker_source"] = "speaker_translation"
+                row["maker_speaker_confidence"] = 1.0
+                if isinstance(row_unit, dict):
+                    row_unit.setdefault("speaker_original", original)
+                    row_unit["speaker"] = new_name
+                    row_unit["speaker_plain"] = new_name
+                    row_unit["speaker_source"] = "speaker_translation"
+                    row_unit["speaker_confidence"] = 1.0
+                    row["maker_text_unit"] = row_unit
+                if isinstance(legacy, dict):
+                    legacy.setdefault("speaker_original", original)
+                    legacy["speaker"] = new_name
+                    legacy["speaker_source"] = "speaker_translation"
+                    legacy["speaker_confidence"] = 1.0
+                    row["maker_meta"] = legacy
+                if before != new_name:
+                    changed += 1
+                    touched_pages.add(target_page_idx)
+        if touched_pages:
+            try:
+                self.mark_maker_writeback_dirty(page_indices=sorted(touched_pages), reason="maker_speaker_translation")
+            except Exception:
+                pass
+            try:
+                self.has_unsaved_changes = True
+                self.mark_project_structure_dirty("maker_speaker_translation")
+            except Exception:
+                pass
+            try:
+                self.save_project_store(getattr(self, "project_store", None), force_full=True)
+            except Exception:
+                try:
+                    self.schedule_deferred_auto_save_project(300)
+                except Exception:
+                    pass
+        try:
+            if hasattr(self, "refresh_maker_database_auto_glossary_after_name_change"):
+                self.refresh_maker_database_auto_glossary_after_name_change(
+                    show_log=False, reason=str(reason or "speaker layer apply")
+                )
+        except Exception:
+            pass
+        try:
+            self.log(self.tr_ui("👤 화자 번역 적용: {count}개 대사 갱신", count=changed))
+        except Exception:
+            pass
+        return changed
+
+    def enter_maker_speaker_mode(self):
+        count = self.ensure_maker_speaker_pages(save_project=True, reason="enter speaker mode")
+        if count <= 0:
+            try:
+                self.show_warn_notice("화자 번역 모드", "화자 데이터가 없습니다.")
+            except Exception:
+                QMessageBox.information(self, self.tr_ui("화자 번역 모드"), self.tr_ui("화자 데이터가 없습니다."))
+            return False
+        previous_mode = self.maker_translation_layer_mode()
+        if previous_mode == "speaker":
+            return True
+        if previous_mode == "database":
+            self._maker_database_layer_last_idx = int(getattr(self, "maker_database_idx", 0) or 0)
+        elif previous_mode == "plugin":
+            self.maker_plugin_idx = int(getattr(self, "maker_database_idx", 0) or 0)
+        else:
+            self._maker_normal_mode_last_page_idx = int(getattr(self, "idx", 0) or 0)
+        try:
+            if previous_mode in {"database", "plugin", "speaker"} and not bool(getattr(self, "_maker_database_batch_translate_active", False)):
+                self.commit_current_database_ui_to_layer()
+        except Exception:
+            pass
+        self.maker_translation_layer = "speaker"
+        self.maker_database_mode_enabled = True
+        pages = self.current_tab_page_indices()
+        current = int(getattr(self, "maker_speaker_idx", pages[0] if pages else 0) or (pages[0] if pages else 0))
+        if current not in pages and pages:
+            current = pages[0]
+        self.maker_speaker_idx = int(current)
+        self.maker_database_idx = int(current)
+        self.force_rebuild_page_tabs_for_current_layer(reason="enter speaker mode")
+        self.refresh_maker_database_view()
+        self.update_maker_database_mode_bar()
+        self.set_maker_database_preview_visible(True)
+        try:
+            self.log(self.tr_ui("👤 화자 번역 모드 진입"))
+        except Exception:
+            pass
+        return True
+
+    def toggle_maker_speaker_mode(self):
+        if self.maker_translation_layer_mode() == "speaker":
+            return self.exit_maker_database_mode()
+        return self.enter_maker_speaker_mode()
+
+    def enter_maker_plugin_mode(self):
+        count = self.ensure_maker_plugin_pages(save_project=True, reason="enter plugin mode")
+        if count <= 0:
+            try:
+                self.show_warn_notice("플러그인 번역 모드", "번역 가능한 플러그인 문구를 찾지 못했습니다.")
+            except Exception:
+                QMessageBox.information(self, self.tr_ui("플러그인 번역 모드"), self.tr_ui("번역 가능한 플러그인 문구를 찾지 못했습니다."))
+            return False
+        previous_mode = self.maker_translation_layer_mode()
+        if previous_mode == "database":
+            self._maker_database_layer_last_idx = int(getattr(self, "maker_database_idx", 0) or 0)
+        elif previous_mode == "speaker":
+            self.maker_speaker_idx = int(getattr(self, "maker_database_idx", 0) or 0)
+        elif previous_mode == "plugin":
+            return True
+        else:
+            self._maker_normal_mode_last_page_idx = int(getattr(self, "idx", 0) or 0)
+        try:
+            if previous_mode in {"database", "plugin", "speaker"} and not bool(getattr(self, "_maker_database_batch_translate_active", False)):
+                self.commit_current_database_ui_to_layer()
+        except Exception:
+            pass
+        self.maker_translation_layer = "plugin"
+        self.maker_database_mode_enabled = True
+        pages = self.current_tab_page_indices()
+        current = int(getattr(self, "maker_plugin_idx", pages[0] if pages else 0) or (pages[0] if pages else 0))
+        if current not in pages and pages:
+            current = pages[0]
+        self.maker_plugin_idx = int(current)
+        self.maker_database_idx = int(current)  # shared special-layer table cursor
+        self.force_rebuild_page_tabs_for_current_layer(reason="enter plugin mode")
+        self.refresh_maker_database_view()
+        self.update_maker_database_mode_bar()
+        self.set_maker_database_preview_visible(True)
+        try:
+            self.log(self.tr_ui("🧩 플러그인 번역 모드 진입"))
+        except Exception:
+            pass
+        return True
+
     def enter_maker_database_mode(self):
         count = self.ensure_maker_database_pages(save_project=False, reason="enter database mode")
         self.audit_maker_database_mode_event(
             "DB_MODE_TOGGLE_REQUEST",
             target="enter",
-            current_enabled=bool(getattr(self, "maker_database_mode_enabled", False)),
+            current_enabled=bool(self.is_maker_special_table_mode()),
             existing_pages=count,
         )
         if count <= 0:
@@ -12826,15 +18534,28 @@ class MainWindowProjectPagesMixin:
                 QMessageBox.information(self, self.tr_ui("데이터베이스 모드"), self.tr_ui("데이터베이스 번역 탭이 없습니다. 먼저 게임을 가져와 주세요."))
             self.update_maker_database_mode_bar()
             return False
-        if not self.is_maker_database_mode():
+        previous_mode = self.maker_translation_layer_mode()
+        if previous_mode == "plugin":
+            self.maker_plugin_idx = int(getattr(self, "maker_database_idx", 0) or 0)
+        elif previous_mode == "speaker":
+            self.maker_speaker_idx = int(getattr(self, "maker_database_idx", 0) or 0)
+        elif previous_mode == "database":
+            return True
+        else:
             try:
                 self._maker_normal_mode_last_page_idx = int(getattr(self, "idx", 0) or 0)
             except Exception:
                 self._maker_normal_mode_last_page_idx = 0
+        try:
+            if previous_mode in {"database", "plugin", "speaker"} and not bool(getattr(self, "_maker_database_batch_translate_active", False)):
+                self.commit_current_database_ui_to_layer()
+        except Exception:
+            pass
+        self.maker_translation_layer = "database"
         self.maker_database_mode_enabled = True
         pages = self.current_tab_page_indices()
         try:
-            current = int(getattr(self, "maker_database_idx", pages[0] if pages else 0) or (pages[0] if pages else 0))
+            current = int(getattr(self, "_maker_database_layer_last_idx", getattr(self, "maker_database_idx", pages[0] if pages else 0)) or (pages[0] if pages else 0))
         except Exception:
             current = pages[0] if pages else 0
         if current not in pages and pages:
@@ -12846,26 +18567,14 @@ class MainWindowProjectPagesMixin:
             ok = bool(self.refresh_maker_database_view())
         except Exception as e:
             self.audit_maker_database_mode_event("DB_MODE_VIEW_REFRESH_FAIL", error=f"{type(e).__name__}: {e}")
-            ok = False
-        try:
-            self.update_maker_database_mode_bar()
-        except Exception:
-            pass
-        try:
-            self.set_maker_database_preview_visible(True)
-        except Exception:
-            pass
+        self.update_maker_database_mode_bar()
+        self.set_maker_database_preview_visible(True)
         self.audit_maker_database_mode_event("DB_MODE_ENTER_DONE", rebuilt=rebuilt, view_refreshed=ok, current_page=self.maker_database_idx)
         return True
 
     def exit_maker_database_mode(self):
-        self.audit_maker_database_mode_event(
-            "DB_MODE_TOGGLE_REQUEST",
-            target="exit",
-            current_enabled=bool(getattr(self, "maker_database_mode_enabled", False)),
-            existing_pages=self.ensure_maker_database_pages(save_project=False, reason="exit database mode"),
-        )
-        if not self.is_maker_database_mode():
+        current_mode = self.maker_translation_layer_mode()
+        if current_mode not in {"database", "plugin", "speaker"}:
             self.update_maker_database_mode_bar()
             return False
         try:
@@ -12873,7 +18582,14 @@ class MainWindowProjectPagesMixin:
                 self.commit_current_database_ui_to_layer()
         except Exception:
             pass
+        if current_mode == "plugin":
+            self.maker_plugin_idx = int(getattr(self, "maker_database_idx", 0) or 0)
+        elif current_mode == "speaker":
+            self.maker_speaker_idx = int(getattr(self, "maker_database_idx", 0) or 0)
+        else:
+            self._maker_database_layer_last_idx = int(getattr(self, "maker_database_idx", 0) or 0)
         self.maker_database_mode_enabled = False
+        self.maker_translation_layer = "normal"
         try:
             self.set_maker_database_preview_visible(False)
         except Exception:
@@ -12887,20 +18603,26 @@ class MainWindowProjectPagesMixin:
             restore = normal_pages[0]
         if normal_pages:
             self.idx = int(restore)
-        rebuilt = self.force_rebuild_page_tabs_for_current_layer(reason="exit database mode")
+        rebuilt = self.force_rebuild_page_tabs_for_current_layer(reason=f"exit {current_mode} mode")
         try:
             self.load()
         except Exception as e:
             self.audit_maker_database_mode_event("DB_MODE_EXIT_LOAD_FAIL", error=f"{type(e).__name__}: {e}")
         try:
-            self.log("↩️ 데이터베이스 모드 나가기")
+            if current_mode == "plugin":
+                msg = self.tr_ui("↩️ 플러그인 번역 모드 나가기")
+            elif current_mode == "speaker":
+                msg = self.tr_ui("↩️ 화자 번역 모드 나가기")
+            else:
+                msg = self.tr_ui("↩️ 데이터베이스 모드 나가기")
+            self.log(msg)
         except Exception:
             pass
-        self.audit_maker_database_mode_event("DB_MODE_EXIT_DONE", rebuilt=rebuilt, restored=self.idx)
+        self.audit_maker_database_mode_event("DB_MODE_EXIT_DONE", rebuilt=rebuilt, restored=self.idx, mode=current_mode)
         return True
 
     def toggle_maker_database_mode(self):
-        if self.is_maker_database_mode():
+        if self.maker_translation_layer_mode() == "database":
             return self.exit_maker_database_mode()
         return self.enter_maker_database_mode()
 
@@ -12933,9 +18655,24 @@ class MainWindowProjectPagesMixin:
                     pass
                 return
 
-            db_mode = self.is_maker_database_mode() if hasattr(self, "is_maker_database_mode") else False
+            db_mode = self.is_maker_special_table_mode() if hasattr(self, "is_maker_special_table_mode") else False
+            plugin_mode = bool(self.is_maker_plugin_mode()) if hasattr(self, "is_maker_plugin_mode") else False
             bar.setTabsClosable(False if db_mode else True)
             bar.setMovable(False if db_mode else True)
+
+            def _special_tab_tooltip(page_i, tab_i, desired_count):
+                page = self._page_data_for_index_safe(page_i) if hasattr(self, "_page_data_for_index_safe") else {}
+                meta = ((page or {}).get("maker_page") or {}) if isinstance(page, dict) else {}
+                source_file = str(meta.get("source_file") or meta.get("map_file") or "").strip()
+                plugin_name = str(meta.get("plugin_name") or "").strip()
+                if plugin_mode:
+                    detail = plugin_name
+                    if source_file:
+                        detail = f"{detail}\n{source_file}" if detail and detail != source_file else source_file
+                    return f"{self.tr_ui('플러그인 탭')} {tab_i + 1} / {desired_count}" + (f"\n{detail}" if detail else "")
+                if hasattr(self, "is_maker_speaker_mode") and self.is_maker_speaker_mode():
+                    return f"{self.tr_ui('화자 탭')} {tab_i + 1} / {desired_count}"
+                return f"{self.tr_ui('데이터베이스 탭')} {tab_i + 1} / {desired_count}" + (f"\n{source_file}" if source_file else "")
 
             desired_count = len(visible_pages)
             need_rebuild = (bar.count() != desired_count)
@@ -12947,10 +18684,7 @@ class MainWindowProjectPagesMixin:
                     bar.addTab(label)
                     try:
                         if db_mode:
-                            tabs = self._ensure_maker_database_layer_storage()
-                            info = tabs[page_i] if 0 <= int(page_i) < len(tabs) else {}
-                            original = str(info.get("source_file") or info.get("path") or info.get("label") or "") if isinstance(info, dict) else ""
-                            tooltip = f"{self.tr_ui('데이터베이스 탭')} {tab_i + 1} / {desired_count}\n{original}"
+                            tooltip = _special_tab_tooltip(page_i, tab_i, desired_count)
                         else:
                             original = self.page_original_name(page_i)
                             tooltip = f"{self.tr_ui('맵')} {tab_i + 1} / {desired_count}\n{original}"
@@ -12963,10 +18697,7 @@ class MainWindowProjectPagesMixin:
                         label = self._database_tab_label_for_page(page_i) if db_mode else self.page_display_name(page_i)
                         try:
                             if db_mode:
-                                tabs = self._ensure_maker_database_layer_storage()
-                                info = tabs[page_i] if 0 <= int(page_i) < len(tabs) else {}
-                                original = str(info.get("source_file") or info.get("path") or info.get("label") or "") if isinstance(info, dict) else ""
-                                tooltip = f"{self.tr_ui('데이터베이스 탭')} {tab_i + 1} / {desired_count}\n{original}"
+                                tooltip = _special_tab_tooltip(page_i, tab_i, desired_count)
                             else:
                                 original = self.page_original_name(page_i)
                                 tooltip = f"{self.tr_ui('맵')} {tab_i + 1} / {desired_count}\n{original}"
@@ -13035,7 +18766,7 @@ class MainWindowProjectPagesMixin:
                 return False
             if bar.count() != len(visible_pages):
                 return False
-            if hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode():
+            if hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode():
                 idx = self.current_tab_display_index_for_page(getattr(self, "maker_database_idx", 0)) if hasattr(self, "current_tab_display_index_for_page") else max(0, min(int(getattr(self, "maker_database_idx", 0) or 0), len(visible_pages) - 1))
             else:
                 idx = self.current_tab_display_index_for_page(getattr(self, "idx", 0)) if hasattr(self, "current_tab_display_index_for_page") else max(0, min(int(getattr(self, "idx", 0) or 0), len(self.paths) - 1))
@@ -13093,7 +18824,7 @@ class MainWindowProjectPagesMixin:
         if index < 0 or index >= len(visible_pages):
             return
         actual_index = int(visible_pages[int(index)])
-        if hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode():
+        if hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode():
             if actual_index == int(getattr(self, "maker_database_idx", 0) or 0):
                 return
             try:
@@ -13233,7 +18964,21 @@ class MainWindowProjectPagesMixin:
         self.confirm_and_delete_pages([index], title="맵 삭제")
 
 
-    def delete_pages_at(self, indices, reason="맵 삭제"):
+    def delete_pages_at(self, *args, **kwargs):
+        _perf_t0 = perf_counter()
+        _perf_action_id = next_action_id("delete_pages_at")
+        _perf_ok = False
+        try:
+            _res = self._perf_impl_delete_pages_at(*args, **kwargs)
+            _perf_ok = True
+            return _res
+        finally:
+            try:
+                perf_log_elapsed(self, "PERF_USER_ACTION", _perf_t0, action="delete_pages_at", action_id=_perf_action_id, ok=bool(_perf_ok), args_count=len(args), kwargs=','.join(sorted([str(k) for k in kwargs.keys()])))
+            except Exception:
+                pass
+
+    def _perf_impl_delete_pages_at(self, indices, reason="맵 삭제"):
         clean = []
         seen = set()
         for raw in indices or []:
@@ -13287,7 +19032,21 @@ class MainWindowProjectPagesMixin:
             self.log(f"🗑️ {reason}: {len(clean)}개")
         return True
 
-    def delete_page_at(self, index):
+    def delete_page_at(self, *args, **kwargs):
+        _perf_t0 = perf_counter()
+        _perf_action_id = next_action_id("delete_page_at")
+        _perf_ok = False
+        try:
+            _res = self._perf_impl_delete_page_at(*args, **kwargs)
+            _perf_ok = True
+            return _res
+        finally:
+            try:
+                perf_log_elapsed(self, "PERF_USER_ACTION", _perf_t0, action="delete_page_at", action_id=_perf_action_id, ok=bool(_perf_ok), args_count=len(args), kwargs=','.join(sorted([str(k) for k in kwargs.keys()])))
+            except Exception:
+                pass
+
+    def _perf_impl_delete_page_at(self, index):
         return self.delete_pages_at([index], reason="맵 삭제")
 
 
@@ -13768,7 +19527,7 @@ class MainWindowProjectPagesMixin:
             pass
 
     def mark_current_page_for_recovery_checkpoint(self, kind="checkpoint_text"):
-        """YSBG 내보내기용 dirty와 workspace checkpoint용 dirty를 분리한다.
+        """프로젝트 저장용 dirty와 workspace checkpoint용 dirty를 분리한다.
 
         project_engine/page_engine dirty는 명시 저장 전까지 유지되어야 하고,
         checkpoint dirty는 journal 저장이 끝나면 바로 비워져야 한다.
@@ -13894,6 +19653,87 @@ class MainWindowProjectPagesMixin:
             image_path = paths[page_idx]
             st = dict(curr.get("maker_preview_settings") or {})
             st["defer_tile_render"] = False
+
+            # Large maps can be split into several editor-only pages
+            # (Map001-1, Map001-2, ...).  They all represent the same physical
+            # MapXXX.json, so tile composition must happen once for the canonical
+            # first split and the later split pages should reuse/copy that image.
+            try:
+                split_total = int(meta.get("editor_split_total") or 1)
+                split_index = int(meta.get("editor_split_index") or 1)
+            except Exception:
+                split_total, split_index = 1, 1
+            try:
+                map_file_key = str(meta.get("map_file") or "")
+            except Exception:
+                map_file_key = ""
+            if split_total > 1 and split_index > 1 and map_file_key:
+                try:
+                    from pathlib import Path as _Path
+                    import shutil as _shutil
+                    from ysb.tools.maker_project import regenerate_maker_placeholder_for_page
+                    first_idx = None
+                    data_all = getattr(self, "data", {}) or {}
+                    for pi in range(len(paths)):
+                        cand = data_all.get(pi) if isinstance(data_all, dict) else None
+                        if not isinstance(cand, dict):
+                            continue
+                        cmeta = cand.get("maker_page") if isinstance(cand.get("maker_page"), dict) else {}
+                        if not isinstance(cmeta, dict):
+                            continue
+                        if str(cmeta.get("page_type") or "map") not in {"", "map"}:
+                            continue
+                        if str(cmeta.get("map_file") or "") != map_file_key:
+                            continue
+                        try:
+                            if int(cmeta.get("editor_split_index") or 1) == 1:
+                                first_idx = pi
+                                break
+                        except Exception:
+                            if first_idx is None:
+                                first_idx = pi
+                    if first_idx is not None and 0 <= first_idx < len(paths):
+                        first_page = data_all.get(first_idx) if isinstance(data_all, dict) else None
+                        first_meta = first_page.get("maker_page") if isinstance(first_page, dict) and isinstance(first_page.get("maker_page"), dict) else {}
+                        first_path = paths[first_idx]
+                        first_ok = False
+                        if isinstance(first_page, dict):
+                            if bool(first_meta.get("preview_render_deferred", False)):
+                                first_st = dict(first_page.get("maker_preview_settings") or {})
+                                first_st["defer_tile_render"] = False
+                                first_ok = bool(regenerate_maker_placeholder_for_page(first_path, first_page, settings=first_st))
+                                if first_ok:
+                                    first_meta["preview_render_deferred"] = False
+                                    first_meta["preview_rendered_on_demand"] = True
+                                    first_meta["preview_canonical_for_split"] = True
+                                    try:
+                                        first_page["ori"] = None
+                                    except Exception:
+                                        pass
+                            else:
+                                first_ok = bool(_Path(str(first_path)).is_file())
+                        if first_ok and _Path(str(first_path)).is_file():
+                            if str(first_path) != str(image_path):
+                                _shutil.copy2(str(first_path), str(image_path))
+                            meta["preview_render_deferred"] = False
+                            meta["preview_rendered_on_demand"] = True
+                            meta["preview_reused_from_split_page"] = int(first_idx)
+                            meta["preview_reused_map_file"] = map_file_key
+                            try:
+                                curr["ori"] = None
+                            except Exception:
+                                pass
+                            try:
+                                self.log(f"🗺️ MAKER_LAZY_MAP_REUSE | page={page_idx+1} | map={map_file_key} | from={first_idx+1}")
+                            except Exception:
+                                pass
+                            return True
+                except Exception as _reuse_e:
+                    try:
+                        self.log(f"⚠️ MAKER_LAZY_MAP_REUSE_FAIL | page={page_idx+1} | {type(_reuse_e).__name__}: {_reuse_e}")
+                    except Exception:
+                        pass
+
             try:
                 from ysb.tools.maker_project import regenerate_maker_placeholder_for_page
                 ok = regenerate_maker_placeholder_for_page(image_path, curr, settings=st)
@@ -14018,6 +19858,9 @@ class MainWindowProjectPagesMixin:
         self._progressive_page_load_queue = []
 
     def schedule_progressive_page_load(self, priority_index=None):
+        if hasattr(self, "is_maker_preview_enabled") and not self.is_maker_preview_enabled():
+            self.stop_progressive_page_loader()
+            return False
         self._ensure_progressive_page_loader()
         total = len(getattr(self, 'paths', []) or [])
         if total <= 1:
@@ -14047,6 +19890,9 @@ class MainWindowProjectPagesMixin:
             pass
 
     def _progressive_page_load_tick(self):
+        if hasattr(self, "is_maker_preview_enabled") and not self.is_maker_preview_enabled():
+            self.stop_progressive_page_loader()
+            return
         if getattr(self, '_app_is_closing', False) or getattr(self, 'is_loading_project', False):
             return
         try:
@@ -14634,7 +20480,7 @@ class MainWindowProjectPagesMixin:
         dst = self.workspace_project_dir(name)
         old_dir = self.project_dir
         try:
-            # 현재 temp 프로젝트 내보내기 후, 새 폴더를 만들지 않고 temp 폴더 자체를 정식 작업 폴더로 승격한다.
+            # 현재 temp 프로젝트 저장 후, 새 폴더를 만들지 않고 temp 폴더 자체를 정식 작업 폴더로 승격한다.
             self.save_project_store(self.project_store)
             if os.path.abspath(old_dir) != os.path.abspath(dst):
                 shutil.move(old_dir, dst)
@@ -14937,7 +20783,7 @@ class MainWindowProjectPagesMixin:
         msg = (
             f"{self.tr_ui('마지막 작업 폴더를 복구할까요?')}\n\n"
             f"{project_dir}\n\n"
-            f"{self.tr_ui('복구한 작업은 아직 정식 YSBG 파일이 아닐 수 있습니다. 필요한 경우 [프로젝트 내보내기]으로 다시 저장해 주세요.')}"
+            f"{self.tr_ui('복구한 작업은 작업 폴더 기준으로 복원됩니다. 필요한 경우 [프로젝트 저장]으로 다시 저장해 주세요.')}"
         )
         ans = QMessageBox.question(
             self,
@@ -14995,7 +20841,7 @@ class MainWindowProjectPagesMixin:
 
             _recover_progress(8, 100, "복구 프로젝트 파일을 읽는 중...")
             # 복구는 별도 캐시를 여는 것이 아니라, 남아 있는 workspace 작업대를 직접 여는 것이다.
-            # 상태표에 원본 .ysbg가 있으면 그대로 연결해 [프로젝트 내보내기]으로 확정할 수 있게 한다.
+            # 상태표에 원본 .ysbg가 있으면 내보내기용 연결 정보로만 보관한다.
             workspace_state = {}
             try:
                 workspace_state = read_workspace_state(project_dir)
@@ -16084,6 +21930,7 @@ class MainWindowProjectPagesMixin:
                     return
                 try:
                     self.maker_database_mode_enabled = False
+                    self.maker_translation_layer = "normal"
                     try:
                         self.set_maker_database_preview_visible(False)
                     except Exception:
@@ -16444,6 +22291,7 @@ class MainWindowProjectPagesMixin:
                 # 이전 프로젝트에서 DB 프리뷰 패널이 켜져 있었던 상태를 무조건 끊고
                 # 왼쪽을 일반 맵 프리뷰 위젯으로 돌린다.
                 self.maker_database_mode_enabled = False
+                self.maker_translation_layer = "normal"
                 try:
                     self.set_maker_database_preview_visible(False)
                 except Exception:
@@ -16468,6 +22316,15 @@ class MainWindowProjectPagesMixin:
             if package_path:
                 self.log(f"📦 연결된 YSBG 파일: {package_path}")
 
+            # 프로젝트가 바뀌면 이전 프로젝트의 자동 DB 단어장을 사용하면 안 된다.
+            # 현재 프로젝트 데이터가 메모리에 올라온 직후 다시 스캔해 번역 시작 전부터
+            # 올바른 자동 단어장이 Config에 연결되도록 한다.
+            try:
+                if hasattr(self, "refresh_maker_database_auto_glossary"):
+                    self.refresh_maker_database_auto_glossary(show_log=False)
+            except Exception:
+                pass
+
             # 쯔꾸르붕이: project.json을 열 때마다 작업 폴더 안의 maker_game을 다시 확인해
             # System.json/fonts/Window.png/MV·MZ 런타임 값을 maker_runtime_profile 캐시로 재구성한다.
             # .ysbg는 운반용 패키지이고 평소 작업 본체는 폴더/project.json이므로,
@@ -16483,13 +22340,58 @@ class MainWindowProjectPagesMixin:
                 except Exception:
                     pass
 
+            # 대사별 프리뷰 구조는 행을 클릭할 때 만들지 않는다. 프로젝트
+            # 불러오기 단계에서 디스크 캐시를 복원하고, 없거나 오래된 항목만
+            # 전체 재생성한 뒤 편집 화면을 연다.
+            try:
+                preview_row_total = self._maker_row_preview_project_row_count()
+            except Exception:
+                preview_row_total = 0
+            if preview_row_total > 0:
+                _emit_load_progress(43, 100, self.tr_ui("대사 프리뷰 캐시를 확인하는 중..."))
+
+                def _row_preview_load_progress(current=0, total=1, detail=""):
+                    try:
+                        total_i = max(1, int(total or 1))
+                        current_i = max(0, min(total_i, int(current or 0)))
+                        mapped = 43 + int((current_i / total_i) * 19)
+                        _emit_load_progress(
+                            max(43, min(62, mapped)),
+                            100,
+                            str(detail or self.tr_ui("대사별 프리뷰 구조를 준비하는 중입니다...")),
+                        )
+                    except Exception:
+                        _emit_load_progress(45, 100, self.tr_ui("대사별 프리뷰 구조를 준비하는 중입니다..."))
+
+                try:
+                    preview_prepare_result = self._maker_prepare_row_preview_blueprints_for_project_open(
+                        progress_callback=_row_preview_load_progress,
+                        reason="project_open",
+                    )
+                    if bool((preview_prepare_result or {}).get("loaded")):
+                        _emit_load_progress(62, 100, self.tr_ui("대사 프리뷰 캐시 불러오기 완료"))
+                    else:
+                        _emit_load_progress(62, 100, self.tr_ui("대사 프리뷰 초기 생성 완료"))
+                except Exception as e:
+                    try:
+                        self.audit_boundary_event(
+                            "MAKER_ROW_PREVIEW_PROJECT_OPEN_PREPARE_FAILED",
+                            error=f"{type(e).__name__}: {e}",
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        self.log(self.tr_ui("⚠️ 대사 프리뷰 준비 실패: {error}", error=f"{type(e).__name__}: {e}"))
+                    except Exception:
+                        pass
+
             # 새 프로젝트/복구 프로젝트는 원본 탭으로 시작한다.
             # 특히 복구 직후 mode 4(최종결과)를 바로 복원하면 대량 클린본/이미지 상태에서 첫 렌더가 매우 무거워질 수 있다.
             if temp_project or bool(getattr(self, "_loading_recovery_project", False)):
                 mode_to_load = 0
             else:
                 mode_to_load = int(ui_state.get("current_mode", 0) or 0)
-            _emit_load_progress(45, 100, "첫 페이지 화면을 구성하는 중...\n이미지가 많은 프로젝트는 이 단계에서 시간이 걸릴 수 있습니다.")
+            _emit_load_progress(64, 100, "첫 페이지 화면을 구성하는 중...\n이미지가 많은 프로젝트는 이 단계에서 시간이 걸릴 수 있습니다.")
             self.set_work_mode_without_undo(mode_to_load)
             self.show_editor()
             self.load()
@@ -16502,7 +22404,7 @@ class MainWindowProjectPagesMixin:
                 self.schedule_progressive_page_load(self.idx)
             except Exception:
                 pass
-            _emit_load_progress(75, 100, "첫 페이지 화면 구성 완료")
+            _emit_load_progress(80, 100, "첫 페이지 화면 구성 완료")
             self.record_current_project_recent()
             state = self.project_ui_view_states.get(self.view_state_key(self.idx, mode_to_load))
             if state:
@@ -16662,7 +22564,7 @@ class MainWindowProjectPagesMixin:
             pass
 
     def forget_recovery_project_dir(self, project_dir=None):
-        """내보내기 완료 등으로 복구 후보가 더 필요 없을 때 마지막 복구 기록만 지운다."""
+        """저장 완료 등으로 복구 후보가 더 필요 없을 때 마지막 복구 기록만 지운다."""
         try:
             target = os.path.abspath(str(project_dir or getattr(self, "work_project_dir", "") or ""))
             if not target:
@@ -17024,7 +22926,7 @@ class MainWindowProjectPagesMixin:
                     text_only_project_dirty = False
 
             if text_only_project_dirty:
-                # 이미 journal에 반영된 텍스트 dirty는 YSBG 내보내기용 dirty로만 남긴다.
+                # 이미 journal에 반영된 텍스트 dirty는 프로젝트 저장용 dirty로만 남긴다.
                 # checkpoint_dirty가 없는데 project_dirty 전체를 다시 journal로 쓰면 매번 [1,2,...]가 반복 저장된다.
                 try:
                     self.audit_boundary_event(
@@ -17065,16 +22967,9 @@ class MainWindowProjectPagesMixin:
                 except Exception:
                     pass
                 self.save_project_store(self.work_project_store, force_full=False)
-        # 쯔꾸르붕이에서는 작업 폴더가 본체이므로 텍스트 변경을 maker_game JSON에도
-        # 가능한 한 바로 반영한다. .ysbg는 이 작업 폴더를 내보내는 운반 상자일 뿐이다.
-        if dirty_pages:
-            try:
-                self.apply_maker_writeback_to_clone(mark_dirty=False, log_result=False, backup=False, page_indices=dirty_pages)
-            except Exception as e:
-                try:
-                    self.log(f"⚠️ 쯔꾸르 JSON 실시간 반영 실패: {e}")
-                except Exception:
-                    pass
+        # 쯔꾸르붕이에서는 편집 저장과 게임 JSON 반영을 분리한다.
+        # 작업 캐시는 복구용 프로젝트 데이터만 저장한다. 실제 작업용 게임 JSON 반영 대기 상태는
+        # 편집/번역이 발생한 순간 mark_maker_writeback_dirty()에서 별도로 관리한다.
         self.record_recovery_project_dir(self.work_project_dir)
         if dirty_pages:
             self.has_unsaved_changes = True
@@ -17115,6 +23010,10 @@ class MainWindowProjectPagesMixin:
         self.app_options[SHOW_PATHS_IN_LOG_KEY] = bool(getattr(self, "show_paths_in_log", False))
         self.app_options[SHOW_CACHE_PATHS_IN_SETTINGS_KEY] = bool(getattr(self, "show_cache_paths_in_settings", False))
         self.app_options["interface_tooltips_enabled"] = bool(getattr(self, "interface_tooltips_enabled", True))
+        self.app_options["maker_preview_enabled"] = bool(getattr(self, "maker_preview_enabled", True))
+        self.app_options["maker_control_code_auto_apply_enabled"] = bool(
+            getattr(self, "maker_control_code_auto_apply_enabled", True)
+        )
         self.app_options["use_light_file_dialog"] = bool(getattr(self, "use_light_file_dialog", True))
         self.app_options["temp_auto_cleanup_enabled"] = bool(self.app_options.get("temp_auto_cleanup_enabled", True))
         cleanup_days = int(self.app_options.get("temp_auto_cleanup_days", 7) or 7)
@@ -17139,8 +23038,37 @@ class MainWindowProjectPagesMixin:
         )
         self.sync_analysis_mask_options_to_config()
         self.app_options.setdefault(TRANSLATION_PROMPT_KEY, "")
+        prompt_presets, active_prompt_preset = normalize_prompt_options(
+            self.app_options.get(TRANSLATION_PROMPT_PRESETS_KEY, {}),
+            self.app_options.get(TRANSLATION_PROMPT_ACTIVE_PRESET_KEY, ""),
+            self.app_options.get(TRANSLATION_PROMPT_KEY, ""),
+        )
+        self.app_options[TRANSLATION_PROMPT_PRESETS_KEY] = prompt_presets
+        self.app_options[TRANSLATION_PROMPT_ACTIVE_PRESET_KEY] = active_prompt_preset
+        self.app_options[TRANSLATION_PROMPT_KEY] = str(
+            (prompt_presets.get(active_prompt_preset) or {}).get("common_prompt") or ""
+        )
         self.app_options.setdefault(TRANSLATION_GLOSSARY_TEXT_KEY, "")
         self.app_options.setdefault(TRANSLATION_GLOSSARY_PATH_KEY, "")
+        self.app_options.setdefault(TRANSLATION_AUTO_DB_GLOSSARY_ENTRIES_KEY, {})
+        self.app_options.setdefault(TRANSLATION_USER_GLOSSARY_ENTRIES_KEY, {})
+        self.app_options.setdefault(TRANSLATION_USER_GLOSSARY_NOTES_KEY, "")
+        legacy_glossary = str(self.app_options.get(TRANSLATION_GLOSSARY_TEXT_KEY, "") or "")
+        auto_glossary = normalize_glossary_entry_dict(self.app_options.get(TRANSLATION_AUTO_DB_GLOSSARY_ENTRIES_KEY, {}))
+        user_glossary = normalize_glossary_entry_dict(self.app_options.get(TRANSLATION_USER_GLOSSARY_ENTRIES_KEY, {}))
+        glossary_notes = str(self.app_options.get(TRANSLATION_USER_GLOSSARY_NOTES_KEY, "") or "")
+        if legacy_glossary and (not auto_glossary or not user_glossary or not glossary_notes):
+            migrated_auto, migrated_user, migrated_notes = split_legacy_glossary_cache(legacy_glossary)
+            if not auto_glossary:
+                auto_glossary = migrated_auto
+            if not user_glossary:
+                user_glossary = migrated_user
+            if not glossary_notes:
+                glossary_notes = migrated_notes
+        self.app_options[TRANSLATION_AUTO_DB_GLOSSARY_ENTRIES_KEY] = dict(auto_glossary)
+        self.app_options[TRANSLATION_USER_GLOSSARY_ENTRIES_KEY] = dict(user_glossary)
+        self.app_options[TRANSLATION_USER_GLOSSARY_NOTES_KEY] = glossary_notes
+        self.app_options[TRANSLATION_GLOSSARY_TEXT_KEY] = glossary_notes
         save_app_options(self.app_options)
 
     def page_name_mode_label_pairs(self):
@@ -17197,10 +23125,49 @@ class MainWindowProjectPagesMixin:
         return True
 
     def sync_translation_option_cache_to_config(self):
-        """옵션 캐시에 저장된 번역 프롬프트/단어장을 번역 엔진 Config에 반영한다."""
+        """Sync structured automatic/user glossaries and free-form notes to Config."""
         try:
-            Config.TRANSLATION_PROMPT = str(self.app_options.get(TRANSLATION_PROMPT_KEY, "") or "")
-            Config.TRANSLATION_GLOSSARY_TEXT = str(self.app_options.get(TRANSLATION_GLOSSARY_TEXT_KEY, "") or "")
+            legacy_text = str(self.app_options.get(TRANSLATION_GLOSSARY_TEXT_KEY, "") or "")
+            auto_entries = normalize_glossary_entry_dict(
+                self.app_options.get(TRANSLATION_AUTO_DB_GLOSSARY_ENTRIES_KEY, {})
+            )
+            user_entries = normalize_glossary_entry_dict(
+                self.app_options.get(TRANSLATION_USER_GLOSSARY_ENTRIES_KEY, {})
+            )
+            user_notes = str(self.app_options.get(TRANSLATION_USER_GLOSSARY_NOTES_KEY, "") or "")
+
+            # Transparent migration for existing installations before the new dialog
+            # is opened.  User entries override automatic DB entries later in the
+            # translation engine.
+            if legacy_text and (not auto_entries or not user_entries or not user_notes):
+                migrated_auto, migrated_user, migrated_notes = split_legacy_glossary_cache(legacy_text)
+                if not auto_entries:
+                    auto_entries = migrated_auto
+                if not user_entries:
+                    user_entries = migrated_user
+                if not user_notes:
+                    user_notes = migrated_notes
+                self.app_options[TRANSLATION_AUTO_DB_GLOSSARY_ENTRIES_KEY] = dict(auto_entries)
+                self.app_options[TRANSLATION_USER_GLOSSARY_ENTRIES_KEY] = dict(user_entries)
+                self.app_options[TRANSLATION_USER_GLOSSARY_NOTES_KEY] = user_notes
+                self.app_options[TRANSLATION_GLOSSARY_TEXT_KEY] = user_notes
+
+            prompt_presets, active_prompt_preset = normalize_prompt_options(
+                self.app_options.get(TRANSLATION_PROMPT_PRESETS_KEY, {}),
+                self.app_options.get(TRANSLATION_PROMPT_ACTIVE_PRESET_KEY, ""),
+                self.app_options.get(TRANSLATION_PROMPT_KEY, ""),
+            )
+            active_prompt_templates = normalize_prompt_preset(prompt_presets.get(active_prompt_preset))
+            self.app_options[TRANSLATION_PROMPT_PRESETS_KEY] = prompt_presets
+            self.app_options[TRANSLATION_PROMPT_ACTIVE_PRESET_KEY] = active_prompt_preset
+            self.app_options[TRANSLATION_PROMPT_KEY] = str(active_prompt_templates.get("common_prompt") or "")
+            Config.TRANSLATION_PROMPT = str(active_prompt_templates.get("common_prompt") or "")
+            Config.TRANSLATION_PROMPT_TEMPLATES = dict(active_prompt_templates)
+            set_runtime_prompt_templates(active_prompt_templates)
+            Config.TRANSLATION_GLOSSARY_TEXT = user_notes
+            Config.TRANSLATION_AUTO_DB_GLOSSARY = dict(auto_entries)
+            Config.TRANSLATION_USER_GLOSSARY = dict(user_entries)
+            Config.TRANSLATION_GLOSSARY_REVISION = int(getattr(Config, "TRANSLATION_GLOSSARY_REVISION", 0) or 0) + 1
         except Exception:
             pass
 
@@ -17235,7 +23202,7 @@ class MainWindowProjectPagesMixin:
             pass
 
     def reload_saved_project_from_disk(self, refresh_view=True):
-        """실제 프로젝트 내보내기본을 다시 로드해서 paths를 프로젝트 폴더 기준으로 되돌린다."""
+        """실제 프로젝트 저장본을 다시 로드해서 paths를 프로젝트 폴더 기준으로 되돌린다."""
         if not self.project_dir:
             return False
         project_file = os.path.join(self.project_dir, PROJECT_FILENAME)
@@ -17282,7 +23249,7 @@ class MainWindowProjectPagesMixin:
     def toggle_auto_save_mode(self, checked=False):
         """Deprecated: 실시간 자동저장 모드는 YSBG 패키지 구조 이후 폐지되었다.
 
-        일반 편집 변경분은 복구용 작업 캐시에 저장되고, 실제 .ysbg 반영은
+        일반 편집 변경분은 복구용 작업 캐시에 저장되고, 실제 .ysbg 패키지 내보내기은
         [내보내기]에서만 확정한다.
         """
         self.auto_save_enabled = False
@@ -17302,7 +23269,7 @@ class MainWindowProjectPagesMixin:
         except Exception:
             pass
         try:
-            self.log("🧪 자동저장 모드는 폐지되었습니다. 변경 사항은 작업 캐시에 보관되고, 프로젝트 내보내기 시 YSBG에 확정됩니다.")
+            self.log("🧪 자동저장 모드는 폐지되었습니다. 변경 사항은 작업 캐시에 보관되고, 프로젝트 저장 시 작업 폴더에 저장됩니다. YSBG는 내보내기에서만 생성됩니다.")
         except Exception:
             pass
 
@@ -17328,6 +23295,18 @@ class MainWindowProjectPagesMixin:
                 self.log(f"⚠️ 프로젝트 전환 전 현재 화면 반영 실패: {e}")
             except Exception:
                 pass
+        try:
+            if hasattr(self, "has_maker_writeback_dirty") and self.has_maker_writeback_dirty():
+                choice = self.prompt_maker_writeback_before_leave(self.tr_ui("프로젝트 전환"))
+                if choice == "cancel":
+                    return False
+                if choice == "apply":
+                    self.save_project()
+                    return not (hasattr(self, "has_maker_writeback_dirty") and self.has_maker_writeback_dirty())
+                if choice == "discard":
+                    self.clear_maker_writeback_dirty(save_state=False)
+        except Exception:
+            pass
         return True
 
     def closeEvent(self, event):
@@ -17378,6 +23357,27 @@ class MainWindowProjectPagesMixin:
             except Exception as e:
                 try:
                     self.log(f"⚠️ 종료 전 현재 화면 상태 반영 실패: {e}")
+                except Exception:
+                    pass
+
+            try:
+                if hasattr(self, "has_maker_writeback_dirty") and self.has_maker_writeback_dirty():
+                    choice = self.prompt_maker_writeback_before_leave(self.tr_ui("종료"))
+                    if choice == "cancel":
+                        self._app_is_closing = False
+                        event.ignore()
+                        return
+                    if choice == "apply":
+                        self.save_project()
+                        if hasattr(self, "has_maker_writeback_dirty") and self.has_maker_writeback_dirty():
+                            self._app_is_closing = False
+                            event.ignore()
+                            return
+                    if choice == "discard":
+                        self.clear_maker_writeback_dirty(save_state=False)
+            except Exception as e:
+                try:
+                    self.log(f"⚠️ 종료 전 프로젝트 저장 확인 실패: {e}")
                 except Exception:
                     pass
 
@@ -17518,7 +23518,7 @@ class MainWindowProjectPagesMixin:
             pass
         layout.addWidget(preview_label)
 
-        info_label = QLabel(self.tr_ui("프로젝트 이름과 생성 위치를 먼저 확정하고, 게임 클론을 넣을 빈 프로젝트(.ysbg)를 만듭니다. 이후 [게임 가져오기]로 맵 페이지를 생성합니다."), dlg)
+        info_label = QLabel(self.tr_ui("프로젝트 이름과 생성 위치를 먼저 확정하고, 게임 클론을 넣을 작업 폴더를 만듭니다. 이후 [게임 가져오기]로 맵 페이지를 생성합니다."), dlg)
         info_label.setWordWrap(True)
         try:
             info_label.setStyleSheet("color:#A39BA1;")
@@ -17562,7 +23562,7 @@ class MainWindowProjectPagesMixin:
                 msg = QMessageBox(dlg)
                 msg.setIcon(QMessageBox.Icon.Warning)
                 msg.setWindowTitle(self.tr_ui("이름 중복"))
-                msg.setText(self.tr_ui("같은 이름의 YSBG 프로젝트가 이미 있습니다."))
+                msg.setText(self.tr_ui("같은 이름의 프로젝트 작업 폴더가 이미 있습니다."))
                 msg.setInformativeText(str(candidate_path))
                 btn_rename = msg.addButton(self.tr_ui("이름 바꾸기"), QMessageBox.ButtonRole.AcceptRole)
                 btn_overwrite = msg.addButton(self.tr_ui("덮어쓰기"), QMessageBox.ButtonRole.DestructiveRole)
@@ -17897,6 +23897,7 @@ class MainWindowProjectPagesMixin:
             # 여기서 제거/분리하지 않고, 모드별 탭 필터링으로만 보여준다.
             try:
                 self.maker_database_mode_enabled = False
+                self.maker_translation_layer = "normal"
                 self.maker_database_idx = 0
             except Exception:
                 pass
@@ -17985,13 +23986,15 @@ class MainWindowProjectPagesMixin:
         return True
 
     def _prebuild_maker_preview_cache_for_current_project(self, progress=None, *, reason="maker_game_import"):
-        """Pre-render preview images for every non-database Maker page.
+        """Pre-render preview images for normal Maker map/common-event pages.
 
         On first RPG Maker import we want all page preview images to exist on disk
         already, so reopening the project mostly becomes image loading instead of
         JSON/tile re-rendering. Map pages create full tile-backed preview caches;
         Common Events create their lightweight virtual-page placeholders.
         """
+        if hasattr(self, "is_maker_preview_enabled") and not self.is_maker_preview_enabled():
+            return {"total": 0, "ok": 0, "failed": [], "skipped": True}
         try:
             from ysb.tools.maker_project import regenerate_maker_placeholder_for_page
         except Exception as e:
@@ -18015,7 +24018,7 @@ class MainWindowProjectPagesMixin:
             if not isinstance(meta, dict) or not meta:
                 continue
             page_type = str(meta.get("page_type") or "map").strip().lower()
-            if page_type == "database":
+            if page_type in {"database", "plugin", "speaker"}:
                 continue
             image_path = str(image_path or "").strip()
             if not image_path:
@@ -18033,6 +24036,74 @@ class MainWindowProjectPagesMixin:
             except Exception:
                 pass
             return {"total": 0, "ok": 0, "failed": []}
+
+        # Large games should become usable quickly.  Build only a small front
+        # cache during import, and leave the rest as deferred/on-demand previews.
+        # The existing lazy renderer will create/copy the real tile preview when a
+        # page is opened, including split pages that share the same physical map.
+        try:
+            prebuild_limit = int(os.environ.get("YSB_MAKER_PREVIEW_PREBUILD_LIMIT", "8") or 8)
+        except Exception:
+            prebuild_limit = 8
+        prebuild_limit = max(1, prebuild_limit)
+        deferred_targets = []
+        if total > prebuild_limit:
+            selected = []
+            selected_keys = set()
+            try:
+                current_idx = int(getattr(self, "idx", 0) or 0)
+            except Exception:
+                current_idx = 0
+            for target in targets:
+                if int(target[0]) == current_idx:
+                    selected.append(target)
+                    selected_keys.add(int(target[0]))
+                    break
+            # Prefer canonical first split pages.  Later split pages can reuse the
+            # canonical map preview on demand.
+            for target in targets:
+                if len(selected) >= prebuild_limit:
+                    break
+                idx, _image_path, _page, meta, _page_type = target
+                if int(idx) in selected_keys:
+                    continue
+                try:
+                    split_index = int((meta or {}).get("editor_split_index") or 1)
+                except Exception:
+                    split_index = 1
+                if split_index != 1:
+                    continue
+                selected.append(target)
+                selected_keys.add(int(idx))
+            for target in targets:
+                if len(selected) >= prebuild_limit:
+                    break
+                idx = int(target[0])
+                if idx in selected_keys:
+                    continue
+                selected.append(target)
+                selected_keys.add(idx)
+            deferred_targets = [t for t in targets if int(t[0]) not in selected_keys]
+            for idx, _image_path, page, meta, _page_type in deferred_targets:
+                try:
+                    meta["preview_render_deferred"] = True
+                    meta["preview_prebuilt"] = False
+                    meta["preview_prebuilt_reason"] = "deferred_after_import_limit"
+                    page["ori"] = None
+                except Exception:
+                    pass
+            try:
+                self.audit_boundary_event(
+                    "MAKER_PREVIEW_PREBUILD_LIMITED",
+                    reason=str(reason or "maker_game_import"),
+                    total=total,
+                    immediate=len(selected),
+                    deferred=len(deferred_targets),
+                    limit=prebuild_limit,
+                )
+            except Exception:
+                pass
+            targets = selected
 
         ok_count = 0
         failed = []
@@ -18104,6 +24175,13 @@ class MainWindowProjectPagesMixin:
                 pass
 
         try:
+            self._prebuild_maker_row_preview_blueprints_for_project(progress, reason=str(reason or "maker_game_import"))
+        except Exception as _row_bp_e:
+            try:
+                self.audit_boundary_event("MAKER_ROW_PREVIEW_PROJECT_BUILD_FAILED", reason=str(reason or "maker_game_import"), error=f"{type(_row_bp_e).__name__}: {_row_bp_e}")
+            except Exception:
+                pass
+        try:
             self._maker_import_progress_update(progress, f"프리뷰 캐시 생성 완료\n{ok_count}/{total}개 준비됨", current=total, total=total)
         except Exception:
             pass
@@ -18163,6 +24241,7 @@ class MainWindowProjectPagesMixin:
             # 여기서 제거/분리하지 않고, 모드별 탭 필터링으로만 보여준다.
             try:
                 self.maker_database_mode_enabled = False
+                self.maker_translation_layer = "normal"
                 self.maker_database_idx = 0
             except Exception:
                 pass
@@ -18275,7 +24354,7 @@ class MainWindowProjectPagesMixin:
             start_dir = str(Path.home())
         game_dir = QFileDialog.getExistingDirectory(
             self,
-            self.tr_ui("가져올 RPG Maker MV/MZ 게임 폴더 선택"),
+            self.tr_ui("가져올 RPG Maker MV/MZ JSON 게임 폴더 선택"),
             start_dir,
         )
         if not game_dir:
@@ -18362,7 +24441,21 @@ class MainWindowProjectPagesMixin:
 
         self.open_project_path(path, skip_guard=True)
 
-    def apply_maker_writeback_to_clone(self, *, mark_dirty=True, log_result=True, backup=False, page_indices=None):
+    def apply_maker_writeback_to_clone(self, *args, **kwargs):
+        _perf_t0 = perf_counter()
+        _perf_action_id = next_action_id("apply_maker_writeback_to_clone")
+        _perf_ok = False
+        try:
+            _res = self._perf_impl_apply_maker_writeback_to_clone(*args, **kwargs)
+            _perf_ok = True
+            return _res
+        finally:
+            try:
+                perf_log_elapsed(self, "PERF_USER_ACTION", _perf_t0, action="apply_maker_writeback_to_clone", action_id=_perf_action_id, ok=bool(_perf_ok), args_count=len(args), kwargs=','.join(sorted([str(k) for k in kwargs.keys()])))
+            except Exception:
+                pass
+
+    def _perf_impl_apply_maker_writeback_to_clone(self, *, mark_dirty=True, log_result=True, backup=False, page_indices=None):
         """Apply current table text to the cloned RPG Maker JSON files.
 
         쯔꾸르붕이는 maker_game/ 클론 자체가 현재 완성본이다.
@@ -18410,16 +24503,48 @@ class MainWindowProjectPagesMixin:
                 try:
                     touched = len((summary or {}).get("touched_maps") or [])
                     backup_dir = str((summary or {}).get("backup_dir") or "")
-                    msg = f"🎮 쯔꾸르 JSON 실시간 반영: 텍스트 {written}개 / 맵 {touched}개"
+                    msg = f"🎮 쯔꾸르 JSON 반영: 텍스트 {written}개 / 맵 {touched}개"
                     if backup_dir:
                         msg += f" / 백업 {backup_dir}"
                     self.log(msg)
                 except Exception:
                     pass
+        try:
+            if written > 0 and hasattr(self, "clear_maker_writeback_dirty"):
+                self.clear_maker_writeback_dirty(page_indices=page_indices, save_state=False)
+        except Exception:
+            pass
+        try:
+            if written > 0:
+                # JSON command text may have changed.  Picture-state command caches
+                # are cheap to rebuild and should not outlive a writeback boundary.
+                self._maker_preview_event_command_cache = {}
+        except Exception:
+            pass
         return summary or {"written_units": 0, "skipped_empty": 0, "touched_maps": []}
 
 
-    def save_project(self):
+    def save_project(self, *args, **kwargs):
+        _perf_t0 = perf_counter()
+        _perf_action_id = next_action_id("save_project")
+        _perf_ok = False
+        try:
+            _res = self._perf_impl_save_project(*args, **kwargs)
+            _perf_ok = True
+            return _res
+        finally:
+            try:
+                perf_log_elapsed(self, "PERF_USER_ACTION", _perf_t0, action="save_project", action_id=_perf_action_id, ok=bool(_perf_ok), args_count=len(args), kwargs=','.join(sorted([str(k) for k in kwargs.keys()])))
+            except Exception:
+                pass
+
+    def _perf_impl_save_project(self):
+        """Save the current workspace project.
+
+        쯔꾸르붕이에서 [프로젝트 저장]은 YSBG 패키지를 만들거나 갱신하지 않는다.
+        저장 대상은 현재 작업 폴더의 project.json/페이지 데이터와 작업용 maker_game JSON이다.
+        YSBG는 [내보내기] 전용 운반/백업 패키지로 분리한다.
+        """
         def _save_ui_diag(event: str, **fields):
             try:
                 root = os.environ.get("LOCALAPPDATA")
@@ -18427,7 +24552,7 @@ class MainWindowProjectPagesMixin:
                     root = os.path.join(str(Path.home()), "AppData", "Local")
                 log_dir = os.path.join(root, "YSBGameEditor", "logs")
                 os.makedirs(log_dir, exist_ok=True)
-                path = os.path.join(log_dir, "save_package_diag.log")
+                path = os.path.join(log_dir, "save_project_diag.log")
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
                 parts = [f"[{ts}]", f"UI_{event}"]
                 for k, v in fields.items():
@@ -18446,397 +24571,192 @@ class MainWindowProjectPagesMixin:
             except Exception:
                 pass
 
-        _save_ui_diag("SAVE_PROJECT_ENTER", page_idx=getattr(self, "idx", None), ysbt=getattr(self, "ysbg_package_path", None), project_dir=getattr(self, "project_dir", None))
+        _save_ui_diag("SAVE_PROJECT_ENTER", page_idx=getattr(self, "idx", None), project_dir=getattr(self, "project_dir", None))
         try:
             self.audit_boundary_event("SAVE_PROJECT_ENTER", stack=True)
         except Exception:
             pass
-        if not self.guard_project_action("프로젝트 내보내기"):
+        if not self.guard_project_action("프로젝트 저장"):
             return
         if not self.project_dir:
             self.log("⚠️ 프로젝트가 없습니다. 새 프로젝트를 먼저 만들어주세요.")
-            return
-        if not self.ysbg_package_path:
-            # 새 프로젝트/구버전 폴더 프로젝트는 첫 저장 때 .ysbg 위치를 정한다.
-            self.save_project_as()
             return
 
         total_pages = len(getattr(self, "paths", []) or [])
         self._long_task_cancel_requested = False
         self._active_long_task_kind = "save"
-        save_cancelled = False
-        dirty_count = 0
-        structure_dirty = True
-        save_mode_text = "YSBG 내보내기"
-
-        self.begin_busy_state("프로젝트 내보내기")
+        self.begin_busy_state("프로젝트 저장")
         try:
             self.show_task_progress_overlay(
-                "프로젝트 내보내기",
+                "프로젝트 저장",
                 f"""전체 페이지: {total_pages}개
-변경 페이지: 계산 중
-내보내기 진행: 0/{total_pages}
-잠시 후 내보내기를 시작합니다.""",
-                total=total_pages,
-                cancellable=True,
+현재 작업: 저장 준비 중입니다...""",
+                total=max(1, total_pages),
+                cancellable=False,
             )
             try:
                 overlay = getattr(self, "_task_progress_overlay", None)
                 if overlay is not None:
-                    overlay.note_label.setText("취소 시 현재 저장 항목이 끝난 뒤 중단됩니다.")
+                    overlay.note_label.setText("프로젝트 저장 중입니다. 완료 안내가 뜰 때까지 기다려 주세요.")
             except Exception:
                 pass
             try:
                 QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-                QThread.msleep(300)
-                QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
             except Exception:
                 pass
-            if bool(getattr(self, "_long_task_cancel_requested", False)):
-                raise PackageProjectCancelled("내보내기 시작 전 취소되었습니다.")
 
             try:
                 if hasattr(self, "project_engine") and self.project_engine is not None:
                     self.project_engine.begin_explicit_save()
             except Exception:
                 pass
+
+            self.update_task_progress_overlay(
+                current=0,
+                total=max(1, total_pages),
+                detail=f"""전체 페이지: {total_pages}개
+현재 작업: 현재 화면의 편집 내용을 정리하는 중입니다...""",
+            )
+            try:
+                QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            except Exception:
+                pass
+
             try:
                 self.flush_pending_view_layer_commit(save_after=False)
             except Exception:
                 pass
-            self.update_task_progress_overlay(current=0, total=total_pages, detail=f"""전체 페이지: {total_pages}개
-변경 페이지: 계산 중
-내보내기 진행: 0/{total_pages}
-현재 작업: 현재 화면 상태를 내보내기 데이터에 반영하는 중입니다...""")
-            QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
             _save_ui_diag("COMMIT_CURRENT_PAGE_UI_BEGIN", total_pages=total_pages)
             self.commit_current_page_ui_to_data()
             _save_ui_diag("COMMIT_CURRENT_PAGE_UI_DONE", total_pages=total_pages)
+
+            self.update_task_progress_overlay(
+                current=1,
+                total=max(3, total_pages),
+                detail=f"""전체 페이지: {total_pages}개
+현재 작업: 작업용 게임 JSON을 저장하는 중입니다...""",
+            )
             try:
-                # 리팩토링 중 일부 구형 편집 경로가 dirty flag를 못 찍는 경우를 방어한다.
-                pe = getattr(self, "project_engine", None)
-                if bool(getattr(self, "has_unsaved_changes", False)) and pe is not None and not pe.has_dirty():
-                    page_idx = int(getattr(self, "idx", 0) or 0)
-                    pe.mark_page_dirty(page_idx, "save_fallback")
-                    if hasattr(self, "page_engine") and self.page_engine is not None:
-                        self.page_engine.mark_dirty(page_idx, "save_fallback")
+                QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
             except Exception:
                 pass
-
             try:
-                pe = getattr(self, "project_engine", None)
-                page_dirty = False
-                try:
-                    page_dirty = bool(getattr(self, "page_engine", None) and self.page_engine.dirty_pages())
-                except Exception:
-                    page_dirty = False
-                project_dirty = bool(pe.has_dirty()) if pe is not None else False
-                if (
-                    not bool(getattr(self, "has_unsaved_changes", False))
-                    and not project_dirty
-                    and not page_dirty
-                    and not bool(getattr(self, "is_temp_project", False))
-                ):
-                    _save_ui_diag("SAVE_SKIPPED_NO_CHANGES")
+                maker_dirty = bool(self.has_maker_writeback_dirty()) if hasattr(self, "has_maker_writeback_dirty") else True
+                if maker_dirty:
+                    dirty_pages = None
                     try:
-                        self.audit_boundary_event("SAVE_PROJECT_SKIPPED_NO_CHANGES")
+                        reasons = set(getattr(self, "_maker_game_writeback_dirty_reasons", set()) or set())
+                        pages = sorted(int(x) for x in (getattr(self, "_maker_game_writeback_dirty_pages", set()) or set()))
+                        if pages and "ALL" not in reasons:
+                            dirty_pages = pages
+                    except Exception:
+                        dirty_pages = None
+                    self._maker_last_writeback_summary = self.apply_maker_writeback_to_clone(mark_dirty=False, page_indices=dirty_pages)
+                else:
+                    self._maker_last_writeback_summary = {"written_units": 0, "skipped_empty": 0, "touched_maps": [], "skipped_reason": "no_maker_writeback_dirty"}
+                    try:
+                        perf_log(self, "PERF_MAKER_WRITEBACK_SKIPPED", reason="no_dirty")
                     except Exception:
                         pass
-                    try:
-                        self.log("💾 내보낼 변경 사항이 없습니다.")
-                    except Exception:
-                        pass
-                    self.mark_saved_state()
-                    try:
-                        self.mark_workspace_state_saved(getattr(self, "project_dir", None))
-                    except Exception:
-                        pass
-                    self.record_current_project_recent()
-                    self.hide_task_progress_overlay()
-                    return
-            except Exception:
-                pass
-
-
-            try:
-                self._maker_last_writeback_summary = self.apply_maker_writeback_to_clone()
             except Exception as e:
-                _save_ui_diag("MAKER_WRITEBACK_EXCEPTION", error=repr(e))
+                _save_ui_diag("MAKER_JSON_SAVE_EXCEPTION", error=repr(e))
                 self.has_unsaved_changes = True
-                self.hide_task_progress_overlay()
+                try:
+                    self.hide_task_progress_overlay()
+                except Exception:
+                    pass
                 QMessageBox.critical(
                     self,
-                    self.tr_ui("쯔꾸르 JSON 실시간 반영 실패"),
-                    f"{self.tr_ui('번역문을 쯔꾸르 게임 파일에 반영하지 못했습니다.')}\n\n{e}",
+                    self.tr_ui("쯔꾸르 JSON 저장 실패"),
+                    f"{self.tr_ui('작업용 게임 JSON을 저장하지 못했습니다.')}\n\n{e}",
                 )
                 return
 
-            self.update_task_progress_overlay(current=0, total=total_pages, detail=f"""전체 페이지: {total_pages}개
-변경 페이지: 계산 중
-내보내기 진행: 0/{total_pages}
-현재 작업: 변경된 페이지를 확인하는 중입니다...""")
-            QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            self.update_task_progress_overlay(
+                current=2,
+                total=max(3, total_pages),
+                detail=f"""전체 페이지: {total_pages}개
+현재 작업: 프로젝트 작업 폴더를 저장하는 중입니다...""",
+            )
+            try:
+                QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            except Exception:
+                pass
             _save_ui_diag("SAVE_PROJECT_STORE_BEGIN")
             self.save_project_store(self.project_store)
             _save_ui_diag("SAVE_PROJECT_STORE_DONE")
-            if bool(getattr(self, "_long_task_cancel_requested", False)):
-                raise PackageProjectCancelled("YSBG 반영 전 저장이 취소되었습니다.")
 
             try:
-                plan = getattr(getattr(self, "storage_engine", None), "last_plan", None)
-                dirty_pages = set(getattr(plan, "dirty_pages", set()) or set()) if plan is not None else set()
-                dirty_count = len(dirty_pages)
-                structure_dirty = bool(plan.needs_full_save()) if plan is not None else True
-                force_full_package = bool(getattr(self, "is_temp_project", False))
-                if force_full_package:
-                    structure_dirty = True
-                    save_mode_text = "전체 YSBG 재패키징"
-                    self.log("💾 [Export] 임시/복구 프로젝트 내보내기: 전체 YSBG 재패키징")
-                elif structure_dirty:
-                    save_mode_text = "전체 YSBG 재패키징"
-                    self.log("💾 [Export] 프로젝트 구조 변경 감지: 전체 YSBG 재패키징")
-                else:
-                    save_mode_text = "증분 YSBG 내보내기"
-                    self.log(f"💾 [Export] 변경 페이지 {dirty_count} / 전체 {total_pages}: 증분 YSBG 내보내기")
-                self.update_task_progress_overlay(current=0, total=total_pages, detail=f"""전체 페이지: {total_pages}개
-변경 페이지: {dirty_count}개
-내보내기 진행: 0/{total_pages}
-현재 작업: YSBG 반영을 준비하는 중입니다...""")
-                QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-
-                def _save_progress(current=None, total=None, detail=None):
-                    try:
-                        show_total = int(total or total_pages or 0)
-                        show_current = int(current or 0)
-                        raw_detail = str(detail or "내보내는 중...")
-                        if "최종 반영" in raw_detail:
-                            overlay = getattr(self, "_task_progress_overlay", None)
-                            if overlay is not None:
-                                try:
-                                    overlay.cancel_btn.setEnabled(False)
-                                    overlay.note_label.setText("최종 반영 중입니다. 이 짧은 단계에서는 취소할 수 없습니다.")
-                                except Exception:
-                                    pass
-                        formatted_detail = (
-                            f"전체 페이지: {total_pages}개\n"
-                            f"변경 페이지: {dirty_count}개\n"
-                            f"내보내기 진행: {show_current}/{show_total}\n"
-                            f"현재 작업: {raw_detail}"
-                        )
-                        self.update_task_progress_overlay(current=show_current, total=show_total, detail=formatted_detail)
-                        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-                    except Exception:
-                        pass
-
-                def _save_cancel_requested():
-                    return bool(getattr(self, "_long_task_cancel_requested", False))
-
-                text_json_only_kinds = {"text", "checkpoint_text", "checkpoint_fallback", "data", "translation", "translated_text", "text_effect_preview"}
-                json_fast_save = False
-                dirty_kinds_for_save = {}
-                try:
-                    pe = getattr(self, "project_engine", None)
-                    summary = pe.dirty_summary() if pe is not None and hasattr(pe, "dirty_summary") else {}
-                    raw_dirty = summary.get("dirty_pages", {}) if isinstance(summary, dict) else {}
-                    if isinstance(raw_dirty, dict):
-                        for k, v in raw_dirty.items():
-                            try:
-                                dirty_kinds_for_save[int(k)] = {str(x or "data") for x in list(v or [])}
-                            except Exception:
-                                pass
-                    if (
-                        bool(dirty_pages)
-                        and not bool(structure_dirty)
-                        and not bool(getattr(self, "is_temp_project", False))
-                        and os.path.exists(str(getattr(self, "ysbg_package_path", "") or ""))
-                    ):
-                        json_fast_save = True
-                        for page_i in set(int(x) for x in dirty_pages):
-                            kinds = dirty_kinds_for_save.get(int(page_i), set())
-                            if not kinds or not set(kinds).issubset(text_json_only_kinds):
-                                json_fast_save = False
-                                break
-                except Exception:
-                    json_fast_save = False
-
-                try:
-                    plan_dirty_pages = sorted(int(x) for x in dirty_pages)
-                except Exception:
-                    plan_dirty_pages = []
-                try:
-                    all_dirty_kinds = sorted({str(kind) for kinds in dirty_kinds_for_save.values() for kind in (kinds or set())})
-                except Exception:
-                    all_dirty_kinds = []
-                try:
-                    json_fast_reject_reason = ""
-                    if not json_fast_save:
-                        if bool(structure_dirty):
-                            json_fast_reject_reason = "structure_dirty"
-                        elif not bool(dirty_pages):
-                            json_fast_reject_reason = "no_dirty_pages"
-                        elif bool(getattr(self, "is_temp_project", False)):
-                            json_fast_reject_reason = "temp_project"
-                        elif not os.path.exists(str(getattr(self, "ysbg_package_path", "") or "")):
-                            json_fast_reject_reason = "missing_ysbt"
-                        else:
-                            json_fast_reject_reason = "non_text_dirty_kind_or_missing_kind"
-                except Exception:
-                    json_fast_reject_reason = "diagnostic_error"
-                _save_ui_diag(
-                    "PACKAGE_PROJECT_BEGIN",
-                    save_mode=save_mode_text,
-                    dirty_count=dirty_count,
-                    structure_dirty=structure_dirty,
-                    json_fast_save=json_fast_save,
-                    dirty_pages=plan_dirty_pages,
-                    dirty_kind_names=all_dirty_kinds,
-                    json_fast_reject_reason=json_fast_reject_reason,
-                    dirty_kinds=dirty_kinds_for_save,
-                )
-                try:
-                    self.audit_boundary_event(
-                        "SAVE_DIRTY_DIAG",
-                        save_mode=save_mode_text,
-                        dirty_count=dirty_count,
-                        structure_dirty=structure_dirty,
-                        json_fast_save=json_fast_save,
-                        dirty_pages=plan_dirty_pages,
-                        dirty_kind_names=all_dirty_kinds,
-                        json_fast_reject_reason=json_fast_reject_reason,
-                        throttle_ms=100,
-                    )
-                except Exception:
-                    pass
-                if json_fast_save:
-                    try:
-                        self.log(f"💾 [Export] 텍스트/번역 JSON 변경 {dirty_count}페이지: YSBG 빠른 저장")
-                    except Exception:
-                        pass
-                    try:
-                        append_project_json_to_package(
-                            self.project_dir,
-                            self.ysbg_package_path,
-                            progress_callback=_save_progress,
-                            cancel_checker=_save_cancel_requested,
-                        )
-                    except PackageProjectCancelled:
-                        raise
-                    except Exception as fast_e:
-                        _save_ui_diag("JSON_FAST_SAVE_FALLBACK_PACKAGE", error=repr(fast_e))
-                        try:
-                            self.log(f"💾 [Export] 빠른 저장 불가 → 일반 증분 저장으로 전환: {fast_e}")
-                        except Exception:
-                            pass
-                        package_project(
-                            self.project_dir,
-                            self.ysbg_package_path,
-                            dirty_pages=dirty_pages,
-                            structure_dirty=structure_dirty,
-                            incremental=not structure_dirty,
-                            progress_callback=_save_progress,
-                            cancel_checker=_save_cancel_requested,
-                        )
-                else:
-                    package_project(
-                        self.project_dir,
-                        self.ysbg_package_path,
-                        dirty_pages=dirty_pages,
-                        structure_dirty=structure_dirty,
-                        incremental=not structure_dirty,
-                        progress_callback=_save_progress,
-                        cancel_checker=_save_cancel_requested,
-                    )
-                _save_ui_diag("PACKAGE_PROJECT_DONE", save_mode=save_mode_text, json_fast_save=json_fast_save)
-            except PackageProjectCancelled:
-                _save_ui_diag("PACKAGE_PROJECT_CANCELLED")
-                save_cancelled = True
-                self.has_unsaved_changes = True
-                try:
-                    self.log("⏹️ [Export] 프로젝트 내보내기 취소됨: 원본 YSBG는 변경되지 않았습니다.")
-                except Exception:
-                    pass
-                self.hide_task_progress_overlay()
-                QMessageBox.warning(
-                    self,
-                    self.tr_ui("프로젝트 내보내기 취소"),
-                    """프로젝트 내보내기이 취소되었습니다.
-
-원본 YSBG 파일은 변경되지 않았습니다.
-현재 작업 내용은 프로그램과 복구용 작업 캐시에 남아 있습니다.
-다시 내보내면 YSBG에 반영할 수 있습니다.""",
-                )
-                return
-            except Exception as e:
-                _save_ui_diag("PACKAGE_PROJECT_EXCEPTION", error=repr(e))
-                msg_text = self.tr_ui("프로젝트는 작업 폴더에 저장했지만, YSBG 파일 저장에 실패했습니다.")
-                self.hide_task_progress_overlay()
-                QMessageBox.critical(self, self.tr_ui("YSBG 내보내기 실패"), f"""{msg_text}
-
-{e}""")
-                self.has_unsaved_changes = True
-                return
-
-            _save_ui_diag("MARK_SAVED_BEGIN")
-            self.mark_saved_state()
+                if hasattr(self, "mark_workspace_state_saved"):
+                    self.mark_workspace_state_saved(getattr(self, "project_dir", None))
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "clear_maker_writeback_dirty"):
+                    self.clear_maker_writeback_dirty(save_state=False)
+                if hasattr(self, "clear_maker_recovery_events"):
+                    self.clear_maker_recovery_events()
+            except Exception:
+                pass
             try:
                 self.clear_pending_clean_import_cache(getattr(self, "work_project_dir", None))
                 self.clear_pending_clean_import_cache(getattr(self, "project_dir", None))
             except Exception:
                 pass
-            _save_ui_diag("MARK_SAVED_DONE")
+
+            self.update_task_progress_overlay(
+                current=max(3, total_pages),
+                total=max(3, total_pages),
+                detail=f"""전체 페이지: {total_pages}개
+현재 작업: 저장 완료 처리 중입니다...""",
+            )
+            try:
+                QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            except Exception:
+                pass
+
+            self.mark_saved_state()
             self.update_window_title()
-            self.log(f"💾 프로젝트 내보내기 완료: {self.ysbg_package_path}")
             self.record_current_project_recent()
-            _save_ui_diag("HIDE_OVERLAY_BEGIN")
-            self.hide_task_progress_overlay()
-            _save_ui_diag("HIDE_OVERLAY_DONE")
+            try:
+                self.forget_recovery_project_dir(getattr(self, "work_project_dir", None))
+            except Exception:
+                pass
+            try:
+                written = 0
+                summary = getattr(self, "_maker_last_writeback_summary", None)
+                if isinstance(summary, dict):
+                    written = int(summary.get("written_units") or summary.get("written") or summary.get("updated") or 0)
+                self.log(f"💾 프로젝트 저장 완료: 작업 폴더 + 작업용 게임 JSON / 텍스트 {written}개")
+            except Exception:
+                pass
+            _save_ui_diag("SAVE_PROJECT_DONE")
+            try:
+                self.hide_task_progress_overlay()
+            except Exception:
+                pass
             try:
                 QMessageBox.information(
                     self,
-                    self.tr_ui("프로젝트 내보내기 완료"),
-                    f"""프로젝트 내보내기이 완료되었습니다.
-
-전체 페이지: {total_pages}개
-변경 페이지: {dirty_count}개""",
+                    self.tr_ui("프로젝트 저장 완료"),
+                    self.tr_ui("프로젝트 저장이 완료되었습니다.\n\n작업 폴더와 작업용 게임 JSON을 저장했습니다."),
                 )
             except Exception:
                 pass
-
-            # 내보내기 완료 후에는 화면을 다시 로드하지 않고, 작업 캐시도 다시 만들지 않는다.
-            # 저장된 시점의 본체는 YSBG 파일이므로 복구용 work cache를 매번 full save로 재생성할 필요가 없다.
-            # 닫기 중 저장이면 어차피 나갈 것이므로 기존 작업 캐시를 삭제하고,
-            # 일반 저장이면 마지막 복구 후보 기록만 지워 저장 직후 "복구할 작업"으로 보이지 않게 한다.
-            if getattr(self, "_app_is_closing", False) or getattr(self, "_closing_confirmed", False):
-                try:
-                    _save_ui_diag("CLEANUP_WORK_CACHE_AFTER_SAVE_BEGIN", reason="closing")
-                    self.cleanup_work_cache()
-                    _save_ui_diag("CLEANUP_WORK_CACHE_AFTER_SAVE_DONE", reason="closing")
-                except Exception as e:
-                    _save_ui_diag("CLEANUP_WORK_CACHE_AFTER_SAVE_FAILED", reason="closing", error=repr(e))
-            else:
-                try:
-                    _save_ui_diag("SKIP_WORK_CACHE_REBUILD_AFTER_SAVE")
-                    self.forget_recovery_project_dir(getattr(self, "work_project_dir", None))
-                except Exception:
-                    pass
-        except PackageProjectCancelled:
+        except Exception as e:
+            _save_ui_diag("SAVE_PROJECT_EXCEPTION", error=repr(e))
             self.has_unsaved_changes = True
-            self.hide_task_progress_overlay()
             try:
-                self.log("⏹️ [Export] 프로젝트 내보내기 취소됨: 원본 YSBG는 변경되지 않았습니다.")
+                self.hide_task_progress_overlay()
             except Exception:
                 pass
-            QMessageBox.warning(
+            QMessageBox.critical(
                 self,
-                self.tr_ui("프로젝트 내보내기 취소"),
-                """프로젝트 내보내기이 취소되었습니다.
-
-원본 YSBG 파일은 변경되지 않았습니다.
-현재 작업 내용은 프로그램과 복구용 작업 캐시에 남아 있습니다.""",
+                self.tr_ui("프로젝트 저장 실패"),
+                f"{self.tr_ui('프로젝트를 저장하지 못했습니다.')}\n\n{e}",
             )
             return
         finally:
-            _save_ui_diag("SAVE_PROJECT_FINALLY_BEGIN", save_cancelled=save_cancelled)
             try:
                 if hasattr(self, "project_engine") and self.project_engine is not None:
                     self.project_engine.end_explicit_save()
@@ -18846,14 +24766,12 @@ class MainWindowProjectPagesMixin:
                 self._active_long_task_kind = ""
             except Exception:
                 pass
-            if not save_cancelled:
-                try:
-                    # 정상 완료/실패 모두에서 남은 진행창을 정리한다. 취소 분기는 위에서 이미 정리한다.
-                    if getattr(self, "_task_progress_overlay", None) is not None and self._task_progress_overlay.isVisible():
-                        self.hide_task_progress_overlay()
-                except Exception:
-                    pass
-            self.end_busy_state("프로젝트 내보내기")
+            try:
+                if getattr(self, "_task_progress_overlay", None) is not None and self._task_progress_overlay.isVisible():
+                    self.hide_task_progress_overlay()
+            except Exception:
+                pass
+            self.end_busy_state("프로젝트 저장")
             _save_ui_diag("SAVE_PROJECT_FINALLY_DONE")
 
     def ensure_save_as_output_parent(self, path_abs: str):
@@ -18973,7 +24891,21 @@ class MainWindowProjectPagesMixin:
 
         return prepared
 
-    def save_project_as(self):
+    def save_project_as(self, *args, **kwargs):
+        _perf_t0 = perf_counter()
+        _perf_action_id = next_action_id("save_project_as")
+        _perf_ok = False
+        try:
+            _res = self._perf_impl_save_project_as(*args, **kwargs)
+            _perf_ok = True
+            return _res
+        finally:
+            try:
+                perf_log_elapsed(self, "PERF_USER_ACTION", _perf_t0, action="save_project_as", action_id=_perf_action_id, ok=bool(_perf_ok), args_count=len(args), kwargs=','.join(sorted([str(k) for k in kwargs.keys()])))
+            except Exception:
+                pass
+
+    def _perf_impl_save_project_as(self):
         """현재 작업 폴더를 .ysbg 패키지로 내보낸다.
 
         쯔꾸르붕이에서는 작업 폴더/project.json이 본체다.
@@ -19035,8 +24967,8 @@ class MainWindowProjectPagesMixin:
             except Exception as e:
                 QMessageBox.critical(
                     self,
-                    self.tr_ui("쯔꾸르 JSON 실시간 반영 실패"),
-                    f"{self.tr_ui('번역문을 쯔꾸르 게임 파일에 반영하지 못했습니다.')}\n\n{e}",
+                    self.tr_ui("쯔꾸르 JSON 반영 실패"),
+                    f"{self.tr_ui('작업용 게임 JSON을 저장하지 못했습니다.')}\n\n{e}",
                 )
                 return
 
@@ -19055,7 +24987,7 @@ class MainWindowProjectPagesMixin:
                     raw_detail = str(detail or "YSBG 패키지를 만드는 중...")
                     formatted = (
                         f"전체 페이지: {total_pages}개\n"
-                        f"내보내기 진행: {show_current}/{show_total}\n"
+                        f"저장 진행: {show_current}/{show_total}\n"
                         f"현재 작업: {raw_detail}"
                     )
                     self.update_task_progress_overlay(current=show_current, total=show_total, detail=formatted)
@@ -19082,26 +25014,26 @@ class MainWindowProjectPagesMixin:
             self.mark_saved_state()
             self.update_window_title()
             self.record_current_project_recent()
-            self.log(f"📦 YSBG 내보내기 완료: {path_abs}")
+            self.log(f"📦 프로젝트 저장 완료: {path_abs}")
             try:
                 self.show_ok_notice(
-                    "내보내기 완료",
+                    "저장 완료",
                     f"YSBG 패키지로 내보냈습니다.\n{path_abs}",
                 )
             except Exception:
                 pass
         except PackageProjectCancelled:
-            self.log("⏹️ YSBG 내보내기 취소")
+            self.log("⏹️ 프로젝트 저장 취소")
             QMessageBox.warning(
                 self,
                 self.tr_ui("내보내기 취소"),
-                self.tr_ui("YSBG 내보내기가 취소되었습니다. 현재 작업 폴더는 변경되지 않았습니다."),
+                self.tr_ui("프로젝트 저장가 취소되었습니다. 현재 작업 폴더는 변경되지 않았습니다."),
             )
         except Exception as e:
             self.has_unsaved_changes = True
             QMessageBox.critical(
                 self,
-                self.tr_ui("YSBG 내보내기 실패"),
+                self.tr_ui("프로젝트 저장 실패"),
                 f"{self.tr_ui('YSBG 파일을 내보내지 못했습니다.')}\n{path_abs}\n\n{e}",
             )
         finally:
@@ -19116,12 +25048,26 @@ class MainWindowProjectPagesMixin:
                 self.hide_task_progress_overlay()
             self.end_busy_state("내보내기")
 
-    def auto_save_project(self):
+    def auto_save_project(self, *args, **kwargs):
+        _perf_t0 = perf_counter()
+        _perf_action_id = next_action_id("auto_save_project")
+        _perf_ok = False
+        try:
+            _res = self._perf_impl_auto_save_project(*args, **kwargs)
+            _perf_ok = True
+            return _res
+        finally:
+            try:
+                perf_log_elapsed(self, "PERF_USER_ACTION", _perf_t0, action="auto_save_project", action_id=_perf_action_id, ok=bool(_perf_ok), args_count=len(args), kwargs=','.join(sorted([str(k) for k in kwargs.keys()])))
+            except Exception:
+                pass
+
+    def _perf_impl_auto_save_project(self):
         """복구용 작업 캐시 저장 진입점.
 
         이름은 기존 호출부 호환을 위해 유지하지만, v2.4 QA6부터는 실제 프로젝트나
         .ysbg 패키지를 자동 갱신하지 않는다. 일반 편집 변경분은 작업 캐시에만 저장하고,
-        실제 YSBG 반영은 명시적인 프로젝트 내보내기에서만 수행한다.
+        실제 YSBG 반영은 명시적인 프로젝트 저장에서만 수행한다.
         """
         if getattr(self, "is_batch_running", False) and getattr(self, "current_batch_mode", None) in ("analyze", "reanalyze"):
             try:
@@ -19379,7 +25325,7 @@ class MainWindowProjectPagesMixin:
             self._text_scene_sync_lock = False
 
     def commit_current_page_ui_to_data(self, include_mask=True):
-        if hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode():
+        if hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode():
             try:
                 if not bool(getattr(self, "_maker_database_batch_translate_active", False)):
                     self.commit_current_database_ui_to_layer()
@@ -19390,15 +25336,27 @@ class MainWindowProjectPagesMixin:
         if not curr:
             return
 
-        # 최종화면 탭에서는 화면 위 텍스트 아이템의 현재 위치를 저장 데이터에 먼저 고정한다.
-        self.sync_final_text_scene_to_data()
-
         # 표 상태 반영
         maker_mode = False
         try:
             maker_mode = bool(hasattr(self, "_is_current_maker_page") and self._is_current_maker_page())
         except Exception:
             maker_mode = False
+
+        # Maker pages use self.data as the master.  Bulk text operations may leave
+        # visible table cells intentionally stale until a single-row click, so a
+        # generic save/commit must never rebuild scene state or copy stale cells back.
+        if not maker_mode:
+            self.sync_final_text_scene_to_data()
+        pending_maker_rows = set()
+        if maker_mode:
+            try:
+                pending_maker_rows = set(self._maker_table_pending_refresh_rows(
+                    page_idx=int(getattr(self, "idx", 0) or 0), db_mode=False
+                ))
+            except Exception:
+                pending_maker_rows = set()
+
         for row in range(1, self.tab.rowCount()):
             data_index = row - 1
             if data_index < 0 or data_index >= len(curr.get('data', [])):
@@ -19419,7 +25377,10 @@ class MainWindowProjectPagesMixin:
                 speaker_item = self.tab.item(row, 2)
                 trans_item = self.tab.item(row, 6)
                 memo_item = self.tab.item(row, 7)
-                if status_item is not None:
+                # translated_text/status are skipped for rows whose model data is
+                # newer than the visible cell.  Speaker/memo direct edits remain
+                # immediate and may still be committed normally.
+                if row not in pending_maker_rows and status_item is not None:
                     data_item['maker_status'] = status_item.text()
                 if speaker_item is not None:
                     speaker_text = speaker_item.text()
@@ -19436,7 +25397,8 @@ class MainWindowProjectPagesMixin:
                             meta['speaker_confidence'] = 1.0 if str(speaker_text or '').strip() else 0.0
                     except Exception:
                         pass
-                data_item['translated_text'] = trans_item.text() if trans_item else ""
+                if row not in pending_maker_rows:
+                    data_item['translated_text'] = trans_item.text() if trans_item else ""
                 if memo_item is not None:
                     data_item['maker_memo'] = memo_item.text()
             else:

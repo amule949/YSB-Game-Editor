@@ -17,6 +17,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
 
+from ysb.settings.translation_prompt_presets import (
+    PROMPT_BLOCK_BEGIN,
+    PROMPT_BLOCK_END,
+    get_runtime_prompt_templates,
+    render_prompt_template,
+)
+
 try:
     from openai import OpenAI
 except Exception:  # pragma: no cover - 사용자가 Google/Gemini만 쓰는 경우 import 실패 방어
@@ -59,15 +66,25 @@ class Config:
     CUSTOM_TRANSLATION_BASE_URL = ""
     CUSTOM_TRANSLATION_MODEL = ""
     CUSTOM_TRANSLATION_PRESET_NAME = "Custom Compatible"
+    LM_STUDIO_BASE_URL = "http://localhost:1234/v1"
+    LM_STUDIO_MODEL = ""
+    LM_STUDIO_API_KEY = ""
 
     OPENAI_TRANSLATION_MODEL = "gpt-4o-mini"
     DEEPSEEK_TRANSLATION_MODEL = "deepseek-v4-flash"
     GOOGLE_TRANSLATE_MODEL = "google_translate_basic_v2"
     GEMINI_TRANSLATION_MODEL = "gemini-2.5-flash-lite"
+    GEMINI_DELAYED_API_KEY = ""
+    GEMINI_DELAYED_TRANSLATION_MODEL = "gemini-2.5-flash-lite"
+    GEMINI_DELAYED_MODE = "flex"
 
     TRANSLATION_PROMPT = ""
-    TRANSLATION_GLOSSARY_TEXT = ""
-    # DB 자동 단어장은 전체를 매번 프롬프트에 넣지 않고,
+    TRANSLATION_PROMPT_TEMPLATES = {}
+    TRANSLATION_GLOSSARY_TEXT = ""  # free-form user notes / legacy compatibility
+    TRANSLATION_AUTO_DB_GLOSSARY = {}
+    TRANSLATION_USER_GLOSSARY = {}
+    TRANSLATION_GLOSSARY_REVISION = 0
+    # 데이터베이스 단어장은 전체를 매번 프롬프트에 넣지 않고,
     # 현재 번역 묶음에 실제 등장한 항목만 추려 넣는다.
     TRANSLATION_MATCHED_GLOSSARY_MAX_TERMS = 80
 
@@ -114,6 +131,14 @@ class TranslationProcessEngine:
         custom_api_key = str(getattr(Config, "CUSTOM_TRANSLATION_API_KEY", "") or "").strip()
         if custom_api_key and custom_base_url:
             self.custom_translation_client = self._make_openai_client(custom_api_key, base_url=custom_base_url.rstrip("/"))
+
+        self.lm_studio_client = None
+        lm_base_url = str(getattr(Config, "LM_STUDIO_BASE_URL", "http://localhost:1234/v1") or "http://localhost:1234/v1").strip().rstrip("/")
+        if lm_base_url:
+            # LM Studio's OpenAI-compatible server generally accepts any Bearer
+            # token or no real key; the OpenAI SDK object still expects a string.
+            lm_api_key = str(getattr(Config, "LM_STUDIO_API_KEY", "") or "lm-studio").strip() or "lm-studio"
+            self.lm_studio_client = self._make_openai_client(lm_api_key, base_url=lm_base_url)
 
     @staticmethod
     def _make_openai_client(api_key: str, base_url: Optional[str] = None):
@@ -198,6 +223,41 @@ class TranslationProcessEngine:
             or "openai 패키지" in s
         )
 
+    @staticmethod
+    def _lm_studio_models_url(base_url: str) -> str:
+        base = str(base_url or "").strip().rstrip("/")
+        if not base:
+            return ""
+        if base.lower().endswith("/v1"):
+            return base + "/models"
+        return base + "/v1/models"
+
+    def _check_lm_studio_server_ready(self) -> None:
+        base_url = str(getattr(Config, "LM_STUDIO_BASE_URL", "") or "").strip().rstrip("/")
+        model_name = str(getattr(Config, "LM_STUDIO_MODEL", "") or "").strip()
+        models_url = self._lm_studio_models_url(base_url)
+        if not models_url:
+            raise ValueError("LM Studio 서버 설정이 비어있습니다. Base URL을 확인하고 LM Studio Developer 서버를 켜 주세요.")
+        try:
+            resp = requests.get(models_url, timeout=2)
+            if resp.status_code < 200 or resp.status_code >= 300:
+                raise RuntimeError(f"HTTP {resp.status_code}")
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = {}
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, list) and not data:
+                raise ValueError("LM Studio 서버는 켜져 있지만 로드된 모델이 없습니다. LM Studio에서 모델을 로드한 뒤 다시 시도해 주세요.")
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(
+                "LM Studio 서버에 연결할 수 없습니다. "
+                "LM Studio > Developer > Local Server에서 서버를 켠 뒤 다시 시도해 주세요. "
+                f"Base URL: {base_url} / 확인 주소: {models_url} / 상세: {e}"
+            ) from e
+
     def _validate_translation_provider(self, provider: str) -> None:
         provider = (provider or "openai").lower()
         if provider == "deepseek":
@@ -212,6 +272,12 @@ class TranslationProcessEngine:
         elif provider == "custom":
             if self.custom_translation_client is None or not getattr(Config, "CUSTOM_TRANSLATION_MODEL", ""):
                 raise ValueError("Custom 번역 API 설정이 비어있습니다. Base URL, Model, API Key를 확인해주세요.")
+        elif provider == "lm_studio":
+            if self.lm_studio_client is None or not getattr(Config, "LM_STUDIO_BASE_URL", ""):
+                raise ValueError("LM Studio 서버 설정이 비어있습니다. Base URL을 확인하고 LM Studio Developer 서버를 켜 주세요.")
+            if not getattr(Config, "LM_STUDIO_MODEL", ""):
+                raise ValueError("LM Studio 모델명이 비어있습니다. LM Studio에서 모델을 로드한 뒤 모델명을 입력해 주세요.")
+            self._check_lm_studio_server_ready()
         else:
             if self.openai_client is None:
                 raise ValueError("OpenAI API 키가 비어있습니다.")
@@ -244,13 +310,25 @@ class TranslationProcessEngine:
                 results.append(str(original or ""))
         return results
 
-    def _translate_text_chunk_gemini(self, texts: Sequence[str], base_id: int = 0, contexts: Optional[Sequence[str]] = None) -> List[str]:
-        """Google AI Studio Gemini API 번역."""
-        key = str(getattr(Config, "GEMINI_API_KEY", "") or "").strip()
-        if not key:
-            raise ValueError("Gemini API 키가 비어있습니다.")
+    def build_gemini_translation_request(
+        self,
+        texts: Sequence[str],
+        base_id: int = 0,
+        contexts: Optional[Sequence[str]] = None,
+        *,
+        model_override: Optional[str] = None,
+        service_tier: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build one REST GenerateContent request without performing network I/O.
 
-        model = str(getattr(Config, "GEMINI_TRANSLATION_MODEL", "gemini-2.5-flash-lite") or "gemini-2.5-flash-lite").strip()
+        Flex and Batch status management use Qt's asynchronous network stack, so
+        they share the exact same prompt/JSON construction as the normal Gemini
+        translation path without blocking the UI thread.
+        """
+        model = str(model_override or getattr(Config, "GEMINI_TRANSLATION_MODEL", "gemini-2.5-flash-lite") or "gemini-2.5-flash-lite").strip()
+        if not model:
+            raise ValueError("Gemini 모델명이 비어있습니다.")
+
         context_list_raw = [str(c or "") for c in (contexts or [])] if contexts is not None else None
         chunk_character_prompt, cleaned_contexts = self._chunk_character_prompt_block(context_list_raw)
         prompt = self._build_translation_system_prompt(texts=texts, contexts=cleaned_contexts if cleaned_contexts is not None else contexts)
@@ -260,70 +338,106 @@ class TranslationProcessEngine:
         input_items = []
         context_list = [str(c or "") for c in (cleaned_contexts or [])] if cleaned_contexts is not None else ([str(c or "") for c in (contexts or [])] if contexts is not None else None)
         for i, text in enumerate(texts):
-            item = {"id": base_id + i, "text": str(text or "")}
+            item_text = str(text or "")
+            item = {"id": base_id + i, "text": item_text}
+            if "\n" in item_text:
+                line_count = item_text.count("\n") + 1
+                item["line_count"] = line_count
+                item["line_rule"] = render_prompt_template(
+                    get_runtime_prompt_templates().get("line_rule_prompt", ""),
+                    LINE_COUNT=line_count,
+                )
             if context_list is not None and i < len(context_list) and context_list[i].strip():
                 item["context"] = context_list[i]
             input_items.append(item)
 
-        user_text = prompt.strip() + "\n\nINPUT JSON:\n" + json.dumps(input_items, ensure_ascii=False)
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        payload = {
+        user_text = render_prompt_template(
+            get_runtime_prompt_templates().get("gemini_input_wrapper", ""),
+            SYSTEM_PROMPT=prompt.strip(),
+            INPUT_JSON=json.dumps(input_items, ensure_ascii=False),
+        )
+        payload: Dict[str, Any] = {
             "contents": [{"role": "user", "parts": [{"text": user_text}]}],
             "generationConfig": {
                 "temperature": 0.2,
                 "responseMimeType": "application/json",
             },
         }
+        if service_tier:
+            payload["service_tier"] = str(service_tier)
+        return payload
 
-        r = requests.post(url, params={"key": key}, json=payload, timeout=90)
-        if r.status_code != 200:
-            err_text = r.text[:800]
-            try:
-                err = r.json().get("error", {})
-                msg = str(err.get("message", "") or err_text)
-                code = int(err.get("code", r.status_code) or r.status_code)
-            except Exception:
-                msg = err_text
-                code = r.status_code
+    def parse_gemini_translation_response(
+        self,
+        data: Dict[str, Any],
+        texts: Sequence[str],
+        base_id: int = 0,
+        provider_name: str = "Gemini",
+    ) -> List[str]:
+        """Extract and validate translated JSON from a REST GenerateContent response."""
+        candidates = data.get("candidates", []) if isinstance(data, dict) else []
+        if not candidates:
+            raise ValueError(f"{provider_name} 번역 응답이 비어있습니다.")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        content = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict)).strip()
+        if not content:
+            raise ValueError(f"{provider_name} 번역 텍스트가 비어있습니다.")
+        return self._parse_translation_json_response(content, texts, base_id, provider_name=provider_name)
 
-            if code == 429:
-                raise ValueError(
-                    "Gemini Translate Error: 429 / Gemini API 할당량 또는 속도 제한을 초과했습니다. "
-                    "AI Studio의 Rate limits와 결제 설정을 확인해 주세요. 무료 등급에서 limit: 0으로 표시되면 "
-                    "해당 프로젝트에 사용 가능한 무료 할당량이 없거나 결제 설정이 필요한 상태일 수 있습니다. "
-                    f"원문: {msg[:400]}"
-                )
-            if code == 404:
-                raise ValueError(
-                    f"Gemini Translate Error: 404 / Gemini 모델명을 찾을 수 없습니다. 현재 모델명 '{model}'을 확인해 주세요. "
+    @staticmethod
+    def _gemini_http_error(response, model: str = "") -> ValueError:
+        err_text = str(getattr(response, "text", "") or "")[:800]
+        try:
+            err = response.json().get("error", {})
+            msg = str(err.get("message", "") or err_text)
+            code = int(err.get("code", getattr(response, "status_code", 0)) or getattr(response, "status_code", 0))
+        except Exception:
+            msg = err_text
+            code = int(getattr(response, "status_code", 0) or 0)
+        if code == 429:
+            return ValueError(
+                "Gemini Translate Error: 429 / Gemini API 할당량 또는 속도 제한을 초과했습니다. "
+                "AI Studio의 Rate limits와 결제 설정을 확인해 주세요. 무료 등급에서 limit: 0으로 표시되면 "
+                "해당 프로젝트에 사용 가능한 무료 할당량이 없거나 결제 설정이 필요한 상태일 수 있습니다. "
+                f"원문: {msg[:400]}"
+            )
+        if code == 404:
+            model_text = str(model or "").strip()
+            if model_text:
+                return ValueError(
+                    f"Gemini Translate Error: 404 / Gemini 모델명을 찾을 수 없습니다. 현재 모델명 '{model_text}'을 확인해 주세요. "
                     "예: gemini-2.5-flash-lite"
                 )
-            raise ValueError(f"Gemini Translate Error: {code} / {msg[:500]}")
+            return ValueError(f"Gemini Translate Error: 404 / Gemini 모델명을 찾을 수 없습니다. 원문: {msg[:400]}")
+        return ValueError(f"Gemini Translate Error: {code} / {msg[:500]}")
 
-        data = r.json()
-        candidates = data.get("candidates", [])
-        if not candidates:
-            raise ValueError("Gemini 번역 응답이 비어있습니다.")
+    def _translate_text_chunk_gemini(self, texts: Sequence[str], base_id: int = 0, contexts: Optional[Sequence[str]] = None) -> List[str]:
+        """Google AI Studio Gemini API translation."""
+        key = str(getattr(Config, "GEMINI_API_KEY", "") or "").strip()
+        if not key:
+            raise ValueError("Gemini API 키가 비어있습니다.")
 
-        parts = candidates[0].get("content", {}).get("parts", [])
-        content = "".join(str(part.get("text", "")) for part in parts).strip()
-        if not content:
-            raise ValueError("Gemini 번역 텍스트가 비어있습니다.")
-
-        return self._parse_translation_json_response(content, texts, base_id, provider_name="Gemini")
+        model = str(getattr(Config, "GEMINI_TRANSLATION_MODEL", "gemini-2.5-flash-lite") or "gemini-2.5-flash-lite").strip()
+        payload = self.build_gemini_translation_request(texts, base_id=base_id, contexts=contexts, model_override=model)
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        r = requests.post(url, params={"key": key}, json=payload, timeout=90)
+        if r.status_code != 200:
+            raise self._gemini_http_error(r, model=model)
+        return self.parse_gemini_translation_response(r.json(), texts, base_id, provider_name="Gemini")
 
     _AUTO_DB_GLOSSARY_BEGIN = "# YSB_AUTO_DB_GLOSSARY_BEGIN"
     _AUTO_DB_GLOSSARY_END = "# YSB_AUTO_DB_GLOSSARY_END"
     _glossary_cache_text: str = ""
     _glossary_cache_entries: List[Dict[str, str]] = []
     _glossary_cache_manual_text: str = ""
+    _glossary_cache_signature = None
 
     @staticmethod
     def _parse_glossary_line(line: str) -> Tuple[str, str] | None:
         line = str(line or "").strip()
         if not line or line.startswith("#"):
             return None
-        # DB 자동 단어장 기본 형식: 원문<TAB>번역문
+        # 데이터베이스 단어장 기본 형식: 원문<TAB>번역문
         if "\t" in line:
             left, right = line.split("\t", 1)
         elif "=>" in line:
@@ -340,28 +454,58 @@ class TranslationProcessEngine:
             return None
         return src, dst
 
+    @staticmethod
+    def _normalize_structured_glossary(value: Any) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        if isinstance(value, dict):
+            items = value.items()
+        elif isinstance(value, (list, tuple)):
+            items = []
+            for item in value:
+                if isinstance(item, dict):
+                    items.append((item.get("source"), item.get("target")))
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    items.append((item[0], item[1]))
+        else:
+            items = []
+        for raw_source, raw_target in items:
+            source = str(raw_source or "").strip()
+            target = str(raw_target or "").strip()
+            if source and target and source != target:
+                out[source] = target
+        return out
+
     @classmethod
     def _split_glossary_for_matching(cls, glossary_text: str) -> Tuple[str, List[Dict[str, str]]]:
-        """Return (manual text, structured entries).
+        """Return free-form notes plus deduplicated structured glossary entries.
 
-        YSB_AUTO_DB_GLOSSARY block is treated as a machine-readable glossary.
-        It can contain many DB terms, so we do NOT send the whole block to the AI.
-        We only send entries that appear in the current source chunk.
+        Priority is deliberately ``user > legacy manual > automatic DB`` so a
+        user's explicit translation always wins when the same source term exists
+        in the scanned game database.
         """
         glossary_text = str(glossary_text or "")
-        if glossary_text == cls._glossary_cache_text:
-            return cls._glossary_cache_manual_text, list(cls._glossary_cache_entries)
+        auto_raw = getattr(Config, "TRANSLATION_AUTO_DB_GLOSSARY", {})
+        user_raw = getattr(Config, "TRANSLATION_USER_GLOSSARY", {})
+        signature = (
+            int(getattr(Config, "TRANSLATION_GLOSSARY_REVISION", 0) or 0),
+            glossary_text,
+            id(auto_raw),
+            id(user_raw),
+        )
+        if signature == cls._glossary_cache_signature:
+            return cls._glossary_cache_manual_text, cls._glossary_cache_entries
 
-        entries: List[Dict[str, str]] = []
+        auto_dict = cls._normalize_structured_glossary(auto_raw)
+        user_dict = cls._normalize_structured_glossary(user_raw)
+        auto_from_legacy: Dict[str, str] = {}
+        manual_entries: Dict[str, str] = {}
 
-        def collect_auto_block(m: re.Match) -> str:
-            block = m.group(1) or ""
-            for raw_line in block.splitlines():
+        def collect_auto_block(match: re.Match) -> str:
+            for raw_line in str(match.group(1) or "").splitlines():
                 parsed = cls._parse_glossary_line(raw_line)
                 if parsed:
-                    src, dst = parsed
-                    entries.append({"source": src, "target": dst, "origin": "db"})
-            # Remove auto block from the normal/manual glossary prompt.
+                    source, target = parsed
+                    auto_from_legacy[source] = target
             return "\n"
 
         pattern = re.compile(
@@ -369,27 +513,44 @@ class TranslationProcessEngine:
             flags=re.S,
         )
         manual_text = pattern.sub(collect_auto_block, glossary_text).strip()
-
-        # Manual lines that look like 1:1 glossary entries are also indexable,
-        # but manual free-form notes remain in manual_text and are sent as-is.
+        note_lines: List[str] = []
         for raw_line in manual_text.splitlines():
             parsed = cls._parse_glossary_line(raw_line)
             if parsed:
-                src, dst = parsed
-                entries.append({"source": src, "target": dst, "origin": "manual"})
+                source, target = parsed
+                manual_entries[source] = target
+            else:
+                note_lines.append(raw_line)
+        manual_text = "\n".join(note_lines).strip()
 
-        # Deduplicate by source while keeping the first target. Prefer longer terms later during matching.
-        dedup: Dict[str, Dict[str, str]] = {}
-        for e in entries:
-            src = str(e.get("source") or "").strip()
-            if src and src not in dedup:
-                dedup[src] = e
-        entries = sorted(dedup.values(), key=lambda x: (-len(x.get("source", "")), x.get("source", "")))
+        entries: List[Dict[str, str]] = []
+        seen = set()
+        for origin, mapping in (
+            ("user", user_dict),
+            ("manual", manual_entries),
+            ("db", auto_dict),
+            ("db", auto_from_legacy),
+        ):
+            for source, target in mapping.items():
+                if source in seen:
+                    continue
+                entries.append({"source": source, "target": target, "origin": origin})
+                seen.add(source)
+        entries.sort(key=lambda item: (-len(item.get("source", "")), item.get("source", "")))
 
+        cls._glossary_cache_signature = signature
         cls._glossary_cache_text = glossary_text
         cls._glossary_cache_manual_text = manual_text
         cls._glossary_cache_entries = list(entries)
-        return manual_text, list(entries)
+        return manual_text, cls._glossary_cache_entries
+
+    @classmethod
+    def _has_glossary_data(cls, glossary_text: str = "") -> bool:
+        return bool(
+            str(glossary_text or "").strip()
+            or getattr(Config, "TRANSLATION_AUTO_DB_GLOSSARY", {})
+            or getattr(Config, "TRANSLATION_USER_GLOSSARY", {})
+        )
 
     @staticmethod
     def _compact_for_term_matching(values: Optional[Sequence[str]]) -> str:
@@ -432,41 +593,45 @@ class TranslationProcessEngine:
 
         if not matched:
             return manual_text, ""
+        templates = get_runtime_prompt_templates()
         lines = []
+        entry_template = templates.get("matched_glossary_entry", "")
         for e in matched:
             src = str(e.get("source") or "").strip()
             dst = str(e.get("target") or "").strip()
             origin = str(e.get("origin") or "").strip()
             tag = "DB" if origin == "db" else "사용자"
-            lines.append(f"- {src} = {dst} ({tag})")
-        block = (
-            "이번 번역 대상 원문/문맥에 실제 등장한 단어장 항목입니다. 아래 용어는 반드시 우선 적용하세요.\n"
-            "전체 단어장을 보내지 않고 현재 문장에 매칭된 항목만 추렸습니다. 긴 용어에 포함된 짧은 용어는 제외했습니다.\n"
-            + "\n".join(lines)
+            lines.append(render_prompt_template(
+                entry_template,
+                SOURCE=src,
+                TARGET=dst,
+                ORIGIN=tag,
+            ))
+        block = render_prompt_template(
+            templates.get("matched_glossary_prompt", ""),
+            ENTRIES="\n".join(line for line in lines if str(line or "").strip()),
         )
         return manual_text, block
 
     def _extract_chunk_character_prompts(self, contexts: Optional[Sequence[str]] = None) -> Tuple[List[str], List[str]]:
-        """Return de-duplicated once-per-chunk prompt blocks and cleaned row contexts.
+        """Lift editable prompt blocks out of per-row context once per chunk.
 
-        RPG Maker contexts are lightweight row metadata.  Full prompt text must
-        not be repeated inside every JSON item.  ``Character prompt:`` and
-        ``Chunk prompt:`` blocks are lifted into the system prompt once per API
-        chunk, while Speaker/Map/Event metadata remains in the user payload.
+        New contexts use non-editable internal begin/end markers so users may
+        freely rewrite every prompt in any language without breaking parsing.
+        The old ``Character prompt:``/``Chunk prompt:`` form is still accepted
+        for compatibility with older project data and tests.
         """
         if contexts is None:
             return [], []
         prompt_blocks: List[str] = []
         seen = set()
         cleaned_contexts: List[str] = []
-        prompt_markers = {"Character prompt:", "Chunk prompt:"}
-        tail_prefixes = (
+        legacy_prompt_markers = {"Character prompt:", "Chunk prompt:"}
+        legacy_tail_prefixes = (
             "RPG Maker control codes",
             "RPG Maker message placeholders",
         )
-        # These are row metadata labels. If a prompt block ever appears before
-        # them, stop collecting so metadata stays in the JSON item context.
-        row_prefixes = (
+        legacy_row_prefixes = (
             "RPG Maker game translation context",
             "Page:",
             "Map:",
@@ -489,40 +654,51 @@ class TranslationProcessEngine:
             "Face:",
         )
 
+        def append_block(lines):
+            block = "\n".join(x.rstrip() for x in lines).strip()
+            if block and block not in seen:
+                seen.add(block)
+                prompt_blocks.append(block)
+
         for raw in contexts:
             lines = str(raw or "").splitlines()
             out_lines: List[str] = []
             block_lines: List[str] = []
             in_block = False
+            legacy_mode = False
             for line in lines:
                 stripped = line.strip()
-                if stripped in prompt_markers:
+                if stripped == PROMPT_BLOCK_BEGIN:
                     if in_block and block_lines:
-                        block = "\n".join(x.rstrip() for x in block_lines).strip()
-                        if block and block not in seen:
-                            seen.add(block)
-                            prompt_blocks.append(block)
+                        append_block(block_lines)
                     block_lines = []
                     in_block = True
+                    legacy_mode = False
+                    continue
+                if stripped == PROMPT_BLOCK_END and in_block and not legacy_mode:
+                    append_block(block_lines)
+                    block_lines = []
+                    in_block = False
+                    legacy_mode = False
+                    continue
+                if not in_block and stripped in legacy_prompt_markers:
+                    block_lines = []
+                    in_block = True
+                    legacy_mode = True
                     continue
                 if in_block:
-                    if any(stripped.startswith(prefix) for prefix in tail_prefixes + row_prefixes):
-                        block = "\n".join(x.rstrip() for x in block_lines).strip()
-                        if block and block not in seen:
-                            seen.add(block)
-                            prompt_blocks.append(block)
+                    if legacy_mode and any(stripped.startswith(prefix) for prefix in legacy_tail_prefixes + legacy_row_prefixes):
+                        append_block(block_lines)
                         block_lines = []
                         in_block = False
+                        legacy_mode = False
                         out_lines.append(line)
                     else:
                         block_lines.append(line)
                     continue
                 out_lines.append(line)
             if in_block and block_lines:
-                block = "\n".join(x.rstrip() for x in block_lines).strip()
-                if block and block not in seen:
-                    seen.add(block)
-                    prompt_blocks.append(block)
+                append_block(block_lines)
             cleaned_contexts.append("\n".join(x for x in out_lines if str(x or "").strip()).strip())
         return prompt_blocks, cleaned_contexts
 
@@ -530,12 +706,14 @@ class TranslationProcessEngine:
         blocks, cleaned = self._extract_chunk_character_prompts(contexts)
         if not blocks:
             return "", cleaned if contexts is not None else None
+        templates = get_runtime_prompt_templates()
         body = []
+        item_template = templates.get("chunk_prompt_item", "")
         for i, block in enumerate(blocks, 1):
-            body.append(f"[{i}]\n{block}")
-        return (
-            "Once-per-chunk prompts for this translation request. Apply character prompts only to rows whose Speaker tag matches that character.\n"
-            + "\n\n".join(body)
+            body.append(render_prompt_template(item_template, INDEX=i, PROMPT=block))
+        return render_prompt_template(
+            templates.get("chunk_prompt_wrapper", ""),
+            BLOCKS="\n\n".join(x for x in body if str(x or "").strip()),
         ), cleaned
 
     def preview_translation_request(self, texts: Sequence[str], contexts: Optional[Sequence[str]] = None, base_id: int = 0) -> Dict[str, Any]:
@@ -548,7 +726,7 @@ class TranslationProcessEngine:
             glossary_text,
             texts=texts,
             contexts=effective_contexts,
-        ) if glossary_text else ("", "")
+        ) if self._has_glossary_data(glossary_text) else ("", "")
         prompt = self._build_translation_system_prompt(texts=texts, contexts=effective_contexts)
         if chunk_prompt and chunk_prompt not in prompt:
             prompt = (chunk_prompt + "\n\n" + prompt).strip()
@@ -577,52 +755,46 @@ class TranslationProcessEngine:
         return False
 
     def _build_translation_system_prompt(self, texts: Optional[Sequence[str]] = None, contexts: Optional[Sequence[str]] = None) -> str:
-        """Build the system prompt for the current translation chunk.
-
-        사용자 프롬프트와 수동 단어장 설명은 유지하되, DB 자동 단어장은
-        현재 번역 묶음에 실제 등장한 항목만 넣어 토큰 낭비를 줄인다.
-        """
-        custom_prompt = str(getattr(Config, "TRANSLATION_PROMPT", "") or "").strip()
+        """Build the active preset's fully editable system prompt."""
+        templates = get_runtime_prompt_templates()
+        custom_prompt = str(templates.get("common_prompt") or getattr(Config, "TRANSLATION_PROMPT", "") or "").strip()
         glossary_text = str(getattr(Config, "TRANSLATION_GLOSSARY_TEXT", "") or "").strip()
 
         parts = []
         if custom_prompt:
             parts.append(custom_prompt)
 
-        manual_glossary, matched_glossary = self._matched_glossary_block(glossary_text, texts=texts, contexts=contexts) if glossary_text else ("", "")
+        manual_glossary, matched_glossary = self._matched_glossary_block(
+            glossary_text,
+            texts=texts,
+            contexts=contexts,
+        ) if self._has_glossary_data(glossary_text) else ("", "")
 
         if manual_glossary:
-            parts.append(
-                "번역 참고 자료/단어장입니다. 아래 내용을 우선 참고해서 번역하세요.\n"
-                "배경 설명, 단어 해설, 1대1 대체 규칙이 섞여 있을 수 있습니다.\n\n"
-                + manual_glossary
+            manual_block = render_prompt_template(
+                templates.get("manual_glossary_prompt", ""),
+                GLOSSARY=manual_glossary,
             )
+            if manual_block:
+                parts.append(manual_block)
 
         if matched_glossary:
             parts.append(matched_glossary)
 
-        output_rules = rf"""
-OUTPUT FORMAT RULES FOR THIS PROGRAM:
-1. Input is a JSON list of objects.
-2. Each object has "id" and "text". Some objects may also have a short "context" with Map/Event/Type/Speaker metadata.
-3. Use "context" only to improve translation tone, speaker voice, and RPG Maker scene nuance.
-4. RPG Maker variable placeholders such as %1, %2, %3, %4 MUST be copied exactly unchanged. Do not translate, delete, reorder, or add spaces inside them.
-5. When a Korean particle would attach to a placeholder like %1, prefer a safe wording that avoids batchim ambiguity, e.g. "%1은(는)", "%1이(가)", or "%1의" rather than changing the placeholder.
-6. RPG Maker control codes such as \V[n], \N[n], \C[n], and \I[n] are not expected in the input because the Maker preprocessor removes them from API requests. Do not invent or add control codes.
-7. Return ONLY a valid JSON object.
-8. The JSON object MUST have one key: "items".
-9. "items" MUST be a list of objects.
-10. Each output object MUST have the same "id" and a "translation".
-11. NEVER skip any id.
-12. NEVER merge two ids into one translation.
-13. NEVER create a new id.
-14. Do not add explanations, notes, comments, markdown, or extra text.
-15. Example output:
-{{"items":[{{"id":0,"translation":"번역문"}},{{"id":1,"translation":"번역문"}}]}}
-""".strip()
-        parts.append(output_rules)
+        control_token_mode = any("⟦YSB_CC_" in str(text or "") for text in (texts or []))
+        if control_token_mode:
+            control_code_rule = str(templates.get("control_token_prompt") or "").strip()
+        else:
+            control_code_rule = str(templates.get("control_code_absent_prompt") or "").strip()
 
-        return "\n\n".join(parts).strip()
+        output_rules = render_prompt_template(
+            templates.get("output_format_prompt", ""),
+            CONTROL_CODE_RULE=control_code_rule,
+        )
+        if output_rules:
+            parts.append(output_rules)
+
+        return "\n\n".join(part for part in parts if str(part or "").strip()).strip()
 
     def _translate_text_chunk(self, texts: Sequence[str], provider: str = "openai", base_id: int = 0, contexts: Optional[Sequence[str]] = None) -> List[str]:
         context_list_for_prompt = [str(c or "") for c in (contexts or [])] if contexts is not None else None
@@ -652,6 +824,13 @@ OUTPUT FORMAT RULES FOR THIS PROGRAM:
             model = str(getattr(Config, "CUSTOM_TRANSLATION_MODEL", "") or "").strip()
             if not model:
                 raise ValueError("Custom 번역 모델명이 비어있습니다.")
+        elif provider == "lm_studio":
+            if self.lm_studio_client is None:
+                raise ValueError("LM Studio 서버 설정이 비어있습니다. Base URL을 확인하고 LM Studio Developer 서버를 켜 주세요.")
+            client = self.lm_studio_client
+            model = str(getattr(Config, "LM_STUDIO_MODEL", "") or "").strip()
+            if not model:
+                raise ValueError("LM Studio 모델명이 비어있습니다.")
         else:
             if self.openai_client is None:
                 raise ValueError("OpenAI API 키가 비어있습니다.")
@@ -661,7 +840,15 @@ OUTPUT FORMAT RULES FOR THIS PROGRAM:
         input_items = []
         context_list = [str(c or "") for c in (contexts or [])] if contexts is not None else None
         for i, text in enumerate(texts):
-            item = {"id": base_id + i, "text": str(text or "")}
+            item_text = str(text or "")
+            item = {"id": base_id + i, "text": item_text}
+            if "\n" in item_text:
+                line_count = item_text.count("\n") + 1
+                item["line_count"] = line_count
+                item["line_rule"] = render_prompt_template(
+                    get_runtime_prompt_templates().get("line_rule_prompt", ""),
+                    LINE_COUNT=line_count,
+                )
             if context_list is not None and i < len(context_list) and context_list[i].strip():
                 item["context"] = context_list[i]
             input_items.append(item)

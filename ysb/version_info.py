@@ -13,8 +13,8 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 # Change these numbers only, then rebuild.
 VERSION_MAJOR = 1
-VERSION_MINOR = 0
-VERSION_PATCH = 2
+VERSION_MINOR = 1
+VERSION_PATCH = 0
 VERSION_BUILD = 0
 
 VERSION_TEXT = f"{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}"

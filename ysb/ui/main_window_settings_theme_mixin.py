@@ -526,21 +526,26 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         return dlg.exec() == QDialog.DialogCode.Accepted
 
     def open_maker_plugin_translation_dialog(self):
-        """DB번역 > 플러그인 번역.
-
-        아직 별도 플러그인 번역 편집창은 연결 전이므로 메뉴 위치만 먼저 확정한다.
-        """
+        """DB번역 메뉴에서 독립 플러그인 번역 레이어로 전환한다."""
         try:
-            QMessageBox.information(
-                self,
-                self.tr_ui("플러그인 번역"),
-                self.tr_ui("플러그인 번역 창은 다음 단계에서 연결합니다."),
-            )
-        except Exception:
+            if hasattr(self, "is_maker_plugin_mode") and self.is_maker_plugin_mode():
+                return bool(self.exit_maker_database_mode())
+            if hasattr(self, "enter_maker_plugin_mode"):
+                return bool(self.enter_maker_plugin_mode())
+        except Exception as e:
             try:
-                self.log("플러그인 번역 창은 다음 단계에서 연결합니다.")
+                self.log(self.tr_ui("⚠️ 플러그인 번역 모드 진입 실패: {error}", error=f"{type(e).__name__}: {e}"))
             except Exception:
                 pass
+        try:
+            QMessageBox.warning(
+                self,
+                self.tr_ui("플러그인 번역 모드"),
+                self.tr_ui("플러그인 번역 모드로 전환하지 못했습니다."),
+            )
+        except Exception:
+            pass
+        return False
 
     def open_settings_overview_dialog(self):
         """설정과 옵션을 한 번에 보는 통합 창.
@@ -1084,7 +1089,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         form.setSpacing(12)
 
         cb_normalize = QCheckBox(self.tr_ui("AI 번역 시 원문 줄내림 제거"), box)
-        cb_normalize.setChecked(bool(old_settings.get("normalize_source_newlines", True)))
+        cb_normalize.setChecked(bool(old_settings.get("normalize_source_newlines", False)))
         cb_desc = QLabel(self.tr_ui("RPG Maker 대사는 여러 401/405 줄로 나뉘어 저장될 수 있습니다. 이 옵션은 번역 품질을 위해 AI 요청용 원문만 한 문장처럼 합칩니다."), box)
         cb_desc.setObjectName("SettingsDescription")
         cb_desc.setWordWrap(True)
@@ -1122,7 +1127,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
 
         def reset_defaults():
             d = DEFAULT_MAKER_TRANSLATION_SETTINGS
-            cb_normalize.setChecked(bool(d.get("normalize_source_newlines", True)))
+            cb_normalize.setChecked(bool(d.get("normalize_source_newlines", False)))
             idx = combo.findData(str(d.get("newline_join_mode") or "auto"))
             combo.setCurrentIndex(idx if idx >= 0 else 0)
         btn_reset.clicked.connect(reset_defaults)
@@ -1181,7 +1186,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
             saved["ok"] = True
             try:
                 self.log("⚙️ 쯔꾸르 번역 설정 저장: 원문 줄내림 제거 {state} / 방식 {mode}".format(
-                    state="ON" if settings.get("normalize_source_newlines", True) else "OFF",
+                    state="ON" if settings.get("normalize_source_newlines", False) else "OFF",
                     mode=settings.get("newline_join_mode") or "auto",
                 ))
             except Exception:
@@ -1765,8 +1770,12 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
             except Exception:
                 pass
 
-    def open_maker_prompt_verification_dialog(self, project_dir=None, prompts=None):
-        """게임 프롬프트 관리 안에서 실제 번역 요청 프롬프트와 테스트 번역을 검증한다."""
+    def open_maker_prompt_verification_dialog(self, project_dir=None, prompts=None, prompt_templates=None):
+        """게임 프롬프트 관리 안에서 실제 번역 요청 프롬프트와 테스트 번역을 검증한다.
+
+        ``prompt_templates`` may contain unsaved values from the parent manager;
+        they are installed only for this modal verification and then restored.
+        """
         project_dir = project_dir or getattr(self, "project_dir", None)
         if not project_dir:
             self.show_warn_notice("입력 프롬프트 확인", "프로젝트를 연 뒤 사용할 수 있습니다.")
@@ -1782,6 +1791,22 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         except Exception as e:
             self.show_warn_notice("입력 프롬프트 확인", str(e)); return
         prompts = normalize_maker_character_prompts(prompts or load_maker_character_prompts(project_dir))
+        old_verify_templates = None
+        old_verify_prompt = None
+        TranslationConfig = None
+        if isinstance(prompt_templates, dict):
+            try:
+                from ysb.engine.translation_engine import Config as TranslationConfig
+                old_verify_templates = get_runtime_prompt_templates()
+                old_verify_prompt = getattr(TranslationConfig, "TRANSLATION_PROMPT", "")
+                verify_templates = normalize_prompt_preset(prompt_templates)
+                set_runtime_prompt_templates(verify_templates)
+                TranslationConfig.TRANSLATION_PROMPT = str(verify_templates.get("common_prompt") or "")
+                TranslationConfig.TRANSLATION_PROMPT_TEMPLATES = dict(verify_templates)
+            except Exception:
+                old_verify_templates = None
+                old_verify_prompt = None
+                TranslationConfig = None
 
         def collect_rows(preview_kind="dialogue", max_per_speaker=2, max_total=30, current_first=True):
             """Collect representative rows for prompt verification.
@@ -1930,11 +1955,11 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
             lines.append("\n[줄별 항목 매칭]")
             for i, r in enumerate(rows, 1):
                 if preview_kind == "database":
-                    matched = "Chunk prompt:" in str(r.get("context") or "")
+                    matched = PROMPT_BLOCK_BEGIN in str(r.get("context") or "")
                     loc = f"DB: {r.get('db_kind','')} / ID: {r.get('db_id','')} / Field: {r.get('db_field','')}"
                     lines.append(f"{i}. {loc} / DB Prompt: {'OK' if matched else '없음'}")
                 else:
-                    matched = "Character prompt:" in str(r.get("context") or "")
+                    matched = PROMPT_BLOCK_BEGIN in str(r.get("context") or "")
                     lines.append(f"{i}. Speaker: {r['speaker']} / Match: {'OK' if matched else '없음'} / {r.get('map','')} / {r.get('event','')}")
                 lines.append(f"   Text: {r['text']}")
             lines.append("\n[실제 system prompt 미리보기]")
@@ -1991,7 +2016,17 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         except Exception: pass
         buttons.rejected.connect(dlg.reject); root.addWidget(buttons)
         refresh_prompt_preview()
-        dlg.exec()
+        try:
+            dlg.exec()
+        finally:
+            if old_verify_templates is not None:
+                try:
+                    set_runtime_prompt_templates(old_verify_templates)
+                    if TranslationConfig is not None:
+                        TranslationConfig.TRANSLATION_PROMPT = old_verify_prompt
+                        TranslationConfig.TRANSLATION_PROMPT_TEMPLATES = dict(old_verify_templates)
+                except Exception:
+                    pass
 
     def refresh_maker_game_dialogue_action(self):
         """Temporarily treat maker_game JSON as the master and import it.
@@ -2233,7 +2268,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                     pass
                 try:
                     # Boundary closes here: after refresh, program data is master again.
-                    self.apply_maker_writeback_to_clone(mark_dirty=False, log_result=False, backup=False, page_indices=touched_pages)
+                    self.mark_maker_writeback_dirty(page_indices=touched_pages, reason="maker_game_settings_changed")
                 except Exception as e:
                     try:
                         self.log(f"⚠️ 게임 갱신 후 프로그램→게임 재고정 실패: {e}")
@@ -2392,7 +2427,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                 touched_title_pages = self._set_maker_title_in_program_data(le_title.text().strip())
                 apply_maker_preview_settings_to_data(getattr(self, "data", {}) or {}, fixed)
                 if touched_title_pages:
-                    self.apply_maker_writeback_to_clone(mark_dirty=False, log_result=False, backup=False, page_indices=touched_title_pages)
+                    self.mark_maker_writeback_dirty(page_indices=touched_title_pages, reason="maker_game_title_changed")
                     try:
                         self.mark_project_structure_dirty("maker_game_title")
                     except Exception:
@@ -2544,7 +2579,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
             touched_pages = self._set_maker_title_in_program_data(title)
             try:
                 if touched_pages:
-                    self.apply_maker_writeback_to_clone(mark_dirty=False, log_result=False, backup=False, page_indices=touched_pages)
+                    self.mark_maker_writeback_dirty(page_indices=touched_pages, reason="maker_game_settings_changed")
                 else:
                     # Very old projects may not have a System.json DB row in the
                     # program table.  Fall back to direct write, but keep the log clear.
@@ -2563,7 +2598,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                     self.save_workspace_project_json_light(reason="maker_game_title")
             except Exception: pass
             try:
-                if hasattr(self, "refresh_maker_database_view") and hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode():
+                if hasattr(self, "refresh_maker_database_view") and hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode():
                     self.refresh_maker_database_view()
             except Exception: pass
             self.log(f"🏷️ 타이틀명 변경: {title}"); dlg.accept()
@@ -2741,31 +2776,17 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                 row=(getattr(self,"data",{}) or {}).get(page_idx,{}).get("data",[])[data_i]
                 if str(row.get("translated_text") or "") != trans:
                     row["translated_text"]=trans; row["maker_status"]=self.tr_ui("번역완료") if trans.strip() else self.tr_ui("미번역"); touched.add(page_idx); changed+=1
-            actor_sync_changed = 0
             if touched:
-                self.apply_maker_writeback_to_clone(mark_dirty=False, log_result=False, backup=False, page_indices=sorted(touched))
+                self.mark_maker_writeback_dirty(page_indices=sorted(touched), reason="maker_database_name_sync")
                 try:
                     if hasattr(self, "refresh_maker_database_auto_glossary"):
                         self.refresh_maker_database_auto_glossary(show_log=False)
                 except Exception:
                     pass
-                try:
-                    actor_sync_changed = self._apply_maker_actor_name_master_to_speakers(refresh=False, write_cache=False)
-                except Exception:
-                    actor_sync_changed = 0
                 try: self.fill_table()
                 except Exception: pass
                 try: self.update_maker_preview_selection_from_table()
                 except Exception: pass
-                if actor_sync_changed:
-                    try:
-                        self.mark_project_structure_dirty("maker_actor_name_master_sync")
-                    except Exception:
-                        pass
-                    try:
-                        self.start_work_cache_from_current(mark_dirty=True)
-                    except Exception:
-                        pass
             return changed
         def do_ai():
             dlg.accept(); self.run_maker_database_batch_translate()
@@ -2948,406 +2969,33 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
             self.show_ok_notice("분석 마스크 설정 저장 완료", "분석 마스크 확장 설정이 저장되었습니다.")
 
     def open_maker_character_name_translation_dialog(self):
-        """화자명만 모아서 일괄 치환한다.
-
-        Normal table cells show a plain speaker name.  If an MV inline-name line
-        used control codes (for example \\MX...\\C[23]天子), this dialog shows that
-        raw shell for review, but edits only the plain display/translation name.
-        """
+        """독립 화자 번역 레이어를 열거나 닫는다."""
         try:
-            from ysb.tools.maker_project import strip_maker_control_codes
-        except Exception:
-            def strip_maker_control_codes(value):
-                return str(value or "")
-        if not getattr(self, "data", None):
-            QMessageBox.information(self, self.tr_ui("화자 번역"), self.tr_ui("불러온 맵 데이터가 없습니다."))
-            return
-        actor_master_map = self._maker_actor_name_translation_map()
-        entries = {}
-        for page_idx, curr in (getattr(self, "data", {}) or {}).items():
-            if not isinstance(curr, dict):
-                continue
-            page_meta = curr.get("maker_page") if isinstance(curr.get("maker_page"), dict) else {}
-            page_type = str((page_meta or {}).get("page_type") or "map").strip().lower()
-            source_file = str((page_meta or {}).get("source_file") or (page_meta or {}).get("map_file") or "").strip()
-            # 화자 번역은 실제 대사 맥락만 대상으로 한다. System/Troops/DB 가상 페이지는 말하는 인물이 아니므로 제외한다.
-            if page_type not in ("", "map", "common_events") or source_file in ("System.json", "Troops.json") or source_file.startswith("DB_"):
-                continue
-            for row in curr.get("data", []) or []:
-                if not isinstance(row, dict):
-                    continue
-                unit_meta = row.get("maker_text_unit") if isinstance(row.get("maker_text_unit"), dict) else {}
-                legacy_meta = row.get("maker_meta") if isinstance(row.get("maker_meta"), dict) else {}
-                row_source_file = str(unit_meta.get("source_file") or unit_meta.get("map_file") or legacy_meta.get("source_file") or "").strip()
-                if row_source_file in ("System.json", "Troops.json") or row_source_file.startswith("DB_"):
-                    continue
-                plain_current = str(
-                    row.get("maker_speaker_plain")
-                    or unit_meta.get("speaker_plain")
-                    or strip_maker_control_codes(row.get("maker_speaker") or "")
-                    or strip_maker_control_codes(legacy_meta.get("speaker") or "")
-                    or strip_maker_control_codes(row.get("speaker") or "")
-                    or ""
-                ).strip()
-                if not plain_current or plain_current.lower() == "unknown":
-                    continue
-                original = str(
-                    row.get("maker_speaker_original")
-                    or unit_meta.get("speaker_original")
-                    or unit_meta.get("speaker_plain")
-                    or legacy_meta.get("speaker_original")
-                    or plain_current
-                ).strip()
-                if not original or original.lower() == "unknown":
-                    continue
-                raw_visible = str(unit_meta.get("speaker_raw_visible") or "").strip()
-                info = entries.setdefault(original, {"current": plain_current, "count": 0, "raw_samples": set()})
-                info["current"] = str(actor_master_map.get(original) or plain_current)
-                info["actor_master"] = bool(original in actor_master_map)
-                info["count"] = int(info.get("count") or 0) + 1
-                if raw_visible:
-                    try:
-                        info.setdefault("raw_samples", set()).add(raw_visible)
-                    except Exception:
-                        pass
-        if not entries:
-            QMessageBox.information(self, self.tr_ui("화자 번역"), self.tr_ui("화자 데이터가 없습니다."))
-            return
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle(self.tr_ui("화자 번역"))
-        dialog.resize(780, 560)
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(8)
-        desc = QLabel(self.tr_ui("화자명만 따로 수정합니다. 일반 표의 화자 칸은 제어코드 없는 이름만 보여주고, 이 창에서 제어코드 포함 원본 화자 줄을 확인할 수 있습니다. Actors 데이터베이스의 이름 번역이 있는 항목은 DB를 마스터로 삼아 자동 반영됩니다."), dialog)
-        desc.setWordWrap(True)
-        layout.addWidget(desc)
-        table = TextTableWidget(len(entries), 4, dialog)
-        table.setHorizontalHeaderLabels([self.tr_ui("원래 화자"), self.tr_ui("제어코드 포함 원본"), self.tr_ui("번역/표시 이름"), self.tr_ui("사용 수")])
-        table.verticalHeader().setVisible(False)
-        table.setAlternatingRowColors(True)
-        try:
-            table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-            table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
-            table.setProperty("ysb_excel_like_text_table", True)
-            table.setProperty("ysb_copy_blank_line_between_rows", True)
-        except Exception:
-            pass
-        try:
-            table.horizontalHeader().setStretchLastSection(False)
-            table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-            table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-            table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-            table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        except Exception:
-            pass
-        originals = sorted(entries.keys(), key=lambda x: x.casefold())
-        for r, original in enumerate(originals):
-            info = entries[original]
-            raw_samples = sorted(list(info.get("raw_samples") or []), key=lambda x: (len(x), x))
-            raw_text = "\n".join(raw_samples[:3])
-            if len(raw_samples) > 3:
-                raw_text += f"\n… +{len(raw_samples)-3}"
-            item_original = QTableWidgetItem(original)
-            item_original.setFlags(item_original.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            table.setItem(r, 0, item_original)
-            item_raw = QTableWidgetItem(raw_text)
-            item_raw.setFlags(item_raw.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            if raw_text:
-                item_raw.setToolTip(raw_text)
-            table.setItem(r, 1, item_raw)
-            item_current = QTableWidgetItem(str(info.get("current") or original))
-            if bool(info.get("actor_master")):
-                item_current.setFlags(item_current.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                item_current.setToolTip(self.tr_ui("Actors 데이터베이스 번역을 따르는 항목입니다."))
-            table.setItem(r, 2, item_current)
-            item_count = QTableWidgetItem(str(info.get("count") or 0))
-            item_count.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            item_count.setFlags(item_count.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            table.setItem(r, 3, item_count)
-        try:
-            table.resizeRowsToContents()
-        except Exception:
-            pass
-        layout.addWidget(table, 1)
-        extra_row = QHBoxLayout()
-        extra_row.addStretch(1)
-        btn_translate_names = QPushButton(self.tr_ui("화자명 번역"), dialog)
-        btn_translate_names.setToolTip(self.tr_ui("이 창의 화자명만 현재 선택한 번역 API로 번역합니다."))
-        extra_row.addWidget(btn_translate_names)
-        layout.addLayout(extra_row)
-
-        def _speaker_table_copy_selected_cells():
+            if hasattr(self, "is_maker_speaker_mode") and self.is_maker_speaker_mode():
+                return bool(self.exit_maker_database_mode())
+            if hasattr(self, "enter_maker_speaker_mode"):
+                return bool(self.enter_maker_speaker_mode())
+        except Exception as e:
             try:
-                text = table.selected_text_for_clipboard() if hasattr(table, "selected_text_for_clipboard") else ""
-                if text == "":
-                    item = table.currentItem()
-                    text = str(item.text() if item is not None else "")
-                if text == "":
-                    return False
-                QApplication.clipboard().setText(text)
-                return True
-            except Exception:
-                return False
-
-        def _speaker_table_paste_translation_cells():
-            try:
-                try:
-                    current_col = int(table.currentColumn())
-                except Exception:
-                    current_col = -1
-                try:
-                    selected_columns = {int(idx.column()) for idx in table.selectedIndexes()}
-                except Exception:
-                    selected_columns = set()
-                # 붙여넣기는 사용자가 수정하는 번역/표시 이름 열에만 허용한다.
-                if current_col != 2 and 2 not in selected_columns:
-                    return False
-                blocks = self.parse_maker_single_column_clipboard_blocks(QApplication.clipboard().text()) if hasattr(self, "parse_maker_single_column_clipboard_blocks") else []
-                if not blocks:
-                    return False
-                try:
-                    start_row = int(table.currentRow())
-                except Exception:
-                    start_row = 0
-                if start_row < 0:
-                    start_row = 0
-                applied = 0
-                for offset, value in enumerate(blocks):
-                    row_no = start_row + offset
-                    if row_no >= table.rowCount():
-                        break
-                    original = originals[row_no] if 0 <= row_no < len(originals) else ""
-                    if original in actor_master_map:
-                        continue
-                    item = table.item(row_no, 2)
-                    if item is None:
-                        item = QTableWidgetItem("")
-                        table.setItem(row_no, 2, item)
-                    item.setText(str(value or ""))
-                    applied += 1
-                if applied:
-                    try:
-                        end_row = min(table.rowCount() - 1, start_row + max(0, applied) - 1)
-                        table.clearSelection()
-                        if end_row >= start_row:
-                            table.setRangeSelected(QTableWidgetSelectionRange(start_row, 2, end_row, 2), True)
-                        table.setCurrentCell(start_row, 2)
-                        item0 = table.item(start_row, 2)
-                        if item0 is not None:
-                            table.scrollToItem(item0, QAbstractItemView.ScrollHint.PositionAtCenter)
-                    except Exception:
-                        pass
-                return applied > 0
-            except Exception:
-                return False
-
-        class _SpeakerTableClipboardFilter(QObject):
-            def eventFilter(self, obj, event):
-                try:
-                    if event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress):
-                        key = event.key()
-                        mods = event.modifiers()
-                        if mods & Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_C:
-                            if event.type() == QEvent.Type.ShortcutOverride:
-                                event.accept(); return True
-                            if _speaker_table_copy_selected_cells():
-                                event.accept(); return True
-                        if mods & Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_V:
-                            try:
-                                fw = QApplication.focusWidget()
-                            except Exception:
-                                fw = None
-                            # 셀 편집기 안에서는 일반 텍스트 붙여넣기를 우선한다.
-                            if isinstance(fw, (QLineEdit, QTextEdit, QPlainTextEdit)):
-                                return False
-                            if event.type() == QEvent.Type.ShortcutOverride:
-                                event.accept(); return True
-                            if _speaker_table_paste_translation_cells():
-                                event.accept(); return True
-                except Exception:
-                    pass
-                return False
-
-        speaker_table_filter = _SpeakerTableClipboardFilter(dialog)
-        table.installEventFilter(speaker_table_filter)
-        table.viewport().installEventFilter(speaker_table_filter)
-        dialog._ysb_speaker_table_clipboard_filter = speaker_table_filter
-
-        def translate_speaker_name_rows():
-            try:
-                if hasattr(self, "ensure_engine_ready") and not self.ensure_engine_ready():
-                    return
-                provider = self.cb_trans_provider.currentData() if hasattr(self, "cb_trans_provider") else "openai"
-                if hasattr(self, "check_translation_api_key_or_alert") and not self.check_translation_api_key_or_alert(provider):
-                    return
-                rows = []
-                texts = []
-                contexts = []
-                for r, original in enumerate(originals):
-                    if original in actor_master_map:
-                        continue
-                    src = str(original or "").strip()
-                    if not src:
-                        continue
-                    rows.append(r)
-                    texts.append(src)
-                    contexts.append("Translate only this RPG Maker speaker/character name into natural Korean. Return only the translated name, no explanation.")
-                if not texts:
-                    QMessageBox.information(dialog, self.tr_ui("화자 번역"), self.tr_ui("번역할 화자명이 없습니다."))
-                    return
-                progress = QProgressDialog(dialog)
-                progress.setWindowTitle(self.tr_ui("화자명 번역"))
-                progress.setLabelText(self.tr_ui("화자명을 번역하는 중입니다..."))
-                progress.setRange(0, 0)
-                progress.setCancelButton(None)
-                progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-                try:
-                    apply_progress_dialog_theme(progress, bool(self.is_light_theme()))
-                except Exception:
-                    pass
-                progress.show(); QApplication.processEvents()
-                chunk_size = self.get_current_translation_chunk_size() if hasattr(self, "get_current_translation_chunk_size") else 50
-                translated = self.engine.translate_text_batch(texts, provider=provider, chunk_size=chunk_size, contexts=contexts)
-                for r, val in zip(rows, translated or []):
-                    item = table.item(r, 2)
-                    if item is not None:
-                        item.setText(str(val or "").strip() or texts[rows.index(r)])
-                progress.close(); progress.deleteLater(); QApplication.processEvents()
-                try:
-                    self.log(f"👤 화자명 번역 완료: {len(rows)}개")
-                except Exception:
-                    pass
-            except Exception as e:
-                try:
-                    progress.close()
-                except Exception:
-                    pass
-                QMessageBox.warning(dialog, self.tr_ui("화자명 번역 실패"), str(e))
-
-        btn_translate_names.clicked.connect(translate_speaker_name_rows)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dialog)
-        try:
-            buttons.button(QDialogButtonBox.StandardButton.Ok).setText(self.tr_ui("적용"))
-            buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(self.tr_ui("취소"))
-        except Exception:
-            pass
-        layout.addWidget(buttons)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        mapping = {}
-        for r, original in enumerate(originals):
-            item = table.item(r, 2)
-            value = str(item.text() if item is not None else "").strip()
-            if original in actor_master_map:
-                mapping[original] = str(actor_master_map.get(original) or original).strip() or original
-            else:
-                mapping[original] = value or original
-        changed = 0
-        touched_pages = set()
-        try:
-            self.commit_current_page_ui_to_data()
-        except Exception:
-            pass
-        for page_idx, curr in (getattr(self, "data", {}) or {}).items():
-            if not isinstance(curr, dict):
-                continue
-            page_meta = curr.get("maker_page") if isinstance(curr.get("maker_page"), dict) else {}
-            page_type = str((page_meta or {}).get("page_type") or "map").strip().lower()
-            source_file = str((page_meta or {}).get("source_file") or (page_meta or {}).get("map_file") or "").strip()
-            if page_type not in ("", "map", "common_events") or source_file in ("System.json", "Troops.json") or source_file.startswith("DB_"):
-                continue
-            for row in curr.get("data", []) or []:
-                if not isinstance(row, dict):
-                    continue
-                unit_meta = row.get("maker_text_unit") if isinstance(row.get("maker_text_unit"), dict) else {}
-                legacy_meta = row.get("maker_meta") if isinstance(row.get("maker_meta"), dict) else {}
-                row_source_file = str(unit_meta.get("source_file") or unit_meta.get("map_file") or legacy_meta.get("source_file") or "").strip()
-                if row_source_file in ("System.json", "Troops.json") or row_source_file.startswith("DB_"):
-                    continue
-                current = str(row.get("maker_speaker_plain") or unit_meta.get("speaker_plain") or strip_maker_control_codes(row.get("maker_speaker") or "") or strip_maker_control_codes(legacy_meta.get("speaker") or "") or strip_maker_control_codes(row.get("speaker") or "") or "").strip()
-                original = str(row.get("maker_speaker_original") or unit_meta.get("speaker_original") or unit_meta.get("speaker_plain") or legacy_meta.get("speaker_original") or current).strip()
-                if not original or original not in mapping:
-                    continue
-                new_name = mapping.get(original) or original
-                if row.get("maker_speaker_original") is None:
-                    row["maker_speaker_original"] = original
-                row["maker_speaker"] = new_name
-                row["maker_speaker_plain"] = new_name
-                row["maker_speaker_source"] = "speaker_translation"
-                row["maker_speaker_confidence"] = 1.0
-                if isinstance(unit_meta, dict):
-                    if unit_meta.get("speaker_original") is None:
-                        unit_meta["speaker_original"] = original
-                    unit_meta["speaker"] = new_name
-                    unit_meta["speaker_plain"] = new_name
-                    unit_meta["speaker_source"] = "speaker_translation"
-                    unit_meta["speaker_confidence"] = 1.0
-                    row["maker_text_unit"] = unit_meta
-                if isinstance(legacy_meta, dict):
-                    if legacy_meta.get("speaker_original") is None:
-                        legacy_meta["speaker_original"] = original
-                    legacy_meta["speaker"] = new_name
-                    legacy_meta["speaker_source"] = "speaker_translation"
-                    legacy_meta["speaker_confidence"] = 1.0
-                    row["maker_meta"] = legacy_meta
-                changed += 1
-                try:
-                    touched_pages.add(int(page_idx))
-                except Exception:
-                    pass
-        if touched_pages:
-            try:
-                # 화자 번역도 실제 게임 클론 JSON에 즉시 반영한다.
-                # project.json에만 저장되면 표에는 보이지만 게임 적용 파일에는 빠질 수 있다.
-                self.apply_maker_writeback_to_clone(
-                    mark_dirty=False,
-                    log_result=False,
-                    backup=False,
-                    page_indices=sorted(touched_pages),
-                )
-            except Exception as e:
-                try:
-                    self.log(f"⚠️ 화자 번역 게임 JSON 반영 실패: {e}")
-                except Exception:
-                    pass
-        try:
-            self.ref_tab()
-            self.update_maker_preview_selection_from_table()
-        except Exception:
-            pass
-        try:
-            self.mark_project_structure_dirty("maker_speaker_translation")
-        except Exception:
-            pass
-        try:
-            # 화자 번역은 게임 JSON writeback만으로 끝내면 다음 열기 때 사라질 수 있다.
-            # 작업 본체인 project.json에도 즉시 확정 저장한다.
-            self.save_project_store(getattr(self, "project_store", None), force_full=True)
-        except Exception:
-            try:
-                self.schedule_deferred_auto_save_project(300)
+                self.log(self.tr_ui("⚠️ 화자 번역 모드 진입 실패: {error}", error=f"{type(e).__name__}: {e}"))
             except Exception:
                 pass
         try:
-            self.start_work_cache_from_current(mark_dirty=True)
+            QMessageBox.warning(
+                self,
+                self.tr_ui("화자 번역 모드"),
+                self.tr_ui("화자 번역 모드로 전환하지 못했습니다."),
+            )
         except Exception:
             pass
-        try:
-            page_count = len(touched_pages or [])
-        except Exception:
-            page_count = 0
-        self.log(f"👤 화자 번역 적용: {changed}개 대사 갱신 / 게임 JSON 반영 맵 {page_count}개")
+        return False
 
     def open_maker_character_prompts_dialog(self):
-        """옵션 > 쯔꾸르 캐릭터 프롬프트 관리.
+        """Single prompt-management surface for every RPG Maker translation prompt.
 
-        Project-level character prompt profiles. OK saves into maker_meta and
-        marks TextUnits with their prompt profile key. Cancel/X discards edits.
+        Global AI prompt templates/presets, project DB instructions, character
+        profiles, and prompt tests all live in this one dialog. Cancel/X never
+        writes either the global preset store or the project prompt file.
         """
         try:
             from ysb.tools.maker_project import (
@@ -3361,28 +3009,43 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                 sync_maker_character_prompts_to_current_speakers,
             )
         except Exception as e:
-            QMessageBox.critical(self, self.tr_ui("설정 오류"), f"{self.tr_ui('쯔꾸르 캐릭터 프롬프트 관리를 열 수 없습니다.')}\n{e}")
+            QMessageBox.critical(
+                self,
+                self.tr_ui("설정 오류"),
+                f"{self.tr_ui('게임 프롬프트 관리를 열 수 없습니다.')}\n{e}",
+            )
             return
 
         project_dir = str(getattr(self, "project_dir", "") or "").strip()
         if not project_dir:
-            QMessageBox.information(self, self.tr_ui("프로젝트 없음"), self.tr_ui("쯔꾸르 캐릭터 프롬프트는 프로젝트를 연 뒤 사용할 수 있습니다."))
+            QMessageBox.information(
+                self,
+                self.tr_ui("프로젝트 없음"),
+                self.tr_ui("게임 프롬프트 관리는 쯔꾸르 프로젝트를 연 뒤 사용할 수 있습니다."),
+            )
             return
 
         is_maker = False
         try:
             ui_state = getattr(getattr(self, "project_store", None), "ui_state", {}) or {}
-            if str(ui_state.get("project_kind") or "").startswith("rpg_maker_"):
-                is_maker = True
+            is_maker = str(ui_state.get("project_kind") or "").startswith("rpg_maker_")
         except Exception:
             pass
         if not is_maker:
             try:
-                is_maker = any(isinstance((page or {}).get("maker_page"), dict) and (page or {}).get("maker_page") for page in (getattr(self, "data", {}) or {}).values())
+                is_maker = any(
+                    isinstance((page or {}).get("maker_page"), dict)
+                    and bool((page or {}).get("maker_page"))
+                    for page in (getattr(self, "data", {}) or {}).values()
+                )
             except Exception:
                 is_maker = False
         if not is_maker:
-            QMessageBox.information(self, self.tr_ui("쯔꾸르 프로젝트 아님"), self.tr_ui("현재 프로젝트에는 쯔꾸르 맵 페이지 정보가 없습니다. 게임 가져오기 후 사용해 주세요."))
+            QMessageBox.information(
+                self,
+                self.tr_ui("쯔꾸르 프로젝트 아님"),
+                self.tr_ui("현재 프로젝트에는 쯔꾸르 맵 페이지 정보가 없습니다. 게임 가져오기 후 사용해 주세요."),
+            )
             return
 
         try:
@@ -3393,23 +3056,79 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         speakers = collect_maker_speakers_from_data(getattr(self, "data", {}) or {})
         allowed_speaker_keys = [str(sp).strip() for sp in speakers if str(sp).strip()]
         allowed_speaker_set = set(allowed_speaker_keys)
-        chars = prompts.setdefault("characters", {})
+
+        global_prompt_presets, active_global_prompt_preset = normalize_prompt_options(
+            (getattr(self, "app_options", {}) or {}).get(TRANSLATION_PROMPT_PRESETS_KEY, {}),
+            (getattr(self, "app_options", {}) or {}).get(TRANSLATION_PROMPT_ACTIVE_PRESET_KEY, ""),
+            (getattr(self, "app_options", {}) or {}).get(TRANSLATION_PROMPT_KEY, ""),
+        )
+
+        # One-time in-memory migration from the former split common/DB preset lists.
+        # It is committed only when the user presses OK, so Cancel/X remains clean.
+        old_split_presets = (getattr(self, "app_options", {}) or {}).get("maker_prompt_presets")
+
+        def _unique_migrated_name(base):
+            name = str(base or "Legacy Prompt").strip() or "Legacy Prompt"
+            if name not in global_prompt_presets:
+                return name
+            idx = 2
+            while f"{name} {idx}" in global_prompt_presets:
+                idx += 1
+            return f"{name} {idx}"
+
+        # Older project files could carry a project-only common prompt. Preserve
+        # it as a full preset before the project is switched to the one global store.
+        legacy_project_common = str(prompts.get("default_prompt") or "")
+        known_common_values = {
+            str((preset or {}).get("common_prompt") or "")
+            for preset in global_prompt_presets.values() if isinstance(preset, dict)
+        }
+        if legacy_project_common.strip() and legacy_project_common not in known_common_values:
+            migrated = builtin_prompt_preset()
+            migrated["common_prompt"] = legacy_project_common
+            global_prompt_presets[_unique_migrated_name("Legacy Project Common")] = migrated
+
+        if isinstance(old_split_presets, dict):
+            for item in old_split_presets.get("common") or []:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text") or "")
+                name = str(item.get("name") or "").strip()
+                if not name and not text:
+                    continue
+                migrated = builtin_prompt_preset()
+                migrated["common_prompt"] = text
+                global_prompt_presets[_unique_migrated_name(f"Legacy Common - {name or 'Prompt'}")] = migrated
+            for item in old_split_presets.get("database") or []:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text") or "")
+                name = str(item.get("name") or "").strip()
+                if not name and not text:
+                    continue
+                migrated = builtin_prompt_preset()
+                migrated["database_prompt"] = text
+                global_prompt_presets[_unique_migrated_name(f"Legacy DB - {name or 'Prompt'}")] = migrated
 
         dlg = QDialog(self)
         dlg.setWindowTitle(self.tr_ui("게임 프롬프트 관리"))
-        dlg.resize(920, 620)
-        dlg.setMinimumSize(760, 460)
+        dlg.resize(1120, 760)
+        dlg.setMinimumSize(820, 540)
         dlg.setSizeGripEnabled(True)
         dlg.setStyleSheet(self.settings_dialog_style())
         root = QVBoxLayout(dlg)
         root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(12)
+        root.setSpacing(10)
 
         title = QLabel(self.tr_ui("게임 프롬프트 관리"), dlg)
         title.setObjectName("SettingsTitle")
         root.addWidget(title)
-
-        desc = QLabel(self.tr_ui("공통 프롬프트, 캐릭터 프롬프트, 데이터베이스 전용 프롬프트를 한곳에서 관리합니다. 확인을 누르면 저장되고, 닫기나 X를 누르면 저장하지 않습니다."), dlg)
+        desc = QLabel(
+            self.tr_ui(
+                "전체 번역 프롬프트 세트, 프로젝트 DB 지침, 캐릭터별 말투와 프롬프트 테스트를 이 창 하나에서 관리합니다. 확인을 눌러야 저장되고, 닫기나 X는 저장하지 않습니다."
+            ),
+            dlg,
+        )
         desc.setObjectName("SettingsDescription")
         desc.setWordWrap(True)
         root.addWidget(desc)
@@ -3417,268 +3136,61 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         prompt_tabs = QTabWidget(dlg)
         root.addWidget(prompt_tabs, 1)
 
-        PROMPT_PRESETS_KEY = "maker_prompt_presets"
+        # 1) Every editable AI prompt and the single preset store.
+        all_prompt_tab = QWidget(prompt_tabs)
+        try:
+            all_prompt_tab.ui_language = getattr(self, "ui_language", LANG_KO)
+        except Exception:
+            pass
+        all_prompt_layout = QVBoxLayout(all_prompt_tab)
+        all_prompt_layout.setContentsMargins(8, 8, 8, 8)
+        all_prompt_layout.setSpacing(8)
+        prompt_editor = TranslationPromptDialog(
+            global_prompt_presets,
+            active_global_prompt_preset,
+            all_prompt_tab,
+            embedded=True,
+        )
+        all_prompt_layout.addWidget(prompt_editor, 1)
+        prompt_tabs.addTab(all_prompt_tab, self.tr_ui("전체 번역 프롬프트"))
 
-        def _normalize_prompt_presets(raw):
-            clean = []
-            seen = set()
-            if isinstance(raw, list):
-                for item in raw:
-                    if not isinstance(item, dict):
-                        continue
-                    name = str(item.get("name") or "").strip()
-                    text = str(item.get("text") or "")
-                    if not name or name in seen:
-                        continue
-                    seen.add(name)
-                    clean.append({"name": name, "text": text})
-            return clean
+        # 2) Project-specific data inserted into {PROJECT_DB_PROMPT}.
+        project_db_tab = QWidget(prompt_tabs)
+        project_db_layout = QVBoxLayout(project_db_tab)
+        project_db_layout.setContentsMargins(8, 8, 8, 8)
+        project_db_layout.setSpacing(8)
+        project_db_box = QFrame(project_db_tab)
+        project_db_box.setObjectName("SettingsItem")
+        project_db_box_layout = QVBoxLayout(project_db_box)
+        project_db_box_layout.setContentsMargins(12, 12, 12, 12)
+        project_db_box_layout.setSpacing(7)
+        project_db_title = QLabel(self.tr_ui("프로젝트 DB 프롬프트"), project_db_box)
+        project_db_title.setObjectName("SettingsItemTitle")
+        project_db_box_layout.addWidget(project_db_title)
+        project_db_desc = QLabel(
+            self.tr_ui(
+                "현재 프로젝트에만 적용되는 DB 번역 지침입니다. 전체 프롬프트 세트의 데이터베이스 번역 지시에서 {PROJECT_DB_PROMPT} 위치에 들어갑니다."
+            ),
+            project_db_box,
+        )
+        project_db_desc.setObjectName("SettingsDescription")
+        project_db_desc.setWordWrap(True)
+        project_db_box_layout.addWidget(project_db_desc)
+        te_system = QPlainTextEdit(str(prompts.get("system_prompt") or ""), project_db_box)
+        te_system.setPlaceholderText(
+            self.tr_ui("예: 이 게임의 아이템명은 짧게, 스킬 설명은 명령형으로 통일합니다.")
+        )
+        te_system.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        project_db_box_layout.addWidget(te_system, 1)
+        project_db_layout.addWidget(project_db_box, 1)
+        prompt_tabs.addTab(project_db_tab, self.tr_ui("프로젝트 DB 프롬프트"))
 
-        def _prompt_presets_root():
-            opts = getattr(self, "app_options", {})
-            if not isinstance(opts, dict):
-                self.app_options = {}
-                opts = self.app_options
-            root_presets = opts.get(PROMPT_PRESETS_KEY)
-            if not isinstance(root_presets, dict):
-                root_presets = {}
-            root_presets["common"] = _normalize_prompt_presets(root_presets.get("common"))
-            root_presets["database"] = _normalize_prompt_presets(root_presets.get("database"))
-            opts[PROMPT_PRESETS_KEY] = root_presets
-            return root_presets
-
-        def _prompt_presets_for(kind):
-            return list((_prompt_presets_root().get(kind) or []))
-
-        def _save_prompt_presets_for(kind, presets):
-            root_presets = _prompt_presets_root()
-            root_presets[kind] = _normalize_prompt_presets(presets)
-            self.app_options[PROMPT_PRESETS_KEY] = root_presets
-            try:
-                self.save_app_options_cache()
-            except Exception:
-                try:
-                    from ysb.core.cache_utils import save_app_options
-                    save_app_options(self.app_options)
-                except Exception:
-                    pass
-
-        def _make_prompt_preset_box(parent, editor, kind, title_text):
-            box = QFrame(parent)
-            box.setObjectName("SettingsItem")
-            lay = QHBoxLayout(box)
-            lay.setContentsMargins(10, 8, 10, 8)
-            lay.setSpacing(8)
-            lab = QLabel(self.tr_ui(title_text), box)
-            lab.setObjectName("SettingsItemTitle")
-            lay.addWidget(lab)
-            combo = QComboBox(box)
-            combo.setMinimumWidth(180)
-            name_edit = QLineEdit(box)
-            name_edit.setPlaceholderText(self.tr_ui("프리셋 이름"))
-            btn_load = QPushButton(self.tr_ui("불러오기"), box)
-            btn_save = QPushButton(self.tr_ui("현재 저장"), box)
-            btn_delete = QPushButton(self.tr_ui("삭제"), box)
-            lay.addWidget(combo, 1)
-            lay.addWidget(name_edit, 1)
-            lay.addWidget(btn_load)
-            lay.addWidget(btn_save)
-            lay.addWidget(btn_delete)
-
-            def refresh(select_name=""):
-                presets = _prompt_presets_for(kind)
-                combo.blockSignals(True)
-                try:
-                    combo.clear()
-                    combo.addItem(self.tr_ui("프리셋 선택"), "")
-                    for preset in presets:
-                        combo.addItem(str(preset.get("name") or ""), str(preset.get("name") or ""))
-                    if select_name:
-                        for idx in range(combo.count()):
-                            if str(combo.itemData(idx) or "") == str(select_name):
-                                combo.setCurrentIndex(idx)
-                                break
-                finally:
-                    combo.blockSignals(False)
-                if select_name:
-                    name_edit.setText(str(select_name))
-
-            def selected_preset():
-                key = str(combo.currentData() or "").strip()
-                if not key:
-                    return None
-                for preset in _prompt_presets_for(kind):
-                    if str(preset.get("name") or "") == key:
-                        return preset
-                return None
-
-            def on_combo_changed():
-                preset = selected_preset()
-                if preset:
-                    name_edit.setText(str(preset.get("name") or ""))
-
-            def load_preset():
-                preset = selected_preset()
-                if not preset:
-                    return
-                editor.setPlainText(str(preset.get("text") or ""))
-
-            def save_preset():
-                name = str(name_edit.text() or "").strip() or str(combo.currentData() or "").strip()
-                if not name:
-                    QMessageBox.information(dlg, self.tr_ui("프리셋 이름 필요"), self.tr_ui("저장할 프리셋 이름을 입력해 주세요."))
-                    return
-                text = editor.toPlainText()
-                presets = _prompt_presets_for(kind)
-                replaced = False
-                for preset in presets:
-                    if str(preset.get("name") or "") == name:
-                        preset["text"] = text
-                        replaced = True
-                        break
-                if not replaced:
-                    presets.append({"name": name, "text": text})
-                _save_prompt_presets_for(kind, presets)
-                refresh(name)
-
-            def delete_preset():
-                key = str(combo.currentData() or "").strip()
-                if not key:
-                    return
-                presets = [p for p in _prompt_presets_for(kind) if str(p.get("name") or "") != key]
-                _save_prompt_presets_for(kind, presets)
-                name_edit.clear()
-                refresh("")
-
-            combo.currentIndexChanged.connect(lambda *_: on_combo_changed())
-            btn_load.clicked.connect(load_preset)
-            btn_save.clicked.connect(save_preset)
-            btn_delete.clicked.connect(delete_preset)
-            refresh("")
-            return box
-
-        common_tab = QWidget(prompt_tabs)
-        common_layout = QVBoxLayout(common_tab)
-        common_layout.setContentsMargins(8, 8, 8, 8)
-        common_layout.setSpacing(8)
-        prompt_tabs.addTab(common_tab, self.tr_ui("공통 프롬프트"))
-
+        # 3) Character prompt profiles.
         character_tab = QWidget(prompt_tabs)
         character_layout = QVBoxLayout(character_tab)
         character_layout.setContentsMargins(8, 8, 8, 8)
         character_layout.setSpacing(8)
         prompt_tabs.addTab(character_tab, self.tr_ui("캐릭터 프롬프트"))
-
-        system_tab = QWidget(prompt_tabs)
-        system_layout = QVBoxLayout(system_tab)
-        system_layout.setContentsMargins(8, 8, 8, 8)
-        system_layout.setSpacing(8)
-        prompt_tabs.addTab(system_tab, self.tr_ui("DB 전용 프롬프트"))
-
-        default_box = QFrame(common_tab)
-        default_box.setObjectName("SettingsItem")
-        default_layout = QVBoxLayout(default_box)
-        default_layout.setContentsMargins(12, 12, 12, 12)
-        default_layout.setSpacing(6)
-        default_title = QLabel(self.tr_ui("공통 번역 프롬프트"), default_box)
-        default_title.setObjectName("SettingsItemTitle")
-        default_layout.addWidget(default_title)
-        default_desc = QLabel(self.tr_ui("API 번역이 기본적으로 참조하는 공통 지침입니다. 일반 맵 대사와 데이터베이스 번역 모두에 영향을 줍니다."), default_box)
-        default_desc.setObjectName("SettingsDescription")
-        default_desc.setWordWrap(True)
-        default_layout.addWidget(default_desc)
-        te_default = QPlainTextEdit(str((getattr(self, "app_options", {}) or {}).get(TRANSLATION_PROMPT_KEY) or prompts.get("default_prompt") or ""), default_box)
-        te_default.setPlaceholderText(self.tr_ui("예: 일본어를 자연스러운 한국어로 번역하고, RPG Maker 제어문자와 치환 코드(%1, %2)는 절대 바꾸지 마세요."))
-        te_default.setMinimumHeight(180)
-        default_layout.addWidget(te_default)
-        default_layout.addWidget(_make_prompt_preset_box(default_box, te_default, "common", "공통 프롬프트 프리셋"))
-        common_layout.addWidget(default_box, 1)
-
-        system_box = QFrame(system_tab)
-        system_box.setObjectName("SettingsItem")
-        system_box_layout = QVBoxLayout(system_box)
-        system_box_layout.setContentsMargins(12, 12, 12, 12)
-        system_box_layout.setSpacing(6)
-        system_title = QLabel(self.tr_ui("데이터베이스 전용 번역 프롬프트"), system_box)
-        system_title.setObjectName("SettingsItemTitle")
-        system_box_layout.addWidget(system_title)
-        system_desc = QLabel(self.tr_ui("System.json terms, States 메시지, 아이템/스킬 설명처럼 게임 UI와 전투 메시지를 번역할 때 붙는 전용 지침입니다. %1, %2 같은 치환 코드는 원문 그대로 API에 보내므로, 조사와 문장 길이 규칙을 여기 적어두면 안정적입니다. \\V[n] 같은 제어문자는 번역 요청에서 제외됩니다."), system_box)
-        system_desc.setObjectName("SettingsDescription")
-        system_desc.setWordWrap(True)
-        system_box_layout.addWidget(system_desc)
-        te_system = QPlainTextEdit(str(prompts.get("system_prompt") or ""), system_box)
-        te_system.setPlaceholderText(self.tr_ui("예: DB 이름/설명/시스템 용어는 짧고 일관되게 번역합니다. %1, %2는 절대 변경하지 않고, 필요한 조사는 은(는)/이(가)/을(를) 형태로 붙입니다."))
-        te_system.setMinimumHeight(220)
-        system_box_layout.addWidget(te_system, 1)
-        system_box_layout.addWidget(_make_prompt_preset_box(system_box, te_system, "database", "DB 전용 프롬프트 프리셋"))
-        system_layout.addWidget(system_box, 1)
-
-        prompt_test_tab = QWidget(prompt_tabs)
-        prompt_test_layout = QVBoxLayout(prompt_test_tab)
-        prompt_test_layout.setContentsMargins(8, 8, 8, 8)
-        prompt_test_layout.setSpacing(8)
-        prompt_tabs.addTab(prompt_test_tab, self.tr_ui("프롬프트 테스트"))
-
-        prompt_test_desc = QLabel(self.tr_ui("화자와 문장을 직접 넣어 실제로 어떤 공통/캐릭터/DB/단어장 프롬프트가 적용되는지 역방향으로 확인합니다. API 호출 없이 조립 결과만 보여줍니다."), prompt_test_tab)
-        prompt_test_desc.setObjectName("SettingsDescription")
-        prompt_test_desc.setWordWrap(True)
-        prompt_test_layout.addWidget(prompt_test_desc)
-
-        prompt_test_form = QFrame(prompt_test_tab)
-        prompt_test_form.setObjectName("SettingsItem")
-        prompt_test_form_layout = QVBoxLayout(prompt_test_form)
-        prompt_test_form_layout.setContentsMargins(12, 12, 12, 12)
-        prompt_test_form_layout.setSpacing(8)
-        prompt_test_layout.addWidget(prompt_test_form, 0)
-
-        prompt_test_row1 = QHBoxLayout(); prompt_test_row1.setSpacing(8)
-        prompt_test_row1.addWidget(QLabel(self.tr_ui("번역 종류"), prompt_test_form))
-        cb_prompt_test_kind = QComboBox(prompt_test_form)
-        cb_prompt_test_kind.addItem(self.tr_ui("일반 대사 번역"), "dialogue")
-        cb_prompt_test_kind.addItem(self.tr_ui("데이터베이스 번역"), "database")
-        prompt_test_row1.addWidget(cb_prompt_test_kind)
-        prompt_test_row1.addWidget(QLabel(self.tr_ui("화자"), prompt_test_form))
-        cb_prompt_test_speaker = QComboBox(prompt_test_form)
-        cb_prompt_test_speaker.setEditable(True)
-        try:
-            cb_prompt_test_speaker.addItems(allowed_speaker_keys)
-        except Exception:
-            pass
-        prompt_test_row1.addWidget(cb_prompt_test_speaker, 1)
-        prompt_test_row1.addStretch(1)
-        prompt_test_form_layout.addLayout(prompt_test_row1)
-
-        prompt_test_row2 = QHBoxLayout(); prompt_test_row2.setSpacing(8)
-        lab_prompt_test_map = QLabel(self.tr_ui("맵"), prompt_test_form)
-        le_prompt_test_map = QLineEdit(prompt_test_form); le_prompt_test_map.setText("TEST")
-        lab_prompt_test_event = QLabel(self.tr_ui("이벤트"), prompt_test_form)
-        le_prompt_test_event = QLineEdit(prompt_test_form); le_prompt_test_event.setText("TEST")
-        lab_prompt_test_db = QLabel(self.tr_ui("DB"), prompt_test_form)
-        le_prompt_test_db = QLineEdit(prompt_test_form); le_prompt_test_db.setText("Items")
-        lab_prompt_test_db_id = QLabel(self.tr_ui("DB ID"), prompt_test_form)
-        le_prompt_test_db_id = QLineEdit(prompt_test_form); le_prompt_test_db_id.setText("1")
-        lab_prompt_test_field = QLabel(self.tr_ui("필드"), prompt_test_form)
-        le_prompt_test_field = QLineEdit(prompt_test_form); le_prompt_test_field.setText("name")
-        for w in (lab_prompt_test_map, le_prompt_test_map, lab_prompt_test_event, le_prompt_test_event, lab_prompt_test_db, le_prompt_test_db, lab_prompt_test_db_id, le_prompt_test_db_id, lab_prompt_test_field, le_prompt_test_field):
-            prompt_test_row2.addWidget(w)
-        prompt_test_form_layout.addLayout(prompt_test_row2)
-
-        prompt_test_text_label = QLabel(self.tr_ui("테스트 문장"), prompt_test_form)
-        prompt_test_text_label.setObjectName("SettingsItemTitle")
-        prompt_test_form_layout.addWidget(prompt_test_text_label)
-        te_prompt_test_text = QPlainTextEdit(prompt_test_form)
-        te_prompt_test_text.setPlaceholderText(self.tr_ui("예: リオラはポーションを手に入れた！"))
-        te_prompt_test_text.setMinimumHeight(86)
-        prompt_test_form_layout.addWidget(te_prompt_test_text)
-        prompt_test_btn_row = QHBoxLayout(); prompt_test_btn_row.addStretch(1)
-        btn_prompt_test_check = QPushButton(self.tr_ui("사용 프롬프트 확인"), prompt_test_form)
-        prompt_test_btn_row.addWidget(btn_prompt_test_check)
-        prompt_test_form_layout.addLayout(prompt_test_btn_row)
-
-        prompt_test_result = QPlainTextEdit(prompt_test_tab)
-        prompt_test_result.setReadOnly(True)
-        prompt_test_result.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        prompt_test_layout.addWidget(prompt_test_result, 1)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, character_tab)
         left = QWidget(splitter)
@@ -3710,7 +3222,6 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         form.setSpacing(10)
 
         current_key = {"value": None}
-
         cb_enabled = QCheckBox(self.tr_ui("이 캐릭터 프롬프트 사용"), right)
         form.addWidget(cb_enabled)
         le_display = QLineEdit(right)
@@ -3743,25 +3254,23 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         add_field("금지/주의 표현", te_forbidden, "피해야 할 단어, 어색한 말투, 쓰면 안 되는 표현을 적습니다.")
         add_field("메모", te_notes, "검수 메모나 나중에 참고할 내용을 적습니다.")
         form.addStretch(1)
-
         splitter.addWidget(left)
         splitter.addWidget(right_scroll)
-        try:
-            splitter.setSizes([250, 670])
-        except Exception:
-            pass
+        splitter.setSizes([250, 670])
         character_layout.addWidget(splitter, 1)
 
         def sorted_keys():
-            keys = [key for key in (prompts.get("characters") or {}).keys() if (not allowed_speaker_set) or key in allowed_speaker_set]
+            keys = [
+                key for key in (prompts.get("characters") or {}).keys()
+                if (not allowed_speaker_set) or key in allowed_speaker_set
+            ]
             return sorted(keys, key=lambda x: str(x).casefold())
 
-        def save_current():
+        def save_current_character():
             key = current_key.get("value")
             if not key:
                 return
-            chars = prompts.setdefault("characters", {})
-            chars[key] = normalize_maker_character_prompt_profile({
+            prompts.setdefault("characters", {})[key] = normalize_maker_character_prompt_profile({
                 "enabled": cb_enabled.isChecked(),
                 "display_name": le_display.text().strip(),
                 "tone": te_tone.toPlainText().strip(),
@@ -3774,7 +3283,9 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
 
         def load_profile(key):
             current_key["value"] = key
-            profile = normalize_maker_character_prompt_profile((prompts.get("characters") or {}).get(key) or {}, speaker=key)
+            profile = normalize_maker_character_prompt_profile(
+                (prompts.get("characters") or {}).get(key) or {}, speaker=key
+            )
             cb_enabled.setChecked(bool(profile.get("enabled", True)))
             le_display.setText(str(profile.get("display_name") or key))
             te_tone.setPlainText(str(profile.get("tone") or ""))
@@ -3788,14 +3299,17 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
             list_widget.blockSignals(True)
             try:
                 list_widget.clear()
-                for key in sorted_keys():
+                keys = sorted_keys()
+                for key in keys:
                     item = QListWidgetItem(str(key))
                     item.setData(Qt.ItemDataRole.UserRole, str(key))
-                    profile = normalize_maker_character_prompt_profile((prompts.get("characters") or {}).get(key) or {}, speaker=key)
+                    profile = normalize_maker_character_prompt_profile(
+                        (prompts.get("characters") or {}).get(key) or {}, speaker=key
+                    )
                     if not profile.get("enabled", True):
                         item.setText(f"{key}  ({self.tr_ui('사용 안 함')})")
                     list_widget.addItem(item)
-                target = select_key or current_key.get("value") or (sorted_keys()[0] if sorted_keys() else None)
+                target = select_key or current_key.get("value") or (keys[0] if keys else None)
                 if target:
                     for i in range(list_widget.count()):
                         it = list_widget.item(i)
@@ -3807,9 +3321,8 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                 list_widget.blockSignals(False)
 
         def on_selection_changed():
-            old = current_key.get("value")
-            if old:
-                save_current()
+            if current_key.get("value"):
+                save_current_character()
             item = list_widget.currentItem()
             key = str(item.data(Qt.ItemDataRole.UserRole) or "") if item is not None else ""
             if key:
@@ -3818,7 +3331,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         list_widget.currentItemChanged.connect(lambda _cur, _prev: on_selection_changed())
 
         def add_character():
-            save_current()
+            save_current_character()
             name, ok = QInputDialog.getText(dlg, self.tr_ui("화자 추가"), self.tr_ui("화자 이름:"))
             if not ok:
                 return
@@ -3832,16 +3345,13 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                     self.tr_ui("캐릭터 프롬프트 목록에는 현재 프로젝트에서 실제 화자로 수집된 이름만 추가할 수 있습니다."),
                 )
                 return
-            chars = prompts.setdefault("characters", {})
-            if key not in chars:
-                chars[key] = normalize_maker_character_prompt_profile({}, speaker=key)
+            if key not in prompts.setdefault("characters", {}):
+                prompts["characters"][key] = normalize_maker_character_prompt_profile({}, speaker=key)
             refresh_list(key)
 
         def remove_character():
             item = list_widget.currentItem()
-            if item is None:
-                return
-            key = str(item.data(Qt.ItemDataRole.UserRole) or "")
+            key = str(item.data(Qt.ItemDataRole.UserRole) or "") if item is not None else ""
             if not key:
                 return
             if not self.ask_yes_no_shortcut(
@@ -3862,26 +3372,87 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         btn_remove.clicked.connect(remove_character)
         refresh_list()
 
-        def update_prompt_test_kind_fields():
-            is_db = str(cb_prompt_test_kind.currentData() or "dialogue") == "database"
-            for w in (lab_prompt_test_map, le_prompt_test_map, lab_prompt_test_event, le_prompt_test_event):
-                try:
-                    w.setVisible(not is_db)
-                except Exception:
-                    pass
-            for w in (lab_prompt_test_db, le_prompt_test_db, lab_prompt_test_db_id, le_prompt_test_db_id, lab_prompt_test_field, le_prompt_test_field):
-                try:
-                    w.setVisible(is_db)
-                except Exception:
-                    pass
+        # 4) Prompt assembly test uses unsaved values from this same window.
+        prompt_test_tab = QWidget(prompt_tabs)
+        prompt_test_layout = QVBoxLayout(prompt_test_tab)
+        prompt_test_layout.setContentsMargins(8, 8, 8, 8)
+        prompt_test_layout.setSpacing(8)
+        prompt_tabs.addTab(prompt_test_tab, self.tr_ui("프롬프트 테스트"))
+        prompt_test_desc = QLabel(
+            self.tr_ui("현재 창에서 편집 중인 프롬프트로 실제 요청 구조를 조립합니다. 확인을 누르기 전에도 결과를 볼 수 있습니다."),
+            prompt_test_tab,
+        )
+        prompt_test_desc.setObjectName("SettingsDescription")
+        prompt_test_desc.setWordWrap(True)
+        prompt_test_layout.addWidget(prompt_test_desc)
 
-        def _current_prompt_test_prompts():
-            save_current()
+        test_form = QFrame(prompt_test_tab)
+        test_form.setObjectName("SettingsItem")
+        test_form_layout = QVBoxLayout(test_form)
+        test_form_layout.setContentsMargins(12, 12, 12, 12)
+        test_form_layout.setSpacing(8)
+        prompt_test_layout.addWidget(test_form, 0)
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel(self.tr_ui("번역 종류"), test_form))
+        cb_test_kind = QComboBox(test_form)
+        cb_test_kind.addItem(self.tr_ui("일반 대사 번역"), "dialogue")
+        cb_test_kind.addItem(self.tr_ui("데이터베이스 번역"), "database")
+        row1.addWidget(cb_test_kind)
+        row1.addWidget(QLabel(self.tr_ui("화자"), test_form))
+        cb_test_speaker = QComboBox(test_form)
+        cb_test_speaker.setEditable(True)
+        cb_test_speaker.addItems(allowed_speaker_keys)
+        row1.addWidget(cb_test_speaker, 1)
+        test_form_layout.addLayout(row1)
+        row2 = QHBoxLayout()
+        lab_map = QLabel(self.tr_ui("맵"), test_form)
+        le_map = QLineEdit("TEST", test_form)
+        lab_event = QLabel(self.tr_ui("이벤트"), test_form)
+        le_event = QLineEdit("TEST", test_form)
+        lab_db = QLabel(self.tr_ui("DB"), test_form)
+        le_db = QLineEdit("Items", test_form)
+        lab_db_id = QLabel(self.tr_ui("DB ID"), test_form)
+        le_db_id = QLineEdit("1", test_form)
+        lab_field = QLabel(self.tr_ui("필드"), test_form)
+        le_field = QLineEdit("name", test_form)
+        for w in (lab_map, le_map, lab_event, le_event, lab_db, le_db, lab_db_id, le_db_id, lab_field, le_field):
+            row2.addWidget(w)
+        test_form_layout.addLayout(row2)
+        test_form_layout.addWidget(QLabel(self.tr_ui("테스트 문장"), test_form))
+        te_test_text = QPlainTextEdit(test_form)
+        te_test_text.setPlaceholderText(self.tr_ui("예: リオラはポーションを手に入れた！"))
+        te_test_text.setMinimumHeight(86)
+        test_form_layout.addWidget(te_test_text)
+        test_btn_row = QHBoxLayout()
+        test_btn_row.addStretch(1)
+        btn_test_check = QPushButton(self.tr_ui("사용 프롬프트 확인"), test_form)
+        test_btn_row.addWidget(btn_test_check)
+        test_form_layout.addLayout(test_btn_row)
+        test_result = QPlainTextEdit(prompt_test_tab)
+        test_result.setReadOnly(True)
+        test_result.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        prompt_test_layout.addWidget(test_result, 1)
+
+        def update_test_kind_fields():
+            is_db = str(cb_test_kind.currentData() or "dialogue") == "database"
+            for w in (lab_map, le_map, lab_event, le_event):
+                w.setVisible(not is_db)
+            for w in (lab_db, le_db, lab_db_id, le_db_id, lab_field, le_field):
+                w.setVisible(is_db)
+
+        def current_global_prompt_state():
+            preset_store, active_name = prompt_editor.get_prompt_state()
+            templates = normalize_prompt_preset(preset_store.get(active_name))
+            return preset_store, active_name, templates
+
+        def current_project_prompts():
+            save_current_character()
             import copy
-            local_prompts = copy.deepcopy(prompts)
-            local_prompts["default_prompt"] = te_default.toPlainText().strip()
-            local_prompts["system_prompt"] = te_system.toPlainText().strip()
-            return normalize_maker_character_prompts(local_prompts)
+            local = copy.deepcopy(prompts)
+            _store, _active, templates = current_global_prompt_state()
+            local["default_prompt"] = str(templates.get("common_prompt") or "")
+            local["system_prompt"] = te_system.toPlainText().strip()
+            return normalize_maker_character_prompts(local), templates
 
         def run_prompt_reverse_test():
             try:
@@ -3889,35 +3460,30 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                 from ysb.engine.translation_engine import Config
                 from ysb.tools.maker_project import prepare_maker_translation_payload
             except Exception as e:
-                prompt_test_result.setPlainText(f"프롬프트 테스트 준비 실패: {type(e).__name__}: {e}")
+                test_result.setPlainText(f"프롬프트 테스트 준비 실패: {type(e).__name__}: {e}")
                 return
-            local_prompts = _current_prompt_test_prompts()
-            text = te_prompt_test_text.toPlainText().strip()
+            text = te_test_text.toPlainText().strip()
             if not text:
-                prompt_test_result.setPlainText(self.tr_ui("테스트 문장을 입력해 주세요."))
+                test_result.setPlainText(self.tr_ui("테스트 문장을 입력해 주세요."))
                 return
-            speaker = str(cb_prompt_test_speaker.currentText() or "").strip() or "Unknown"
-            kind = str(cb_prompt_test_kind.currentData() or "dialogue")
+            local_prompts, test_templates = current_project_prompts()
+            speaker = str(cb_test_speaker.currentText() or "").strip() or "Unknown"
+            kind = str(cb_test_kind.currentData() or "dialogue")
             if kind == "database":
                 meta = {
-                    "source_kind": "database",
-                    "text_type": "database",
-                    "db_kind": le_prompt_test_db.text().strip() or "Items",
-                    "db_id": le_prompt_test_db_id.text().strip() or "1",
-                    "db_field": le_prompt_test_field.text().strip() or "name",
-                    "speaker_plain": speaker,
-                    "speaker": speaker,
-                    "map_name": "Database",
-                    "event_name": str(le_prompt_test_db.text().strip() or "Items"),
+                    "source_kind": "database", "text_type": "database",
+                    "db_kind": le_db.text().strip() or "Items",
+                    "db_id": le_db_id.text().strip() or "1",
+                    "db_field": le_field.text().strip() or "name",
+                    "speaker_plain": speaker, "speaker": speaker,
+                    "map_name": "Database", "event_name": le_db.text().strip() or "Items",
                 }
             else:
                 meta = {
-                    "source_kind": "map",
-                    "text_type": "dialogue",
-                    "speaker_plain": speaker,
-                    "speaker": speaker,
-                    "map_name": le_prompt_test_map.text().strip() or "TEST",
-                    "event_name": le_prompt_test_event.text().strip() or "TEST",
+                    "source_kind": "map", "text_type": "dialogue",
+                    "speaker_plain": speaker, "speaker": speaker,
+                    "map_name": le_map.text().strip() or "TEST",
+                    "event_name": le_event.text().strip() or "TEST",
                 }
             item = {
                 "text": text,
@@ -3925,108 +3491,97 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                 "maker_speaker_plain": speaker,
                 "maker_text_unit": meta,
             }
-            payload = prepare_maker_translation_payload(item, local_prompts)
-            engine = getattr(self, "engine", None)
-            if engine is None:
-                try:
-                    self.restart_engine(show_error=False)
-                    engine = getattr(self, "engine", None)
-                except Exception:
-                    engine = None
-            if engine is None or not hasattr(engine, "preview_translation_request"):
-                prompt_test_result.setPlainText(self.tr_ui("번역 엔진을 초기화하지 못했습니다."))
-                return
-            try:
-                if hasattr(self, "sync_translation_option_cache_to_config"):
-                    self.sync_translation_option_cache_to_config()
-            except Exception:
-                pass
+            old_templates = get_runtime_prompt_templates()
             old_prompt = getattr(Config, "TRANSLATION_PROMPT", "")
             try:
-                Config.TRANSLATION_PROMPT = str(local_prompts.get("default_prompt") or "")
-                preview = engine.preview_translation_request([payload.get("text") or ""], contexts=[payload.get("context") or ""], base_id=0)
+                set_runtime_prompt_templates(test_templates)
+                Config.TRANSLATION_PROMPT = str(test_templates.get("common_prompt") or "")
+                Config.TRANSLATION_PROMPT_TEMPLATES = dict(test_templates)
+                payload = prepare_maker_translation_payload(item, local_prompts)
+                engine = getattr(self, "engine", None)
+                if engine is None:
+                    self.restart_engine(show_error=False)
+                    engine = getattr(self, "engine", None)
+                if engine is None or not hasattr(engine, "preview_translation_request"):
+                    raise RuntimeError(self.tr_ui("번역 엔진을 초기화하지 못했습니다."))
+                preview = engine.preview_translation_request(
+                    [payload.get("text") or ""],
+                    contexts=[payload.get("context") or ""],
+                    base_id=0,
+                )
             except Exception as e:
                 preview = {"error": f"{type(e).__name__}: {e}", "items": []}
+                payload = locals().get("payload") or {"text": text, "context": ""}
             finally:
-                try:
-                    Config.TRANSLATION_PROMPT = old_prompt
-                except Exception:
-                    pass
-            chunk_block = str(preview.get("character_prompt_block") or "").strip()
-            matched_glossary = str(preview.get("matched_glossary_block") or "").strip()
-            cleaned_contexts = preview.get("cleaned_contexts") or []
-            cleaned_context = str(cleaned_contexts[0] if cleaned_contexts else "")
-            has_character_prompt = "[Character:" in chunk_block
-            has_db_prompt = "Database-only system prompt:" in chunk_block or "Database text is game UI/system text" in chunk_block
-            lines = []
-            lines.append("[프롬프트 역방향 테스트]")
-            lines.append(f"번역 종류: {'데이터베이스 번역' if kind == 'database' else '일반 대사 번역'}")
-            lines.append(f"화자: {speaker}")
-            lines.append(f"API 입력 원문: {payload.get('text') or ''}")
-            lines.append("")
-            lines.append("[적용 판정]")
-            if kind == "database":
-                lines.append(f"DB 전용 프롬프트: {'포함' if has_db_prompt else '없음'}")
-                lines.append("캐릭터 프롬프트: 데이터베이스 번역에는 적용하지 않음")
-            else:
-                lines.append("DB 전용 프롬프트: 일반 대사 번역에는 적용하지 않음")
-                lines.append(f"캐릭터 프롬프트: {'포함' if has_character_prompt else '없음'}")
-            lines.append(f"이번 문장 적용 단어장: {'있음' if matched_glossary else '없음'}")
-            lines.append("")
-            lines.append("[이번 문장 적용 단어장]")
-            lines.append(matched_glossary or "(없음)")
-            lines.append("")
-            lines.append("[청크당 1회 적용 프롬프트 묶음]")
-            lines.append(chunk_block or "(없음)")
-            lines.append("")
-            lines.append("[줄별 context]")
-            lines.append(cleaned_context or "(없음)")
-            lines.append("")
-            lines.append("[실제 system prompt 미리보기]")
-            lines.append(str(preview.get("system_prompt") or ""))
-            lines.append("")
-            lines.append("[실제 user payload 미리보기]")
+                set_runtime_prompt_templates(old_templates)
+                Config.TRANSLATION_PROMPT = old_prompt
+                Config.TRANSLATION_PROMPT_TEMPLATES = dict(old_templates)
+            lines = [
+                "[프롬프트 역방향 테스트]",
+                f"활성 프리셋: {current_global_prompt_state()[1]}",
+                f"번역 종류: {'데이터베이스 번역' if kind == 'database' else '일반 대사 번역'}",
+                f"화자: {speaker}",
+                f"API 입력 원문: {payload.get('text') or ''}",
+                "",
+                "[청크당 1회 적용 프롬프트 묶음]",
+                str(preview.get("character_prompt_block") or "(없음)"),
+                "",
+                "[줄별 context]",
+                str((preview.get("cleaned_contexts") or [payload.get("context") or ""])[0] or "(없음)"),
+                "",
+                "[실제 system prompt 미리보기]",
+                str(preview.get("system_prompt") or ""),
+                "",
+                "[실제 user payload 미리보기]",
+            ]
             try:
                 lines.append(json.dumps(preview.get("items") or [], ensure_ascii=False, indent=2))
             except Exception:
                 lines.append(str(preview.get("items") or []))
             if preview.get("error"):
                 lines.insert(0, "ERROR: " + str(preview.get("error")))
-            prompt_test_result.setPlainText("\n".join(lines))
+            test_result.setPlainText("\n".join(lines))
 
-        try:
-            cb_prompt_test_kind.currentIndexChanged.connect(lambda *_: update_prompt_test_kind_fields())
-        except Exception:
-            pass
-        btn_prompt_test_check.clicked.connect(run_prompt_reverse_test)
-        update_prompt_test_kind_fields()
+        cb_test_kind.currentIndexChanged.connect(lambda *_: update_test_kind_fields())
+        btn_test_check.clicked.connect(run_prompt_reverse_test)
+        update_test_kind_fields()
 
         verify_row = QHBoxLayout()
         verify_row.addStretch(1)
         btn_verify_prompt = QPushButton(self.tr_ui("입력 프롬프트 확인 / 번역 테스트"), dlg)
-        btn_verify_prompt.setToolTip(self.tr_ui("실제 API 요청에 들어가는 공용/캐릭터 프롬프트와 대표 대사 번역 결과를 확인합니다."))
+        btn_verify_prompt.setToolTip(
+            self.tr_ui("현재 창에서 편집 중인 전체 프롬프트와 프로젝트/캐릭터 프롬프트를 기준으로 대표 요청을 확인합니다.")
+        )
         verify_row.addWidget(btn_verify_prompt)
         root.addLayout(verify_row)
-        btn_verify_prompt.clicked.connect(lambda: (save_current(), self.open_maker_prompt_verification_dialog(project_dir, prompts)))
 
+        def open_full_verification():
+            local_prompts, templates = current_project_prompts()
+            self.open_maker_prompt_verification_dialog(project_dir, local_prompts, prompt_templates=templates)
+
+        btn_verify_prompt.clicked.connect(open_full_verification)
         save_applied = {"ok": False, "count": 0}
 
         def apply_changes():
-            save_current()
-            # NOTE: do not rebind the outer ``prompts`` name here.
-            # Rebinding inside this nested function makes Python treat it as a
-            # local variable, so the earlier ``prompts[...]`` reads crash with
-            # UnboundLocalError when the OK button is pressed.  Build a fixed
-            # copy instead, then save/apply that copy.
-            prompts["default_prompt"] = te_default.toPlainText().strip()
+            if not prompt_editor.validate_before_save(dlg):
+                return False
+            save_current_character()
+            new_presets, new_active = prompt_editor.get_prompt_state()
+            active_templates = normalize_prompt_preset(new_presets.get(new_active))
+            prompts["default_prompt"] = str(active_templates.get("common_prompt") or "")
             prompts["system_prompt"] = te_system.toPlainText().strip()
-            try:
-                self.app_options[TRANSLATION_PROMPT_KEY] = prompts["default_prompt"]
-                self.save_app_options_cache()
-                self.sync_translation_option_cache_to_config()
-            except Exception:
-                pass
-            fixed_prompts = sync_maker_character_prompts_to_current_speakers(prompts, getattr(self, "data", {}) or {})
+
+            self.app_options[TRANSLATION_PROMPT_PRESETS_KEY] = new_presets
+            self.app_options[TRANSLATION_PROMPT_ACTIVE_PRESET_KEY] = new_active
+            self.app_options[TRANSLATION_PROMPT_KEY] = prompts["default_prompt"]
+            # The former split preset store is retired after successful migration.
+            self.app_options.pop("maker_prompt_presets", None)
+            self.save_app_options_cache()
+            self.sync_translation_option_cache_to_config()
+
+            fixed_prompts = sync_maker_character_prompts_to_current_speakers(
+                prompts, getattr(self, "data", {}) or {}
+            )
             fixed = save_maker_character_prompts(project_dir, fixed_prompts)
             changed = apply_maker_character_prompts_to_data(getattr(self, "data", {}) or {}, fixed)
             try:
@@ -4057,13 +3612,20 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                 pass
             save_applied["ok"] = True
             save_applied["count"] = int(changed)
-            self.log(f"🎭 쯔꾸르 프롬프트 저장: 캐릭터 {len((fixed.get('characters') or {}))}명 / 텍스트 {changed}개 연결 / 시스템 프롬프트 {len(str(fixed.get('system_prompt') or '')):,}자")
+            self.log(
+                f"🎭 게임 프롬프트 저장: {new_active} / 캐릭터 {len((fixed.get('characters') or {}))}명 / "
+                f"텍스트 {changed}개 연결 / 프로젝트 DB 프롬프트 {len(str(fixed.get('system_prompt') or '')):,}자"
+            )
+            return True
 
         def on_ok():
-            apply_changes()
-            dlg.accept()
+            if apply_changes():
+                dlg.accept()
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dlg)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            dlg,
+        )
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText(self.tr_ui("확인"))
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(self.tr_ui("닫기"))
         buttons.accepted.connect(on_ok)
@@ -4071,9 +3633,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         root.addWidget(buttons)
 
         if dlg.exec() == QDialog.DialogCode.Accepted and save_applied.get("ok"):
-            self.show_ok_notice("프롬프트 저장 완료", "쯔꾸르 프롬프트 설정이 저장되었습니다.")
-
-
+            self.show_ok_notice("프롬프트 저장 완료", "게임 프롬프트 설정이 저장되었습니다.")
 
     def open_maker_character_profiles_dialog(self):
         """현재 쯔꾸르 프로젝트의 등장인물/이미지 후보/대표 대사를 한곳에서 파악한다."""
@@ -4256,29 +3816,89 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         project_root = Path(project_dir)
         game_root = project_root / MAKER_CLONE_DIR
 
+        profile_pixmap_cache = {}
+
+        def _profile_asset_pixmap(rel_path):
+            rel = str(rel_path or "").strip().replace("\\", "/")
+            if not rel:
+                return QPixmap()
+            resolved = None
+            try:
+                # The shared preview resolver also decrypts *.png_ / *.rpgmvp
+                # into the project asset cache without touching the game files.
+                resolved, _diag = self._maker_preview_resolve_asset_path(rel, subdirs=("",))
+            except Exception:
+                resolved = None
+            path = Path(resolved) if resolved is not None else (game_root / rel)
+            return QPixmap(str(path))
+
         def candidate_pixmap(candidate):
             try:
-                rel = str((candidate or {}).get("rel_path") or "").strip().replace("\\", "/")
-                if not rel:
-                    return QPixmap()
-                resolved = None
-                diag = {}
-                try:
-                    # Use the same RPG Maker image resolver as the map preview.
-                    # This supports deployed/encrypted assets such as *.png_ and *.rpgmvp
-                    # by decrypting them into maker_meta/asset_cache for display only.
-                    resolved, diag = self._maker_preview_resolve_asset_path(rel, subdirs=("",))
-                except Exception:
-                    resolved = None
-                if resolved is None:
-                    path = game_root / rel
+                cand = candidate or {}
+                layers = [x for x in (cand.get("layers") or []) if isinstance(x, dict) and x.get("rel_path")]
+                cache_key = (
+                    str(cand.get("kind") or ""),
+                    str(cand.get("rel_path") or ""),
+                    int(cand.get("index") or 0),
+                    tuple(
+                        (
+                            str(x.get("role") or ""),
+                            str(x.get("rel_path") or ""),
+                            int(x.get("x") or 0),
+                            int(x.get("y") or 0),
+                            float(x.get("opacity") if x.get("opacity") is not None else 1.0),
+                        )
+                        for x in layers
+                    ),
+                )
+                cached = profile_pixmap_cache.get(cache_key)
+                if isinstance(cached, QPixmap) and not cached.isNull():
+                    return cached
+
+                if layers:
+                    loaded = []
+                    min_x = 0
+                    min_y = 0
+                    max_x = 0
+                    max_y = 0
+                    for layer in layers:
+                        pix = _profile_asset_pixmap(layer.get("rel_path"))
+                        if pix.isNull():
+                            continue
+                        x = int(layer.get("x") or 0)
+                        y = int(layer.get("y") or 0)
+                        loaded.append((layer, pix, x, y))
+                        min_x = min(min_x, x)
+                        min_y = min(min_y, y)
+                        max_x = max(max_x, x + pix.width())
+                        max_y = max(max_y, y + pix.height())
+                    if not loaded:
+                        return QPixmap()
+                    canvas = QPixmap(max(1, max_x - min_x), max(1, max_y - min_y))
+                    canvas.fill(Qt.GlobalColor.transparent)
+                    painter = QPainter(canvas)
+                    try:
+                        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                        for layer, pix, x, y in loaded:
+                            try:
+                                opacity = float(layer.get("opacity") if layer.get("opacity") is not None else 1.0)
+                            except Exception:
+                                opacity = 1.0
+                            painter.setOpacity(max(0.0, min(1.0, opacity)))
+                            painter.drawPixmap(x - min_x, y - min_y, pix)
+                    finally:
+                        painter.end()
+                    pix = canvas
                 else:
-                    path = Path(resolved)
-                pix = QPixmap(str(path))
-                if pix.isNull():
-                    return pix
-                crop_type = str((candidate or {}).get("crop_type") or "full")
-                idx = int((candidate or {}).get("index") or 0)
+                    rel = str(cand.get("rel_path") or "").strip().replace("\\", "/")
+                    if not rel:
+                        return QPixmap()
+                    pix = _profile_asset_pixmap(rel)
+                    if pix.isNull():
+                        return pix
+
+                crop_type = str(cand.get("crop_type") or "full")
+                idx = int(cand.get("index") or 0)
                 if crop_type == "face":
                     cols, rows = 4, 2
                     cw = max(1, pix.width() // cols)
@@ -4287,8 +3907,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                     y = (idx // cols) * ch
                     pix = pix.copy(x, y, cw, ch)
                 elif crop_type == "character":
-                    # RPG Maker character sheets are usually 4x2 character blocks,
-                    # except files starting with '$', which contain one character.
+                    rel = str(cand.get("rel_path") or "")
                     name = Path(rel).name
                     if not name.startswith("$"):
                         cols, rows = 4, 2
@@ -4297,6 +3916,8 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                         x = (idx % cols) * cw
                         y = (idx // cols) * ch
                         pix = pix.copy(x, y, cw, ch)
+                if not pix.isNull():
+                    profile_pixmap_cache[cache_key] = pix
                 return pix
             except Exception:
                 return QPixmap()
@@ -4342,9 +3963,11 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
             imgs = list((profile or {}).get("images") or [])
             for r, cand in enumerate(imgs):
                 image_table.insertRow(r)
+                layer_paths = [str(x.get("rel_path") or "") for x in (cand.get("layers") or []) if isinstance(x, dict) and x.get("rel_path")]
+                file_text = " + ".join(layer_paths) if layer_paths else str(cand.get("rel_path") or "")
                 vals = [
-                    str(cand.get("label") or cand.get("kind") or ""),
-                    str(cand.get("rel_path") or ""),
+                    self.tr_ui(str(cand.get("label") or cand.get("kind") or "")),
+                    file_text,
                     f"{float(cand.get('confidence') or 0.0) * 100:.0f}%",
                     str(cand.get("count") or 0),
                     " / ".join(str(x) for x in (cand.get("evidences") or [])[:2]),
@@ -4770,6 +4393,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         work_menu.addAction(self.actions["work_scan_maker_game"])
         work_menu.addAction(self.actions["paint_reanalyze"])
         work_menu.addAction(self.actions["work_translate"])
+        # 게임 반영은 프로젝트 저장(Ctrl+S)으로 통합됨.
         if "work_restore_edge_control_codes_current" in self.actions:
             work_menu.addAction(self.actions["work_restore_edge_control_codes_current"])
         work_menu.addAction(self.actions["work_inpaint"])
@@ -4831,6 +4455,8 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         db_menu = menubar.addMenu(self.tr_ui("DB번역")); self.db_menu = db_menu
         if "option_maker_database_translation" in self.actions:
             db_menu.addAction(self.actions["option_maker_database_translation"])
+        if "db_maker_plugin_translation" in self.actions:
+            db_menu.addAction(self.actions["db_maker_plugin_translation"])
         if "db_maker_character_name_translation" in self.actions:
             db_menu.addAction(self.actions["db_maker_character_name_translation"])
 
@@ -5147,7 +4773,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
 
         self.btn_page_add = QToolButton()
         self.btn_page_add.setText("+")
-        self.btn_page_add.setToolTip(self.native_tooltip_html("게임 가져오기", self.shortcut_text_for_key("project_import_maker_game", "Alt+O"), "현재 프로젝트에 RPG Maker MV/MZ 게임 폴더를 클론하고 맵 페이지를 재구성합니다."))
+        self.btn_page_add.setToolTip(self.native_tooltip_html("게임 가져오기", self.shortcut_text_for_key("project_import_maker_game", "Alt+O"), "현재 프로젝트에 RPG Maker MV/MZ JSON 게임 폴더를 클론하고 맵 페이지를 재구성합니다. www/resources/app.nw/macOS .app 구조도 감지합니다."))
         self.btn_page_add.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_page_add.setFixedSize(32, 28)
         self.btn_page_add.clicked.connect(self.import_maker_game_action)
@@ -5158,6 +4784,9 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         page_tab_layout.addWidget(self.btn_page_add, 0)
         vl.addWidget(self.page_tab_container)
 
+        # 좌측 캔버스 공통 옵션바.
+        # 일반 모드에서는 우측 끝의 [프리뷰 보기]만 표시하고, DB/플러그인/화자
+        # 모드에서는 프리뷰를 완전히 끈 채 해당 모드 나가기 버튼을 표시한다.
         self.maker_database_mode_bar = QFrame()
         self.maker_database_mode_bar.setObjectName("MakerDatabaseModeBar")
         self.maker_database_mode_bar.setFixedHeight(34)
@@ -5170,14 +4799,21 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         self.lbl_maker_database_mode.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.lbl_maker_database_mode_detail = QLabel(self.tr_ui(""))
         self.lbl_maker_database_mode_detail.setObjectName("MakerDatabaseModeDetail")
-        self.lbl_maker_database_mode_detail.hide()
+        self.lbl_maker_database_mode_detail.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.btn_exit_maker_database_mode = QPushButton(self.tr_ui("데이터베이스 모드 나가기"))
         self.btn_exit_maker_database_mode.setFixedHeight(26)
         self.btn_exit_maker_database_mode.clicked.connect(self.exit_maker_database_mode)
+        self.cb_maker_preview_visible = QCheckBox(self.tr_ui("프리뷰 보기"))
+        self.cb_maker_preview_visible.setObjectName("MakerPreviewVisibleCheckBox")
+        self.cb_maker_preview_visible.setChecked(bool(getattr(self, "maker_preview_enabled", True)))
+        self.cb_maker_preview_visible.setToolTip(self.tr_ui("끄면 일반 대사 프리뷰 생성, 캐시 준비, 선택 행 갱신을 모두 중단합니다."))
+        self.cb_maker_preview_visible.toggled.connect(self.on_maker_preview_visibility_toggled)
         db_mode_lay.addWidget(self.lbl_maker_database_mode, 0)
+        db_mode_lay.addWidget(self.lbl_maker_database_mode_detail, 0)
         db_mode_lay.addStretch(1)
         db_mode_lay.addWidget(self.btn_exit_maker_database_mode, 0)
-        self.maker_database_mode_bar.hide()
+        db_mode_lay.addWidget(self.cb_maker_preview_visible, 0)
+        self.maker_database_mode_bar.show()
         vl.addWidget(self.maker_database_mode_bar)
 
         self._refreshing_page_tabs = False
@@ -5518,61 +5154,28 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         except Exception:
             pass
 
-        # 데이터베이스 모드 전용 좌측 프리뷰.
-        # 일반 맵 프리뷰와 분리해서 DB 모드에서는 이 패널만 표시한다.
+        # DB/플러그인/화자 모드는 시각 프리뷰를 만들지 않는다.
+        # 왼쪽은 순수 데이터 작업을 위한 검은 빈 캔버스로만 유지한다.
         self.maker_database_preview_panel = QFrame()
         self.maker_database_preview_panel.setObjectName("MakerDatabasePreviewPanel")
         self.maker_database_preview_panel.setMinimumHeight(260)
         self.maker_database_preview_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        db_preview_lay = QVBoxLayout(self.maker_database_preview_panel)
-        db_preview_lay.setContentsMargins(12, 10, 12, 10)
-        db_preview_lay.setSpacing(6)
-        self.lbl_maker_database_preview_title = QLabel(self.tr_ui("데이터베이스 프리뷰"))
-        self.lbl_maker_database_preview_title.setObjectName("MakerDatabasePreviewTitle")
-        self.lbl_maker_database_preview_title.setWordWrap(True)
-        self.lbl_maker_database_preview_title.hide()
-        self.lbl_maker_database_preview_subtitle = QLabel(self.tr_ui("오른쪽 표에서 DB 항목을 선택하면 이곳에 표시됩니다."))
-        self.lbl_maker_database_preview_subtitle.setObjectName("MakerDatabasePreviewSubtitle")
-        self.lbl_maker_database_preview_subtitle.setWordWrap(True)
-        self.lbl_maker_database_preview_subtitle.hide()
-        # DB 프리뷰는 일반 맵 프리뷰처럼 "렌더된 이미지"로 다룬다.
-        # QScrollArea + QLabel 조합으로 Ctrl+휠 확대/축소와 스크롤을 지원한다.
-        self.maker_database_preview_scroll = QScrollArea()
-        self.maker_database_preview_scroll.setObjectName("MakerDatabasePreviewScroll")
-        self.maker_database_preview_scroll.setWidgetResizable(False)
-        self.maker_database_preview_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.maker_database_preview_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.maker_database_preview_scroll.setStyleSheet("QScrollArea#MakerDatabasePreviewScroll { background:#050608; border:1px solid #24252b; }")
-        self.lbl_maker_database_preview_canvas = QLabel("")
-        self.lbl_maker_database_preview_canvas.setObjectName("MakerDatabasePreviewCanvas")
-        self.lbl_maker_database_preview_canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_maker_database_preview_canvas.setMinimumSize(320, 240)
-        self.lbl_maker_database_preview_canvas.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.lbl_maker_database_preview_canvas.setStyleSheet("background:#050608; color:#9b949a;")
-        self.lbl_maker_database_preview_canvas.installEventFilter(self)
-        try:
-            self.maker_database_preview_scroll.viewport().installEventFilter(self)
-        except Exception:
-            pass
-        self.maker_database_preview_scroll.setWidget(self.lbl_maker_database_preview_canvas)
-        self._maker_database_preview_zoom = 1.0
-        self._maker_database_preview_fit_mode = True
-
-        # 구버전 호환용 라벨. 실제 DB 프리뷰는 캔버스 QLabel을 사용한다.
-        self.maker_database_preview_card = QFrame()
-        self.maker_database_preview_card.setObjectName("MakerDatabasePreviewCard")
-        self.maker_database_preview_card.hide()
-        self.lbl_maker_database_preview_image = QLabel("")
-        self.lbl_maker_database_preview_kind = QLabel("")
-        self.lbl_maker_database_preview_source = QLabel("")
-        self.lbl_maker_database_preview_translation = QLabel("")
-        self.lbl_maker_database_preview_hint = QLabel("")
-
-        db_preview_lay.addWidget(self.lbl_maker_database_preview_title, 0)
-        db_preview_lay.addWidget(self.lbl_maker_database_preview_subtitle, 0)
-        db_preview_lay.addWidget(self.maker_database_preview_scroll, 1)
+        self.maker_database_preview_panel.setStyleSheet("QFrame#MakerDatabasePreviewPanel { background:#000000; border:none; }")
         self.maker_database_preview_panel.hide()
-        vl.addWidget(self.maker_database_preview_panel)
+        vl.addWidget(self.maker_database_preview_panel, 1)
+
+        # 제거된 구형 데이터 프리뷰 위젯을 참조하는 호환 코드가 안전하게
+        # 건너뛸 수 있도록 명시적인 빈 참조만 유지한다.
+        self.lbl_maker_database_preview_title = None
+        self.lbl_maker_database_preview_subtitle = None
+        self.maker_database_preview_scroll = None
+        self.lbl_maker_database_preview_canvas = None
+        self.maker_database_preview_card = None
+        self.lbl_maker_database_preview_image = None
+        self.lbl_maker_database_preview_kind = None
+        self.lbl_maker_database_preview_source = None
+        self.lbl_maker_database_preview_translation = None
+        self.lbl_maker_database_preview_hint = None
 
         ll.addWidget(vc)
 
@@ -5729,6 +5332,8 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         self.cb_trans_provider.addItem("DeepSeek", "deepseek")
         self.cb_trans_provider.addItem("Google", "google")
         self.cb_trans_provider.addItem("Gemini", "gemini")
+        self.cb_trans_provider.addItem("Gemini Flex/Batch", "gemini_deferred")
+        self.cb_trans_provider.addItem("LM Studio", "lm_studio")
         self.cb_trans_provider.addItem("Custom", "custom")
         self.set_combo_current_data(self.cb_trans_provider, getattr(self.api_settings, "selected_translation_provider", "openai"))
         self.cb_trans_provider.currentIndexChanged.connect(self.on_translation_provider_changed)
@@ -5748,7 +5353,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         self.cb_show_final_text.setFixedWidth(104)
         self.cb_show_final_text.toggled.connect(self.on_show_final_text_toggled)
 
-        self.btn_translate = QPushButton("🌐 번역", clicked=self.trans)
+        self.btn_translate = QPushButton("🌐 번역", clicked=self.on_translate_button_clicked)
         _fixed_button(self.btn_translate, 82)
         self.btn_inpaint = QPushButton("🎨 인페인팅", clicked=self.run_inpainting, styleSheet="QPushButton { background:#2f5d4a;color:#ffffff;border:1px solid #5f8d70;border-radius:0px;padding:4px 8px;font-weight:700; } QPushButton:hover { background:#3b6e57; border-color:#7fa68d; } QPushButton:pressed { background:#254838; }")
         _fixed_button(self.btn_inpaint, 95)
@@ -5764,12 +5369,31 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         self.btn_maker_ctrl_restore_all.clicked.connect(self.restore_edge_control_codes_all)
         _fixed_button(self.btn_maker_ctrl_restore_all, 98)
 
+        self.cb_maker_control_code_auto_apply = QCheckBox(self.tr_ui("번역 시 자동 반영"))
+        self.cb_maker_control_code_auto_apply.setChecked(
+            bool(getattr(self, "maker_control_code_auto_apply_enabled", True))
+        )
+        self.cb_maker_control_code_auto_apply.setToolTip(
+            self.tr_ui("번역 시 자동으로 제어코드를 원문과 유사하게 복원합니다.")
+        )
+        self.cb_maker_control_code_auto_apply.setFixedHeight(26)
+        self.cb_maker_control_code_auto_apply.setMinimumWidth(132)
+        self.cb_maker_control_code_auto_apply.toggled.connect(
+            self.on_maker_control_code_auto_apply_toggled
+        )
+
         self.lbl_maker_preview_refresh = _short_label(self.tr_ui("프리뷰"), 46)
         self.lbl_maker_preview_refresh.setToolTip(self.tr_ui("현재 맵의 프리뷰 이미지를 상태/캐시와 무관하게 다시 만듭니다."))
         self.btn_maker_preview_refresh = QPushButton(self.tr_ui("프리뷰 갱신"))
         self.btn_maker_preview_refresh.setToolTip(self.tr_ui("현재 맵의 프리뷰 이미지를 상태/캐시와 무관하게 다시 만듭니다."))
         self.btn_maker_preview_refresh.clicked.connect(self.force_refresh_maker_preview_action)
         _fixed_button(self.btn_maker_preview_refresh, 94)
+
+        self.btn_maker_apply_game = QPushButton(self.tr_ui("프로젝트 저장"))
+        self.btn_maker_apply_game.setToolTip(self.tr_ui("프로젝트 저장 기능으로 통합되었습니다."))
+        self.btn_maker_apply_game.clicked.connect(self.apply_maker_writeback_to_game_action)
+        _fixed_button(self.btn_maker_apply_game, 104)
+        self.btn_maker_apply_game.hide()
 
         ai_line.addWidget(_short_label("엔진", 32))
         ai_line.addWidget(self.cb_trans_provider)
@@ -5778,12 +5402,14 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         ai_line.addWidget(self.lbl_maker_ctrl_restore)
         ai_line.addWidget(self.btn_maker_ctrl_restore_current)
         ai_line.addWidget(self.btn_maker_ctrl_restore_all)
+        ai_line.addWidget(self.cb_maker_control_code_auto_apply)
         try:
             self.lbl_maker_preview_refresh.hide()
             self.btn_maker_preview_refresh.hide()
         except Exception:
             pass
         ai_line.addStretch(1)
+        # 게임 반영 버튼은 Ctrl+S 프로젝트 저장으로 통합되어 숨긴다.
         ai_line_widget = _row_widget(ai_line, "RightAiControlLine")
         self.right_ai_line_widget = ai_line_widget
         self.right_control_title = None
@@ -5823,7 +5449,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
             self.tab.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
             self.tab.viewport().setFocusPolicy(Qt.FocusPolicy.StrongFocus)
             self.tab.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-            self.tab.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+            self.tab.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self.tab.setDragEnabled(False)
             self.tab.setAcceptDrops(False)
             self.tab.viewport().setAcceptDrops(False)
@@ -5855,12 +5481,12 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         self.tab.setDropIndicatorShown(False)
         self.tab.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tab.customContextMenuRequested.connect(self.on_table_context_menu)
-        self.tab.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        self.tab.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tab.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tab.setStyleSheet(
             "QTableWidget { background:#171719; color:#E8E1E6; gridline-color:#2C282D; border:1px solid #293241; border-radius:0px; }"
             "QTableWidget::item { padding:3px 4px; }"
-            "QTableWidget::item:selected { background:#8A4A52; color:#ffffff; }"
+            "QTableWidget::item:selected { background:#5B3136; color:#FFFFFF; }"
             "QTableWidget QTableCornerButton::section { background:#141416; border:1px solid #293241; }"
         )
         rl.addWidget(self.tab, 1)
@@ -5871,7 +5497,10 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         self.tab.setColumnWidth(1, 28)
         self.tab.setWordWrap(True)
         self.tab.verticalHeader().setVisible(False)
-        self.tab.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        # Maker/map bulk text changes update cell text immediately but never
+        # recalculate all row heights.  ref_tab() sizes rows once on load and
+        # plain single-row activation calls resizeRowToContents(row).
+        self.tab.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
 
 
         # 작업 로그는 하단에 작은 조작 막대를 두고, 막대의 버튼으로 접고 펼친다.
@@ -6149,6 +5778,11 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                 btn.setEnabled(can_execute_import)
         except Exception:
             pass
+        try:
+            if hasattr(self, "sync_maker_writeback_ui_state"):
+                self.sync_maker_writeback_ui_state()
+        except Exception:
+            pass
         return can_execute_import
 
     def _ensure_maker_db_menu(self):
@@ -6252,6 +5886,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
             if m is not None:
                 m.clear()
                 add_if(m, "option_maker_database_translation")
+                add_if(m, "db_maker_plugin_translation")
                 add_if(m, "db_maker_character_name_translation")
         except Exception:
             pass
@@ -6641,8 +6276,8 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
             pass
         return False
 
-    def tr_ui(self, text):
-        return translate_ui_text(text, getattr(self, "ui_language", LANG_KO))
+    def tr_ui(self, text, **kwargs):
+        return translate_ui_text(text, getattr(self, "ui_language", LANG_KO), **kwargs)
 
     def tr_msg(self, text):
         return translate_ui_dynamic_text(text, getattr(self, "ui_language", LANG_KO))
@@ -6777,8 +6412,8 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
             "project_open_json": "프로젝트 열기",
             "project_show_launcher": "홈화면으로 가기",
             "project_exit": "프로젝트 나가기",
-            "project_save": "내보내기",
-            "project_save_as": "다른 이름으로 내보내기(호환)",
+            "project_save": "프로젝트 저장",
+            "project_save_as": "YSBG 내보내기",
             "project_recover_last_work": "복구하기",
             "option_settings_overview": "설정 / 옵션",
             "edit_undo": "텍스트 입력 취소",
@@ -6794,6 +6429,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
             "work_page_delete_all": "일괄 페이지탭 삭제",
             "work_open_current_project_folder": "현재 프로젝트의 작업 폴더로 이동하기",
             "work_scan_maker_game": "게임 분석",
+            "work_apply_maker_game_json": "프로젝트 저장(구버전)",
             "work_analyze": "분석(호환)",
             "paint_reanalyze": "재분석",
             "work_quick_ocr": "빠른 OCR 설정",
@@ -6801,6 +6437,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
             "work_text_number_width": "텍스트 넘버 크기 변경",
             "work_translate": "번역",
             "work_restore_edge_control_codes_current": "맵 제어코드 복원",
+            "work_toggle_maker_control_code_auto_apply": "번역 시 제어코드 자동 반영",
             "work_refresh_maker_preview": "프리뷰 갱신",
             "work_inpaint": "인페인팅",
             "work_import_clean_background": "클린본 불러오기",
@@ -6839,7 +6476,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
             "setting_interface_tooltips": "인터페이스 툴팁 표시",
             "setting_file_path_visibility": "파일 경로 표시",
             "option_api_settings": "API 관리",
-            "option_translation_prompt": "공통 번역 프롬프트",
+            "option_translation_prompt": "게임 프롬프트 관리(호환)",
             "option_maker_character_prompts": "게임 프롬프트 관리",
             "option_maker_translation_settings": "줄내림 옵션",
             "option_maker_refresh_runtime_profile": "쯔꾸르 표시 환경 갱신",
@@ -6853,11 +6490,11 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
             "option_maker_title_settings": "타이틀명 변경",
             "option_maker_terms_translation": "시스템 번역",
             "option_maker_database_translation": "데이터베이스 모드",
-            "db_maker_character_name_translation": "화자 번역",
+            "db_maker_character_name_translation": "화자 번역 모드",
             "debug_maker_database_scan": "DB 스캔 진단",
             "debug_maker_database_layer_rebuild": "DB 레이어 생성 테스트",
             "debug_maker_tile_preview_diagnose": "타일 프리뷰 진단",
-            "db_maker_plugin_translation": "플러그인 번역",
+            "db_maker_plugin_translation": "플러그인 번역 모드",
             "option_ocr_analysis_regions": "OCR 분석 범위 지정",
             "option_cleanup_outputs": "출력물 삭제",
             "option_workspace_location": "작업 폴더 위치 변경",
@@ -6921,6 +6558,14 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                         widget.setText(new_txt)
                     except Exception:
                         pass
+
+        try:
+            if hasattr(self, "cb_maker_control_code_auto_apply"):
+                self.cb_maker_control_code_auto_apply.setToolTip(
+                    self.tr_ui("번역 시 자동으로 제어코드를 원문과 유사하게 복원합니다.")
+                )
+        except Exception:
+            pass
 
         # 우측 텍스트 표 헤더
         try:
@@ -7019,6 +6664,9 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
                 self.lbl_maker_preview_refresh.setText(self.tr_ui("프리뷰"))
             if hasattr(self, "btn_maker_preview_refresh"):
                 self.btn_maker_preview_refresh.setText(self.tr_ui("프리뷰 갱신"))
+            if hasattr(self, "btn_maker_apply_game"):
+                self.btn_maker_apply_game.setText(self.tr_ui("프로젝트 저장"))
+                self.btn_maker_apply_game.setToolTip(self.tr_ui("프로젝트 저장 기능으로 통합되었습니다."))
             if hasattr(self, "btn_inpaint"):
                 self.btn_inpaint.setText(self.tr_ui("🎨 인페인팅"))
             if hasattr(self, "btn_text_cleanup"):
@@ -7479,7 +7127,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         if hasattr(self, 'tab') and self.tab:
             self.tab.setStyleSheet(
                 "QTableWidget { background:#ffffff; color:#242329; gridline-color:#E7E1E5; border:1px solid #DED8DC; border-radius:0px; }"
-                "QTableWidget::item:selected { background:#F5E8EA; color:#111827; }"
+                "QTableWidget::item:selected { background:#F5E8EA; color:#202124; }"
                 "QTableWidget QTableCornerButton::section { background:#F2EDEF; border:1px solid #DED8DC; }"
             )
             self.repaint_text_table_theme()
@@ -7674,7 +7322,7 @@ QCheckBox, QRadioButton { color:#E0DADF; spacing:9px; }
         if hasattr(self, 'tab') and self.tab:
             self.tab.setStyleSheet(
                 "QTableWidget { background:#171719; color:#E0DADF; gridline-color:#2C282D; border:1px solid #2E2A30; border-radius:0px; }"
-                "QTableWidget::item:selected { background:#8A4A52; color:#ffffff; }"
+                "QTableWidget::item:selected { background:#5B3136; color:#FFFFFF; }"
                 "QTableWidget QTableCornerButton::section { background:#141416; border:1px solid #2E2A30; }"
             )
             self.repaint_text_table_theme()

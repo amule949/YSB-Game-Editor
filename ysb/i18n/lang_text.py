@@ -46,6 +46,93 @@ def tr_shortcut(text, lang=LANG_KO, **kwargs):
 
 
 UI_KO_EN = {
+ '프리뷰 보기': 'Show Preview',
+ '끄면 일반 대사 프리뷰 생성, 캐시 준비, 선택 행 갱신을 모두 중단합니다.': 'When off, dialogue preview generation, cache preparation, and selected-row refresh are all stopped.',
+ '🖥️ 프리뷰 보기: OFF': '🖥️ Show Preview: OFF',
+ '🖥️ 프리뷰 보기: ON — 현재 선택된 단일 대사만 갱신': '🖥️ Show Preview: ON — refreshed only the currently selected dialogue row',
+ '🖥️ 프리뷰 보기: ON — 단일 대사를 선택하면 표시': '🖥️ Show Preview: ON — select one dialogue row to display it',
+ '열린 프로젝트가 없습니다.': 'No project is open.',
+ '플러그인 페이지 {count}개를 AI 번역할까요?\n번역 완료 후 원래 플러그인 데이터 위치에 바로 반영됩니다.': 'Translate {count} plugin pages with AI?\nWhen complete, translations will be written directly to their original plugin data locations.',
+ '데이터베이스 페이지 {count}개만 먼저 AI 번역할까요?\n번역 완료 후 클론 게임 JSON에 바로 반영됩니다.': 'Translate the selected {count} database pages with AI?\nWhen complete, translations will be written directly to the cloned game JSON.',
+ '🧩 플러그인 번역 시작: {count}페이지': '🧩 Plugin translation started: {count} pages',
+ '🧩 플러그인 번역 레이어 생성: {count}개 ({reason})': '🧩 Plugin translation layer created: {count} pages ({reason})',
+ '⚠️ 플러그인 텍스트 추출 실패: {error}': '⚠️ Failed to extract plugin text: {error}',
+ '⚠️ 플러그인 번역 레이어 확인 실패: {error}': '⚠️ Failed to prepare the plugin translation layer: {error}',
+ '🧩 플러그인 번역 모드 진입': '🧩 Entered Plugin Translation Mode',
+ '↩️ 플러그인 번역 모드 나가기': '↩️ Exited Plugin Translation Mode',
+ '⚠️ 플러그인 번역 모드 진입 실패: {error}': '⚠️ Failed to enter Plugin Translation Mode: {error}',
+ '플러그인 페이지': 'Plugin Page',
+ '전체 플러그인 페이지': 'All Plugin Pages',
+ '플러그인 페이지 선택': 'Select Plugin Pages',
+ '작업할 플러그인 페이지 범위를 선택하세요.': 'Select the range of plugin pages to process.',
+ '쉼표와 범위를 섞어서 입력할 수 있습니다. 번호는 현재 플러그인 탭 순서 기준입니다.': 'You can mix commas and ranges. Numbers follow the current plugin tab order.',
+ '플러그인 번역': 'Plugin Translation',
+ '플러그인 번역 페이지가 없습니다.': 'There are no plugin translation pages.',
+ '플러그인 번역 모드에서 번역할 플러그인 페이지가 없습니다.': 'There are no plugin pages to translate in Plugin Translation Mode.',
+ '데이터베이스 번역 페이지가 없습니다.': 'There are no database translation pages.',
+ '플러그인 번역 모드': 'Plugin Translation Mode',
+ '플러그인 번역 모드로 전환하지 못했습니다.': 'Could not switch to Plugin Translation Mode.',
+ '플러그인 번역 모드 나가기': 'Exit Plugin Translation Mode',
+ '번역 가능한 플러그인 문구를 찾지 못했습니다.': 'No translatable plugin text was found.',
+ '플러그인 목록': 'Plugin List',
+ '플러그인 항목 없음': 'No Plugin Items',
+ '플러그인 탭': 'Plugin Tab',
+ '현재 탭의 플러그인 항목만 번역합니다.': 'Only plugin items in the current tab will be translated.',
+ '플러그인 데이터 미리보기': 'Plugin Data Preview',
+ '이 플러그인 탭에는 표시할 텍스트가 없습니다.': 'This plugin tab has no text to display.',
+ '플러그인의 원본 위치와 번역값을 표시합니다.': 'Shows the plugin source location and translation value.',
+ '번역문은 원래 플러그인 데이터 위치에 다시 저장됩니다.': 'The translation is written back to its original plugin data location.',
+ '현재 플러그인 텍스트': 'Current Plugin Text',
+ '데이터베이스 모드': 'Database Mode',
+ '데이터베이스 모드 나가기': 'Exit Database Mode',
+ '현재 탭의 DB 항목만 번역합니다.': 'Only database items in the current tab will be translated.',
+ '데이터베이스 프리뷰': 'Database Preview',
+ '데이터베이스 목록': 'Database List',
+ '데이터베이스 항목 없음': 'No Database Items',
+ '데이터베이스 탭': 'Database Tab',
+ '현재 DB 텍스트': 'Current Database Text',
+ '이 DB 탭에는 표시할 텍스트가 없습니다.': 'This database tab has no text to display.',
+ '배우 데이터 미리보기': 'Actor Data Preview',
+ '얼굴 이미지 없음': 'No Face Image',
+ '별명': 'Nickname',
+ '직업': 'Class',
+ '초기 레벨': 'Initial Level',
+ '선택 필드': 'Selected Field',
+ '표시값': 'Display Value',
+ '원본 파일': 'Source File',
+ '원본 위치': 'Source Location',
+ '번역문 / 표시값': 'Translation / Display Value',
+ '데이터 미리보기': 'Data Preview',
+ '실제 게임 화면을 흉내 내지 않고 원본 데이터만 표시합니다.': 'Shows only the source data without imitating the in-game screen.',
+ 'Actors.json의 실제 데이터만 표시합니다. 게임의 스테이터스 화면을 재현하지 않습니다.': 'Shows only the actual Actors.json data. It does not recreate the in-game status screen.',
+ '플러그인 텍스트 페이지 구성 중...': 'Building plugin text pages...',
+ '정말 번역을 취소하시겠습니까?\n\n이미 완료되어 반영된 청크는 유지합니다.\n현재 API 요청은 응답이 돌아와도 반영하지 않고, 이후 청크는 시작하지 않습니다.': 'Do you really want to cancel translation?\n\nChunks that have already completed and been applied will be kept.\nThe current API response will be ignored, and no later chunks will be started.',
+ '번역 취소됨. 완료된 청크는 유지하고, 현재 응답과 이후 청크는 반영하지 않습니다.': 'Translation canceled. Completed chunks are kept; the current response and later chunks will not be applied.',
+ '⏹️ 번역 취소: 완료된 청크는 유지하고 현재 응답과 이후 청크는 버립니다.': '⏹️ Translation canceled: completed chunks are kept, while the current response and later chunks are discarded.',
+ '번역 청크 결과 적용에 실패했습니다.': 'Failed to apply the translation chunk result.',
+ '취소된 번역 작업입니다.': 'This translation job has been canceled.',
+ '번역 청크 결과를 프로젝트에 적용하지 못했습니다.': 'Could not apply the translation chunk result to the project.',
+ '✅ 번역 완료: {applied}개 항목을 청크 순서대로 반영했습니다.': '✅ Translation complete: applied {applied} items sequentially by chunk.',
+ '⏹️ 번역 취소됨: 이미 반영된 {applied}개 결과는 유지하고 이후 청크는 중단했습니다.': '⏹️ Translation canceled: kept {applied} already-applied results and stopped the remaining chunks.',
+ '대사별 프리뷰 구조를 생성하는 중입니다...': 'Building per-dialogue preview structures...',
+ '대사 프리뷰 초기 생성': 'Initial Dialogue Preview Build',
+ '대사별 프리뷰 구조 생성 중... ({current}/{total})': 'Building dialogue preview structures... ({current}/{total})',
+ '대사별 프리뷰 구조 생성 완료': 'Dialogue preview structure build complete',
+ '대사 프리뷰 캐시를 확인하는 중...': 'Checking dialogue preview cache...',
+ '대사별 프리뷰 구조를 준비하는 중입니다...': 'Preparing per-dialogue preview structures...',
+ '대사 프리뷰 캐시 불러오기 완료': 'Dialogue preview cache loaded',
+ '대사 프리뷰 초기 생성 완료': 'Initial dialogue preview build complete',
+ '⚠️ 대사 프리뷰 준비 실패: {error}': '⚠️ Failed to prepare dialogue previews: {error}',
+ '일괄 번역 취소': 'Cancel Batch Translation',
+ '정말 일괄 번역을 취소하시겠습니까?\n\n이미 번역이 끝나 반영된 맵은 유지합니다.\n현재 API 요청 중인 맵은 응답이 돌아와도 반영하지 않습니다.\n아직 시작하지 않은 맵은 번역하지 않습니다.': 'Do you really want to cancel batch translation?\n\nMaps that have already finished and been applied will be kept.\nThe current API request will be ignored even if a response comes back.\nMaps that have not started yet will not be translated.',
+ '번역 취소': 'Cancel Translation',
+ '정말 번역을 취소하시겠습니까?\n\n이미 전송된 API 응답이 돌아와도 번역문에 반영하지 않습니다.': 'Do you really want to cancel translation?\n\nAlready sent API responses will not be applied to the translation even if they return.',
+ '작업 취소': 'Cancel Task',
+ '정말 현재 작업을 취소하시겠습니까?\n\n현재 처리 중인 항목이 끝난 뒤 중단됩니다.': 'Do you really want to cancel the current task?\n\nIt will stop after the current item finishes.',
+ '취소하기': 'Cancel',
+ '계속하기': 'Continue',
+ '취소 요청됨. 현재 처리 중인 응답은 반영하지 않고 중단합니다.': 'Cancellation requested. The current response will be ignored and the task will stop.',
+ '일괄 번역 취소 요청됨. 완료된 맵은 유지하고, 현재 API 응답은 돌아와도 반영하지 않습니다.': 'Batch translation cancellation requested. Completed maps will be kept, and the current API response will be ignored even if it returns.',
  '엔진과 표시 환경을 확인하는 중...': 'Checking the engine and display environment...',
  '배우/화자 힌트를 읽는 중...': 'Reading actor/speaker hints...',
  '작업 폴더 구조를 준비하는 중...': 'Preparing the work folder structure...',
@@ -102,6 +189,15 @@ UI_KO_EN = {
  '수동처리 필요': 'Manual Handling Needed',
  '없음': 'None',
  '번역/API에는 제어코드를 제거한 원문만 사용합니다.': 'Translation/API uses only the source text with control codes removed.',
+ '번역 시 자동 반영': 'Auto-apply on translation',
+ '번역 시 제어코드 자동 반영': 'Auto-apply control codes on translation',
+ '번역 시 자동으로 제어코드를 원문과 유사하게 복원합니다.': 'Automatically restores control codes in positions similar to the source during translation.',
+ '🧩 번역 시 제어코드 자동 반영: ON': '🧩 Control-code auto-apply on translation: ON',
+ '🧩 번역 시 제어코드 자동 반영: OFF': '🧩 Control-code auto-apply on translation: OFF',
+ '🎮 쯔꾸르 AI 번역: 제어코드를 안전 토큰으로 분리하고 번역 의미에 맞춰 자동 반영합니다.': '🎮 RPG Maker AI translation: control codes are separated into safe tokens and automatically placed according to translated meaning.',
+ '⚠️ 제어코드 자동 반영에 실패한 {count}개 대사는 안전을 위해 순수 번역문으로 유지했습니다.': '⚠️ {count} dialogue lines failed control-code auto-apply and were kept as plain translations for safety.',
+ 'ℹ️ AI 토큰 검증에 실패한 {count}개 대사는 안전한 앞/뒤 제어코드만 자동 복원했습니다.': 'ℹ️ For {count} dialogue lines that failed AI token validation, only safe leading/trailing control codes were restored.',
+ '⚠️ 제어코드 자동 반영 실패 {count}개: 안전을 위해 순수 번역문으로 유지': '⚠️ Control-code auto-apply failed for {count} items: kept plain translations for safety',
  '상태': 'Status',
  '정리 원문': 'Clean Source',
  '⚠️ 쯔꾸르 선택 프리뷰 갱신 실패: {error}': '⚠️ Failed to refresh Maker selection preview: {error}',
@@ -537,7 +633,7 @@ UI_KO_EN = {
  '자동저장 모드': 'Auto Save Mode',
  '자동저장 모드 OFF': 'Auto Save Mode OFF',
  '자동저장 모드 OFF: 변경 사항은 작업 캐시에만 저장됩니다.': 'Auto Save Mode OFF: changes are saved only to the work cache.',
-'자동저장 모드는 폐지되었습니다. 변경 사항은 작업 캐시에 보관되고, 프로젝트 내보내기 시 YSBG에 확정됩니다.': 'Auto Save has been removed. Changes are kept in the work cache and are committed to YSBG when you save the project.',
+'자동저장 모드는 폐지되었습니다. 변경 사항은 작업 캐시에 보관되고, 프로젝트 저장 시 작업 폴더에 저장됩니다. YSBG는 내보내기에서만 생성됩니다.': 'Auto Save has been removed. Changes are kept in the work cache and saved to the work folder when you save the project. YSBG packages are created only through export.',
  '자동저장 모드 ON': 'Auto Save Mode ON',
  '자동저장 모드 ON: 변경 사항이 실제 프로젝트에 바로 저장됩니다.': 'Auto Save Mode ON: changes are saved directly to the actual project.',
  '자동저장 전환': 'Switch Auto Save',
@@ -2149,7 +2245,7 @@ UI_EN_KO.update({en: ko for ko, en in _OUTPUT_RENDER_OPTIONS_KO_EN.items()})
 # YSB Maker Editor / RPG Maker import branch strings
 _MAKER_IMPORT_KO_EN = {
     '게임 가져오기': 'Import Game',
-    '가져올 RPG Maker MV/MZ 게임 폴더 선택': 'Select RPG Maker MV/MZ Game Folder to Import',
+    '가져올 RPG Maker MV/MZ JSON 게임 폴더 선택': 'Select RPG Maker MV/MZ JSON Game Folder to Import',
     '게임 가져오기 실패': 'Failed to Import Game',
     '쯔꾸르 게임을 가져오지 못했습니다.': 'Could not import the RPG Maker game.',
     '게임 다시 가져오기': 'Re-import Game',
@@ -2159,7 +2255,7 @@ _MAKER_IMPORT_KO_EN = {
     '취소': 'Cancel',
     '게임 분석': 'Analyze Game',
     '일괄 게임 분석': 'Batch Analyze Game',
-    '프로젝트 이름과 생성 위치를 먼저 확정하고, 게임 클론을 넣을 빈 프로젝트(.ysbg)를 만듭니다. 이후 [게임 가져오기]로 맵 페이지를 생성합니다.': 'Choose the project name and location first, then create an empty .ysbg project for the game clone. Use [Import Game] afterward to create map pages.',
+    '프로젝트 이름과 생성 위치를 먼저 확정하고, 게임 클론을 넣을 작업 폴더를 만듭니다. 이후 [게임 가져오기]로 맵 페이지를 생성합니다.': 'Choose the project name and location first, then create an empty .ysbg project for the game clone. Use [Import Game] afterward to create map pages.',
     '게임은 작업 폴더 안에 클론으로 가져옵니다.': 'The game is imported as a clone inside the work folder.',
     '엔진 자동 감지': 'Engine auto-detected',
     '신뢰도': 'confidence',
@@ -2236,8 +2332,16 @@ UI_EN_KO.update({en: ko for ko, en in _MAKER_PREVIEW_FONT_KO_EN.items()})
 
 # YSB Maker Editor / write-back to cloned RPG Maker JSON
 _MAKER_WRITEBACK_KO_EN = {
-    '쯔꾸르 JSON 저장 반영 실패': 'RPG Maker JSON Write-back Failed',
-    '번역문을 쯔꾸르 게임 파일에 반영하지 못했습니다.': 'Could not write the translated text back to the RPG Maker game files.',
+    '쯔꾸르 JSON 저장 실패': 'RPG Maker JSON Save Failed',
+    '작업용 게임 JSON을 저장하지 못했습니다.': 'Could not save the working game JSON files.',
+    '프로젝트 저장 확인': 'Confirm Project Save',
+    '저장하지 않은 변경사항이 있습니다.\n저장할까요?': 'There are unsaved changes.\nSave now?',
+    '저장': 'Save',
+    '저장 안 함': "Don't Save",
+    '프로젝트 저장이 완료되었습니다.\n\n작업 폴더와 작업용 게임 JSON을 저장했습니다.': 'Project save is complete.\n\nThe work folder and working game JSON files have been saved.',
+    '프로젝트를 저장하지 못했습니다.': 'Could not save the project.',
+    '현재 작업 폴더와 작업용 게임 JSON을 저장합니다.': 'Save the current work folder and working game JSON files.',
+    '현재 작업 폴더와 작업용 게임 JSON을 저장합니다. 단축키: Ctrl+S': 'Save the current work folder and working game JSON files. Shortcut: Ctrl+S',
     '쯔꾸르 프로젝트 복사 실패': 'RPG Maker Project Copy Failed',
     '쯔꾸르 게임 클론과 메타데이터를 새 저장 위치로 복사하지 못했습니다.': 'Could not copy the RPG Maker game clone and metadata to the new save location.',
 }
@@ -2266,6 +2370,7 @@ _MAKER_TEXT_TABLE_KO_EN = {
     '번역완료': 'Translated',
     '대사': 'Dialogue',
     '선택지': 'Choice',
+    '선택지 도움말': 'Choice Help',
     '스크롤문': 'Scrolling Text',
     '공통 이벤트': 'Common Event',
     '데이터베이스': 'Database',
@@ -2334,6 +2439,7 @@ _MAKER_CHARACTER_PROFILE_KO_EN = {
     '횟수': 'Count',
     '근거': 'Evidence',
     '이미지 후보': 'Image Candidates',
+    '플러그인 조합 스탠딩': 'Plugin Composite Standing Image',
     '등장 위치': 'Appearances',
     '맵/페이지': 'Map/Page',
     '이벤트': 'Event',
@@ -2374,6 +2480,14 @@ _MAKER_TRANSLATION_SETTINGS_KO_EN = {
     'AI 번역용 원문 줄내림 정규화 설정이 저장되었습니다.': 'Source line-break normalization settings for AI translation have been saved.',
     '쯔꾸르 AI 번역: 캐릭터 프롬프트, 제어문자 보호, 원문 줄내림 정규화를 적용합니다.': 'RPG Maker AI translation: applying character prompts, control-code handling, and source line-break normalization.',
     '쯔꾸르 AI 번역용 원문 정규화 설정창을 엽니다.': 'Open RPG Maker AI translation source normalization settings.',
+    '선택한 줄만 번역': 'Translate Selected Lines Only',
+    '선택한 줄만 번역할까요?': 'Translate only the selected lines?',
+    '현재 오른쪽 텍스트 표에서 줄이 선택되어 있습니다. 전체 대상이 아니라 선택한 줄만 번역합니다.\n\n대상: {count}줄': 'Lines are currently selected in the right text table. Only the selected lines will be translated instead of the full target set.\n\nTarget: {count} line(s)',
+    '선택한 셀만 번역': 'Translate Selected Cells Only',
+    '선택한 셀만 번역할까요?': 'Translate only the selected cells?',
+    '현재 오른쪽 텍스트 표에서 셀이 선택되어 있습니다. 전체 대상이 아니라 선택한 셀에 해당하는 줄만 번역합니다.\n\n선택 셀: {cell_count}개 / 번역 대상: {target_count}줄': 'Cells are currently selected in the right text table. Only the rows corresponding to the selected cells will be translated instead of the full target set.\n\nSelected cells: {cell_count} / Translation targets: {target_count} line(s)',
+    '선택한 셀 중 번역 가능한 원문/번역문 셀이 없습니다.': 'None of the selected cells are translatable source/translation cells.',
+    '선택한 행 중 번역 가능한 원문이 없습니다.': 'None of the selected rows have translatable source text.',
     'AI 번역 요청에 넣는 쯔꾸르 원문을 정리합니다. 원본 데이터는 유지하고, 번역 품질을 위해 요청용 줄내림만 제거할 수 있습니다.': 'Clean RPG Maker source text sent to AI translation. Original data is preserved, and only request-time line breaks can be removed for translation quality.',
 }
 UI_KO_EN.update(_MAKER_TRANSLATION_SETTINGS_KO_EN)
@@ -2463,5 +2577,318 @@ _MAKER_PROMPT_REVERSE_TEST_KO_EN = {
 UI_KO_EN.update(_MAKER_PROMPT_REVERSE_TEST_KO_EN)
 try:
     UI_EN_KO.update({en: ko for ko, en in _MAKER_PROMPT_REVERSE_TEST_KO_EN.items()})
+except Exception:
+    pass
+
+
+# LM Studio 서버 연결 인터락 문구
+_LM_STUDIO_INTERLOCK_KO_EN = {
+    'LM Studio 연결 실패': 'LM Studio Connection Failed',
+    'LM Studio Local Server에 연결할 수 없습니다.': 'Cannot connect to the LM Studio Local Server.',
+    'LM Studio > Developer > Local Server에서 서버를 켠 뒤 다시 시도해 주세요.': 'Start the server in LM Studio > Developer > Local Server, then try again.',
+    'LM Studio 서버는 켜져 있지만 로드된 모델이 없습니다.': 'The LM Studio server is running, but no model is loaded.',
+    'LM Studio에서 모델을 로드한 뒤 다시 시도해 주세요.': 'Load a model in LM Studio, then try again.',
+    '확인 주소': 'Check URL',
+}
+UI_KO_EN.update(_LM_STUDIO_INTERLOCK_KO_EN)
+try:
+    UI_EN_KO.update({en: ko for ko, en in _LM_STUDIO_INTERLOCK_KO_EN.items()})
+except Exception:
+    pass
+
+API_TR_KO_EN.update({
+    "LM Studio / Local OpenAI-Compatible": "LM Studio / Local OpenAI-Compatible",
+    "LM Studio의 Developer 서버를 켠 뒤 사용할 수 있습니다. 기본 주소는 http://localhost:1234/v1 입니다. 모델은 LM Studio에서 먼저 다운로드/로드해야 합니다. API Key는 보통 비워도 됩니다.": "Use this after starting the LM Studio Developer server. The default address is http://localhost:1234/v1. Download/load a model in LM Studio first. API Key can usually be left empty.",
+    "비워도 됨 / optional": "Optional / can be empty",
+    "LM Studio에서 로드한 모델명": "Model name loaded in LM Studio",
+    "LM Studio": "LM Studio",
+})
+
+
+# Gemini Flex / Batch 지연 번역 청크 현황 창
+_GEMINI_DELAYED_TRANSLATION_KO_EN = {
+    '청크': 'Chunk',
+    '대상 범위': 'Target Range',
+    '방식': 'Mode',
+    '상태': 'Status',
+    '경과 시간': 'Elapsed',
+    '재시도 횟수': 'Retries',
+    '재시도': 'Retry',
+    '상세': 'Details',
+    '{seconds}초': '{seconds}s',
+    '{minutes}분 {seconds}초': '{minutes}m {seconds}s',
+    '{hours}시간 {minutes}분': '{hours}h {minutes}m',
+    '대기': 'Queued',
+    '제출 중': 'Submitting',
+    '제출됨': 'Submitted',
+    '처리 중': 'Processing',
+    '응답 대기': 'Waiting for Response',
+    '결과 적용 중': 'Applying Result',
+    '완료': 'Completed',
+    '실패': 'Failed',
+    '취소됨': 'Canceled',
+    'Gemini 지연 번역 청크 현황': 'Gemini Delayed Translation Chunk Status',
+    '{mode} 요청을 청크별로 처리합니다. 완료된 청크는 즉시 번역문에 반영됩니다. 작업 중에는 이 창만 조작할 수 있습니다.': '{mode} requests are processed chunk by chunk. Completed chunks are applied immediately. Only this window can be used while the task is running.',
+    '실패 청크 전체 재시도': 'Retry All Failed Chunks',
+    '작업 취소': 'Cancel Task',
+    '전체 {total}개 · 완료 {completed}개 · 처리 중 {active}개 · 실패 {failed}개 · 대기 {waiting}개': 'Total {total} · Completed {completed} · Active {active} · Failed {failed} · Queued {waiting}',
+    '번역 결과를 프로젝트에 적용하지 못했습니다.': 'Could not apply the translation result to the project.',
+    '번역 결과 적용 실패': 'Failed to apply translation result',
+    '모든 청크가 완료되어 번역문에 반영되었습니다. 확인을 눌러 작업 화면으로 돌아가세요.': 'All chunks have completed and were applied. Click OK to return to the workspace.',
+    'Gemini 지연 번역 취소': 'Cancel Gemini Delayed Translation',
+    '현재 지연 번역 작업을 취소할까요?\n\n이미 완료되어 반영된 청크는 유지합니다. 대기·처리 중인 청크는 중단하고, 뒤늦게 도착한 응답은 번역문에 반영하지 않습니다.': 'Cancel the current delayed translation task?\n\nChunks already completed and applied will be kept. Queued and active chunks will stop, and late responses will not be applied.',
+    'Batch 작업 ID가 비어 있습니다.': 'The Batch job ID is empty.',
+    'Batch 작업 ID를 받지 못했습니다.': 'No Batch job ID was returned.',
+    'Batch 요청이 실패했습니다.': 'The Batch request failed.',
+    '알 수 없는 API 오류': 'Unknown API error.',
+    'Batch 작업이 실패했습니다.': 'The Batch job failed.',
+    '✅ 지연 번역 청크 {chunk} 완료 및 즉시 반영': '✅ Delayed translation chunk {chunk} completed and applied immediately',
+    '⚠️ 지연 번역 마무리 처리 실패: {error}': '⚠️ Failed to finalize delayed translation: {error}',
+    '✅ Gemini 지연 번역 완료: 전체 {total}개 청크': '✅ Gemini delayed translation complete: {total} chunks',
+    '⏹️ Gemini 지연 번역 취소: 완료 {completed}개 / 실패 {failed}개 / 전체 {total}개': '⏹️ Gemini delayed translation canceled: {completed} completed / {failed} failed / {total} total',
+}
+UI_KO_EN.update(_GEMINI_DELAYED_TRANSLATION_KO_EN)
+try:
+    UI_EN_KO.update({en: ko for ko, en in _GEMINI_DELAYED_TRANSLATION_KO_EN.items()})
+except Exception:
+    pass
+
+API_TR_KO_EN.update({
+    'Gemini Flex / Batch': 'Gemini Flex / Batch',
+    '일반 번역 진행창 대신 청크 현황 창을 사용합니다. 완료된 청크는 즉시 반영되고, 실패한 청크만 다시 시도할 수 있습니다. 작업 중에는 다른 프로젝트 작업을 할 수 없습니다.': 'Uses a chunk status window instead of the normal translation progress window. Completed chunks are applied immediately, and only failed chunks can be retried. Other project work is unavailable while this task is running.',
+    '요청 방식': 'Request Mode',
+    'Flex API': 'Flex API',
+    'Batch API': 'Batch API',
+})
+
+# Translation TXT streaming import progress / memory-safe sequential apply
+_TRANSLATION_IMPORT_STREAM_KO_EN = {
+    '선택 페이지 진행: {current}/{total}': 'Selected page progress: {current}/{total}',
+    '현재 페이지: {page}': 'Current page: {page}',
+    '현재 페이지 적용: {changed}개 / 전체 항목 {total}개': 'Current page applied: {changed} / {total} total items',
+    '누적 적용: {count}개': 'Total applied: {count}',
+    '텍스트 데이터가 없어 건너뜁니다.': 'Skipped because there is no text data.',
+    'TXT 파일을 읽지 못했습니다: {error}': 'Could not read the TXT file: {error}',
+    '번역문을 순차 적용하는 중...': 'Applying translations sequentially...',
+    '현재 페이지 반영 완료': 'Current page applied',
+    '현재 페이지 표와 행 높이를 갱신하는 중...': 'Refreshing the current page table and row heights...',
+    '번역문 불러오기는 Undo를 지원하지 않습니다.': 'Translation import does not support Undo.',
+    '▶️ 번역문 불러오기 시작: 대상 {pages}페이지 ({label}) / Undo 미지원': '▶️ Translation import started: {pages} page(s) ({label}) / Undo unavailable',
+    '⚠️ 번역문 불러오기 화면 갱신 실패: {error}': '⚠️ Failed to refresh the translation import screen: {error}',
+    '⏹️ 번역문 불러오기 취소: {count}개까지 반영 / Undo 미지원': '⏹️ Translation import canceled: {count} item(s) applied / Undo unavailable',
+    '📥 번역문 불러오기 완료: {count}개 / Undo 미지원': '📥 Translation import complete: {count} item(s) / Undo unavailable',
+    '텍스트 데이터 없음': 'No text data',
+    '불러올 텍스트 번호 없음': 'No text IDs to import',
+    '매칭 파일 없음': 'No matching file',
+    'TXT 파일 핸들이 없습니다.': 'The TXT file handle is unavailable.',
+    '맞는 텍스트 번호 없음': 'No matching text IDs',
+    '변경된 번역문 없음': 'No translation changes',
+    '{count}개 적용': '{count} item(s) applied',
+}
+UI_KO_EN.update(_TRANSLATION_IMPORT_STREAM_KO_EN)
+try:
+    UI_EN_KO.update({en: ko for ko, en in _TRANSLATION_IMPORT_STREAM_KO_EN.items()})
+except Exception:
+    pass
+
+
+# Separate database glossary and user glossary editor
+_GLOSSARY_SPLIT_KO_EN = {
+    '자동 단어장에는 데이터베이스의 name 항목과 화자 번역 모드의 name 항목이 자동 반영됩니다.\n사용자 단어장은 원문과 번역문을 직접 등록하며, 저장하면 딕셔너리로 변환되어 번역 대상에 실제 등장한 항목만 API에 전달됩니다.': 'Database name fields and speaker-translation name fields are reflected automatically in the automatic glossary.\nThe user glossary stores source/translation pairs as a dictionary, and only entries that actually appear in the translation target are sent to the API.',
+    '데이터베이스의 name 항목과 화자 번역 모드의 name 항목이 자동 반영됩니다.': 'Database name fields and speaker-translation name fields are reflected automatically.',
+    '자동 단어장': 'Automatic glossary',
+    '사용자 단어장': 'User glossary',
+    '원문': 'Source',
+    '번역문': 'Translation',
+    '원문과 번역문을 한 쌍씩 추가합니다. 같은 원문을 다시 추가하면 기존 번역문을 갱신합니다. 같은 원문이 겹치면 사용자 단어장이 우선입니다.': 'Add source and translation as pairs. Adding the same source again updates its translation. When the same source appears in both glossaries, the user glossary takes priority.',
+    '추가 / 갱신': 'Add / Update',
+    '등록 항목: {count}개': 'Entries: {count}',
+    'TXT 불러오기': 'Load TXT',
+    '선택 삭제': 'Delete selected',
+    '전체 초기화': 'Clear all',
+    '추가 번역 메모 / 규칙': 'Additional translation notes / rules',
+    '단어 쌍이 아닌 배경 설명이나 말투 규칙이 필요할 때만 적습니다.': 'Use this only for background notes or voice rules that are not term pairs.',
+    '입력 필요': 'Input required',
+    '원문과 번역문을 모두 입력해주세요.': 'Enter both the source and translation.',
+    '입력 확인': 'Check input',
+    '원문과 번역문이 같습니다.': 'The source and translation are identical.',
+    '사용자 단어장 초기화': 'Clear user glossary',
+    '사용자 단어장의 모든 항목을 지울까요?': 'Clear all entries in the user glossary?',
+    '사용자 단어장 TXT 불러오기': 'Load user glossary TXT',
+    '사용자 단어장 {imported}개를 불러왔습니다. 인식하지 못한 줄: {skipped}개': 'Imported {imported} user glossary entries. Unrecognized lines: {skipped}',
+    '↩️ 단어장 저장 취소': '↩️ Glossary save canceled',
+    '📚 사용자 단어장 저장 완료: {count}개': '📚 User glossary saved: {count} entries',
+    ' / 메모 {count}자': ' / notes {count} characters',
+    '📚 자동 단어장 갱신: {count}개 / DB name·화자 name 자동 반영 / 현재 번역 청크에 등장한 항목만 사용': '📚 Automatic glossary refreshed: {count} entries / DB names and speaker names included / only terms appearing in the current translation chunk are used',
+    '⚠️ 자동 단어장 갱신 실패: {error}': '⚠️ Failed to refresh the automatic glossary: {error}',
+}
+UI_KO_EN.update(_GLOSSARY_SPLIT_KO_EN)
+try:
+    UI_EN_KO.update({en: ko for ko, en in _GLOSSARY_SPLIT_KO_EN.items()})
+except Exception:
+    pass
+
+# Independent RPG Maker speaker translation layer
+_MAKER_SPEAKER_LAYER_KO_EN = {
+    '화자 번역 모드': 'Speaker Translation Mode',
+    '화자 번역 모드 나가기': 'Exit Speaker Translation Mode',
+    '화자 번역 모드로 전환하지 못했습니다.': 'Could not switch to Speaker Translation Mode.',
+    '⚠️ 화자 번역 모드 진입 실패: {error}': '⚠️ Failed to enter Speaker Translation Mode: {error}',
+    '👤 화자 번역 모드 진입': '👤 Entered Speaker Translation Mode',
+    '↩️ 화자 번역 모드 나가기': '↩️ Exited Speaker Translation Mode',
+    '👤 화자 번역 레이어 생성: {count}개 ({reason})': '👤 Speaker translation layer created: {count} names ({reason})',
+    '⚠️ 화자 번역 레이어 확인 실패: {error}': '⚠️ Failed to prepare the speaker translation layer: {error}',
+    '👤 화자 번역 적용: {count}개 대사 갱신': '👤 Applied speaker translations: updated {count} dialogue rows',
+    '👤 화자 번역 시작: {count}페이지': '👤 Speaker translation started: {count} pages',
+    '화자 데이터가 없습니다.': 'There is no speaker data.',
+    '화자 번역 페이지가 없습니다.': 'There are no speaker translation pages.',
+    '화자 번역 모드에서 번역할 화자 페이지가 없습니다.': 'There are no speaker pages to translate in Speaker Translation Mode.',
+    '화자명 {count}개를 AI 번역할까요?\n번역 결과는 연결된 실제 대사의 화자명에 반영됩니다.': 'Translate {count} speaker names with AI?\nThe results will be applied to the speaker names of linked dialogue rows.',
+    '화자 목록': 'Speaker List',
+    '화자 탭': 'Speaker Tab',
+    '화자 페이지': 'Speaker Page',
+    '전체 화자 페이지': 'All Speaker Pages',
+    '화자 페이지 선택': 'Select Speaker Pages',
+    '작업할 화자 페이지 범위를 선택하세요.': 'Select the range of speaker pages to process.',
+    '쉼표와 범위를 섞어서 입력할 수 있습니다. 번호는 현재 화자 탭 순서 기준입니다.': 'You can mix commas and ranges. Numbers follow the current speaker tab order.',
+    '현재 화자명만 번역합니다.': 'Only the current speaker names are translated.',
+    '화자 번역 미리보기': 'Speaker Translation Preview',
+    '현재 화자명': 'Current Speaker Names',
+    '화자명': 'Speaker Name',
+    '이름': 'Name',
+    '사용 {count}회': 'Used {count} times',
+    '이 화자 탭에는 표시할 화자명이 없습니다.': 'This speaker tab has no speaker names to display.',
+    '대사에서 수집한 화자명을 독립 레이어에서 관리합니다.': 'Manages speaker names collected from dialogue in an independent layer.',
+    '원래 화자': 'Original Speaker',
+    '제어코드 포함 원본': 'Original with Control Codes',
+    '번역/표시 이름': 'Translated / Display Name',
+    '수정한 화자명은 연결된 실제 대사에만 반영됩니다.': 'Edited speaker names are applied only to linked dialogue rows.',
+    '플러그인 번역 모드': 'Plugin Translation Mode',
+}
+UI_KO_EN.update(_MAKER_SPEAKER_LAYER_KO_EN)
+try:
+    UI_EN_KO.update({en: ko for ko, en in _MAKER_SPEAKER_LAYER_KO_EN.items()})
+except Exception:
+    pass
+SHORTCUT_TR_KO_EN.update({
+    '플러그인 번역 모드': 'Plugin Translation Mode',
+    '화자 번역 모드': 'Speaker Translation Mode',
+})
+
+_TRANSLATION_PROMPT_PRESET_KO_EN = {
+    '프리셋': 'Preset',
+    '새 프리셋': 'New Preset',
+    '이름 변경': 'Rename',
+    '이름 중복': 'Duplicate Name',
+    '프롬프트 변수 누락': 'Missing Prompt Variables',
+    '↩️ 번역 프롬프트 저장 취소': '↩️ Translation prompt save cancelled',
+}
+UI_KO_EN.update(_TRANSLATION_PROMPT_PRESET_KO_EN)
+try:
+    UI_EN_KO.update({en: ko for ko, en in _TRANSLATION_PROMPT_PRESET_KO_EN.items()})
+except Exception:
+    pass
+
+_TRANSLATION_PROMPT_EDITOR_KO_EN = {
+    '공통 번역 지시': 'Common translation instructions',
+    '모든 AI 번역 요청에 공통으로 들어가는 사용자 지시입니다.': 'User instructions included in every AI translation request.',
+    '사용자 단어장 안내': 'Manual glossary instructions',
+    '사용자 메모/단어장을 AI에 전달할 때 감싸는 안내문입니다.': "Instructions wrapping the user's glossary notes.",
+    '자동 단어장 항목 형식': 'Matched glossary entry format',
+    '현재 문장에 매칭된 자동/사용자 단어장 한 항목의 형식입니다.': 'Format for one matched automatic/user glossary entry.',
+    '자동 단어장 안내': 'Matched glossary instructions',
+    '현재 번역 묶음에 실제 등장한 단어장 항목을 감싸는 안내문입니다.': 'Instructions wrapping glossary entries matched to the current chunk.',
+    '캐릭터 프롬프트 머리말': 'Character prompt header',
+    '캐릭터별 프롬프트의 이름 머리말입니다.': 'Name header for a character-specific prompt.',
+    '캐릭터 말투 항목': 'Character tone line',
+    '캐릭터 말투 값이 있을 때 추가되는 한 줄입니다.': 'Line added when a character tone is present.',
+    '캐릭터 성격 항목': 'Character personality line',
+    '캐릭터 성격 값이 있을 때 추가되는 한 줄입니다.': 'Line added when a character personality is present.',
+    '캐릭터 관계·문맥 항목': 'Character relationship/context line',
+    '캐릭터 관계·문맥 값이 있을 때 추가되는 한 줄입니다.': 'Line added when relationship/context is present.',
+    '캐릭터 번역 규칙 항목': 'Character translation-rules line',
+    '캐릭터별 번역 규칙 값이 있을 때 추가되는 한 줄입니다.': 'Line added when character-specific translation rules are present.',
+    '캐릭터 금지 표현 항목': 'Character forbidden-words line',
+    '캐릭터 금지 표현 값이 있을 때 추가되는 한 줄입니다.': 'Line added when forbidden/avoid words are present.',
+    '캐릭터 메모 항목': 'Character notes line',
+    '캐릭터 메모 값이 있을 때 추가되는 한 줄입니다.': 'Line added when character notes are present.',
+    '화자 이름 번역 지시': 'Speaker-name translation instructions',
+    '화자 번역 독립 레이어에서 이름을 번역할 때 사용하는 지시입니다.': 'Instructions used by the independent speaker-name layer.',
+    '데이터베이스 번역 지시': 'Database translation instructions',
+    'DB 번역 레이어에서 사용하는 지시입니다. 프로젝트별 DB 프롬프트를 원하는 위치에 넣을 수 있습니다.': 'Instructions used by the database layer. The project-level DB prompt can be placed anywhere.',
+    '전투 이벤트 번역 지시': 'Battle-event translation instructions',
+    'Troops.json 전투 이벤트 문장을 번역할 때 사용하는 지시입니다.': 'Instructions used for Troops.json battle-event text.',
+    '청크 프롬프트 항목 형식': 'Chunk-prompt item format',
+    '한 번의 API 묶음에 포함되는 캐릭터/모드 프롬프트 한 항목의 형식입니다.': 'Format for one character/mode prompt inside an API chunk.',
+    '청크 프롬프트 묶음 지시': 'Chunk-prompt wrapper',
+    '캐릭터·DB·화자·전투 프롬프트 묶음을 감싸는 지시입니다.': 'Instructions wrapping character/database/speaker/battle prompt blocks.',
+    '제어코드 매핑 항목 형식': 'Control-code mapping entry format',
+    '개별 대사의 제어코드 토큰과 실제 코드를 보여주는 한 항목의 형식입니다.': 'Format for one opaque-token to raw-control-code mapping entry.',
+    '개별 대사 제어코드 배치 문맥': 'Per-item control-code placement context',
+    '제어코드 자동 반영 시 각 대사의 원문·토큰 원문·매핑표와 함께 전달되는 전체 지시입니다.': 'Full per-item instructions sent with raw source, tokenized source, and token mapping.',
+    '제어코드 자동 반영 지시': 'Control-token placement instructions',
+    '‘번역 시 자동 반영’이 켜져 제어코드 토큰이 포함됐을 때 사용하는 지시입니다.': 'Instructions used when automatic control-code token placement is enabled.',
+    '제어코드 제거 상태 지시': 'Control-code-removed instructions',
+    '제어코드 자동 반영을 사용하지 않을 때 새 제어코드를 만들지 않도록 안내하는 지시입니다.': 'Instructions used when raw control codes were removed before translation.',
+    '출력 형식·행 유지 지시': 'Output-format and line-preservation rules',
+    'JSON 응답 형식, ID 유지, 줄 수 보존 등을 AI에 요구하는 전체 지시입니다.': 'Full instructions for JSON output, id preservation, and physical-line preservation.',
+    '개별 행 줄 수 지시': 'Per-item line-count rule',
+    '여러 줄 원문 항목에 별도로 붙는 줄 수 유지 지시입니다.': 'Per-item rule attached to source text containing multiple physical lines.',
+    'Gemini 입력 묶음 형식': 'Gemini input wrapper',
+    'Gemini REST 요청에서 시스템 프롬프트와 입력 JSON을 합치는 형식입니다.': 'Format joining the system prompt and input JSON for Gemini REST requests.',
+}
+UI_KO_EN.update(_TRANSLATION_PROMPT_EDITOR_KO_EN)
+try:
+    UI_EN_KO.update({en: ko for ko, en in _TRANSLATION_PROMPT_EDITOR_KO_EN.items()})
+except Exception:
+    pass
+
+_TRANSLATION_PROMPT_PRESET_DIALOG_KO_EN = {
+    'AI 번역에 전달되는 모든 자연어 프롬프트를 직접 수정합니다. 프리셋 1에는 프로그램 기본값이 들어 있습니다. 확인을 눌러야 저장됩니다.': "Every natural-language instruction sent to the AI translator is editable here. Preset 1 contains the program's built-in defaults. Changes are saved only when you press OK.",
+    'AI 번역에 전달되는 모든 자연어 프롬프트를 직접 수정합니다. Default Set에는 프로그램 기본값이 들어 있습니다. 확인을 눌러야 저장됩니다.': "Every natural-language instruction sent to the AI translator is editable here. Default Set contains the program's built-in defaults. Changes are saved only when you press OK.",
+    '프리셋 1 원본 복원': 'Restore Preset 1 Defaults',
+    'Default Set 원본 복원': 'Restore Default Set',
+    '필수 변수를 지워도 저장할 수 있지만, 해당 데이터가 AI에 전달되지 않을 수 있습니다. 프로그램은 숨겨진 프롬프트를 몰래 다시 붙이지 않습니다.': 'Missing placeholders are allowed, but related data may not be sent to the AI. The program will not silently reinsert hidden prompts.',
+    '사용 가능한 변수: ': 'Available variables: ',
+    '프리셋 1은 기본 복구 이름을 유지합니다. 내용은 전부 수정할 수 있습니다.': 'Preset 1 keeps its fixed fallback name. Its contents are fully editable.',
+    'Default Set은 기본 복구 이름을 유지합니다. 내용은 전부 수정할 수 있습니다.': 'Default Set keeps its fixed recovery name. All of its contents remain editable.',
+    '프리셋 1은 기본 복구용이라 삭제할 수 없습니다. 내용은 수정하거나 원본으로 복원할 수 있습니다.': 'Preset 1 is the built-in fallback and cannot be deleted. It can still be edited or restored.',
+    'Default Set은 기본 복구용이라 삭제할 수 없습니다. 내용은 수정하거나 원본으로 복원할 수 있습니다.': 'Default Set is the built-in recovery preset and cannot be deleted. It can still be edited or restored.',
+    "'{name}' 프리셋을 삭제할까요?": "Delete the '{name}' preset?",
+    '일부 프롬프트에서 변수가 빠져 있습니다. 해당 데이터가 AI에 전달되지 않을 수 있습니다.': 'Some prompt variables are missing. Related data may not be sent to the AI.',
+    '그래도 저장할까요?': 'Save anyway?',
+    '프리셋 1': 'Preset 1',
+    '기존 프롬프트': 'Legacy Prompt',
+}
+UI_KO_EN.update(_TRANSLATION_PROMPT_PRESET_DIALOG_KO_EN)
+try:
+    UI_EN_KO.update({en: ko for ko, en in _TRANSLATION_PROMPT_PRESET_DIALOG_KO_EN.items()})
+except Exception:
+    pass
+
+_UNIFIED_GAME_PROMPT_MANAGER_KO_EN = {
+    '전체 번역 프롬프트 세트, 프로젝트 DB 지침, 캐릭터별 말투와 프롬프트 테스트를 이 창 하나에서 관리합니다. 확인을 눌러야 저장되고, 닫기나 X는 저장하지 않습니다.': 'Manage the full translation prompt set, project DB instructions, character voices, and prompt tests in this single window. Changes are saved only with OK; Close or X discards them.',
+    '전체 번역 프롬프트': 'All Translation Prompts',
+    '프로젝트 DB 프롬프트': 'Project DB Prompt',
+    '현재 프로젝트에만 적용되는 DB 번역 지침입니다. 전체 프롬프트 세트의 데이터베이스 번역 지시에서 {PROJECT_DB_PROMPT} 위치에 들어갑니다.': 'Project-specific DB translation instructions. They are inserted at {PROJECT_DB_PROMPT} in the Database Translation Instructions field of the full prompt set.',
+    '예: 이 게임의 아이템명은 짧게, 스킬 설명은 명령형으로 통일합니다.': 'Example: Keep item names short and use imperative phrasing for skill descriptions in this game.',
+    '현재 창에서 편집 중인 프롬프트로 실제 요청 구조를 조립합니다. 확인을 누르기 전에도 결과를 볼 수 있습니다.': 'Build the actual request structure from the prompts currently being edited in this window. You can inspect the result before pressing OK.',
+    '현재 창에서 편집 중인 전체 프롬프트와 프로젝트/캐릭터 프롬프트를 기준으로 대표 요청을 확인합니다.': 'Inspect representative requests using the full prompt set and project/character prompts currently being edited in this window.',
+    '게임 프롬프트 관리를 열 수 없습니다.': 'Could not open Game Prompt Manager.',
+    '게임 프롬프트 관리는 쯔꾸르 프로젝트를 연 뒤 사용할 수 있습니다.': 'Game Prompt Manager is available after opening an RPG Maker project.',
+    'Default Set': 'Default Set',
+}
+UI_KO_EN.update(_UNIFIED_GAME_PROMPT_MANAGER_KO_EN)
+try:
+    UI_EN_KO.update({en: ko for ko, en in _UNIFIED_GAME_PROMPT_MANAGER_KO_EN.items()})
+except Exception:
+    pass
+
+_MAKER_NESTED_CONTENT_ROOT_KO_EN = {
+    '데이터 폴더를 찾지 못했습니다. 선택한 게임 폴더 아래에 RPG Maker MV/MZ의 data/MapInfos.json이 있는지 확인해 주세요.': 'Could not find the data folder. Check that data/MapInfos.json for RPG Maker MV/MZ exists somewhere under the selected game folder.',
+}
+UI_KO_EN.update(_MAKER_NESTED_CONTENT_ROOT_KO_EN)
+try:
+    UI_EN_KO.update({en: ko for ko, en in _MAKER_NESTED_CONTENT_ROOT_KO_EN.items()})
 except Exception:
     pass

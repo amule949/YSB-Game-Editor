@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ast
 import math
 import os
 import re
@@ -17,6 +18,12 @@ import cv2
 import numpy as np
 
 from ysb.tools.maker_engines import get_engine_adapter, engine_module_metadata, normalize_engine
+from ysb.settings.translation_prompt_presets import (
+    PROMPT_BLOCK_BEGIN,
+    PROMPT_BLOCK_END,
+    get_runtime_prompt_templates,
+    render_prompt_template,
+)
 
 
 RPG_MAKER_DATA_DIR = "data"
@@ -32,6 +39,7 @@ MAKER_WRITEBACK_SUMMARY_FILE = "maker_writeback_summary.json"
 MAKER_SPEAKER_SUMMARY_FILE = "maker_speaker_summary.json"
 MAKER_CHARACTER_PROMPTS_FILE = "maker_character_prompts.json"
 MAKER_DATABASE_SUMMARY_FILE = "maker_database_summary.json"
+MAKER_PLUGIN_SUMMARY_FILE = "maker_plugin_summary.json"
 MAKER_CHARACTER_PROFILES_FILE = "maker_character_profiles.json"
 MAKER_TRANSLATION_SETTINGS_FILE = "maker_translation_settings.json"
 MAKER_RUNTIME_PROFILE_FILE = "maker_runtime_profile.json"
@@ -42,7 +50,7 @@ MAKER_KEEP_FILE = ".ysb_keep"
 
 
 DEFAULT_MAKER_TRANSLATION_SETTINGS: Dict[str, Any] = {
-    "normalize_source_newlines": True,
+    "normalize_source_newlines": False,
     "newline_join_mode": "auto",  # auto / cjk_join / space
 }
 
@@ -162,32 +170,155 @@ def _rel_or_name(path: Path, root: Path) -> str:
 
 
 def _candidate_content_roots(root: Path) -> List[Path]:
-    """Return likely RPG Maker content roots under a selected folder.
+    """Return likely RPG Maker MV/MZ content roots under a selected folder.
 
     During development the project usually has data/ and js/ directly under the
-    selected folder. A deployed Windows build commonly has them under www/.
+    selected folder. Deployed games can hide the same content root one or more
+    levels deeper depending on platform/build style: www/, resources/app.nw/,
+    resources/app/, package.nw/, or macOS .app/Contents/Resources/app.nw/.
+
     The editor still clones the selected game folder as-is; this function only
-    finds where the Maker data actually lives inside that clone.
+    finds where the Maker data actually lives inside that clone.  The scan stays
+    shallow and bounded so choosing a high-level folder never turns into a whole
+    drive crawl.
     """
     candidates: List[Path] = [root]
-    for name in ("www", "game", "Game"):
-        p = root / name
+
+    explicit_rel_roots = (
+        "www",
+        "game",
+        "Game",
+        "app",
+        "app.nw",
+        "package.nw",
+        "resources/app",
+        "resources/app.nw",
+        "Resources/app",
+        "Resources/app.nw",
+        "Contents/Resources/app",
+        "Contents/Resources/app.nw",
+    )
+    for rel in explicit_rel_roots:
+        p = root / rel
         if p.is_dir():
             candidates.append(p)
-    # Keep the search intentionally shallow and deterministic. We do not want a
-    # whole-drive scan when the user accidentally picks a high-level folder.
-    for child in sorted(root.iterdir()) if root.exists() and root.is_dir() else []:
-        if child.is_dir() and child not in candidates and (child / RPG_MAKER_DATA_DIR / "MapInfos.json").is_file():
-            candidates.append(child)
+
+    # Bounded compatibility search.  This catches structures such as
+    # Game.app/Contents/Resources/app.nw/data without guessing every possible
+    # executable wrapper folder name.
+    max_depth = 6
+    max_dirs = 2500
+    skip_names = {
+        "node_modules", ".git", ".hg", ".svn", "__pycache__",
+        "locales", "swiftshader", "shadercache", "GPUCache",
+        "maker_meta", "maker_backup", "maker_diff",
+    }
+    try:
+        stack: List[Tuple[Path, int]] = [(root, 0)]
+        visited = 0
+        while stack and visited < max_dirs:
+            current, depth = stack.pop(0)
+            visited += 1
+            data_marker = current / RPG_MAKER_DATA_DIR / "MapInfos.json"
+            if data_marker.is_file():
+                candidates.append(current)
+            if depth >= max_depth:
+                continue
+            try:
+                children = sorted([c for c in current.iterdir() if c.is_dir()], key=lambda x: x.name.lower())
+            except Exception:
+                continue
+            for child in children:
+                if child.name in skip_names or child.name.startswith("."):
+                    continue
+                stack.append((child, depth + 1))
+    except Exception:
+        pass
+
     out: List[Path] = []
     seen = set()
     for c in candidates:
-        key = str(c.resolve()) if c.exists() else str(c)
+        try:
+            key = str(c.resolve()) if c.exists() else str(c)
+        except Exception:
+            key = str(c)
         if key in seen:
             continue
         seen.add(key)
         out.append(c)
     return out
+
+
+def _detect_legacy_maker_layout(root: Path) -> Tuple[str, List[str]] | None:
+    """Detect older non-JSON RPG Maker layouts for clearer compatibility errors.
+
+    쯔꾸르붕이의 현재 번역/저장 파이프라인은 MV/MZ JSON(data/MapInfos.json)
+    구조를 기준으로 한다.  VX Ace/VX/XP/2000/2003 계열은 파일 형식이 달라서
+    같은 루틴으로 열면 안 되므로, 최소한 사용자가 선택한 폴더가 어떤 계열로
+    보이는지 알려준다.
+    """
+    if not root.exists() or not root.is_dir():
+        return None
+    markers: List[str] = []
+
+    def note(path: Path) -> None:
+        try:
+            markers.append(_rel_or_name(path, root))
+        except Exception:
+            markers.append(str(path))
+
+    try:
+        base_candidates: List[Path] = [root, root / "Data", root / "data"]
+        try:
+            for child in sorted([c for c in root.iterdir() if c.is_dir()], key=lambda x: x.name.lower()):
+                base_candidates.extend([child, child / "Data", child / "data"])
+        except Exception:
+            pass
+        seen_bases = set()
+        for base in base_candidates:
+            try:
+                base_key = str(base.resolve()) if base.exists() else str(base)
+            except Exception:
+                base_key = str(base)
+            if base_key in seen_bases:
+                continue
+            seen_bases.add(base_key)
+            if not base.exists():
+                continue
+            if list(base.glob("*.rvdata2")):
+                first = sorted(base.glob("*.rvdata2"))[0]
+                note(first)
+                return "RPG Maker VX Ace(RGSS3 / .rvdata2)", markers
+            if list(base.glob("*.rvdata")):
+                first = sorted(base.glob("*.rvdata"))[0]
+                note(first)
+                return "RPG Maker VX(RGSS2 / .rvdata)", markers
+            if list(base.glob("*.rxdata")):
+                first = sorted(base.glob("*.rxdata"))[0]
+                note(first)
+                return "RPG Maker XP(RGSS / .rxdata)", markers
+        for name in ("RPG_RT.ldb", "RPG_RT.lmt"):
+            p = root / name
+            if p.is_file():
+                note(p)
+                return "RPG Maker 2000/2003(RPG_RT)", markers
+        for pattern in ("*.ldb", "*.lmt", "*.lmu"):
+            found = sorted(root.glob(pattern))
+            if found:
+                note(found[0])
+                return "RPG Maker 2000/2003(RPG_RT)", markers
+        game_ini = root / "Game.ini"
+        if game_ini.is_file():
+            try:
+                raw = game_ini.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                raw = ""
+            if "RGSS" in raw or "RTP" in raw:
+                note(game_ini)
+                return "RPG Maker RGSS 계열(XP/VX/VX Ace 추정)", markers
+    except Exception:
+        return None
+    return None
 
 
 def _score_engine_for_root(content_root: Path, selected_root: Path) -> Tuple[str, str, float, List[str], List[str]]:
@@ -291,7 +422,20 @@ def detect_maker_engine(folder: str | os.PathLike[str]) -> MakerEngineInfo:
             best = info
 
     if best is None:
-        raise MakerProjectError("RPG Maker MV/MZ 프로젝트로 보이지 않습니다. data/MapInfos.json 또는 www/data/MapInfos.json이 있는 폴더를 선택해 주세요.")
+        legacy = _detect_legacy_maker_layout(selected_root)
+        if legacy is not None:
+            legacy_label, legacy_markers = legacy
+            marker_text = ", ".join(legacy_markers[:3]) if legacy_markers else "구버전 데이터 파일"
+            raise MakerProjectError(
+                f"{legacy_label} 구조로 보입니다. 감지 파일: {marker_text}. "
+                "현재 쯔꾸르붕이는 RPG Maker MV/MZ의 JSON 구조(data/MapInfos.json)를 기준으로 가져옵니다. "
+                "VX Ace/VX/XP/2000/2003 계열은 별도 변환/전용 지원이 필요합니다."
+            )
+        raise MakerProjectError(
+            "RPG Maker MV/MZ 프로젝트로 보이지 않습니다. "
+            "data/MapInfos.json, www/data/MapInfos.json, resources/app.nw/data/MapInfos.json, "
+            "또는 macOS .app/Contents/Resources/app.nw/data/MapInfos.json이 있는 폴더를 선택해 주세요."
+        )
     return best
 
 
@@ -1197,7 +1341,7 @@ def normalize_maker_translation_source_text(text: Any, settings: Dict[str, Any] 
     """
     src = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
     st = normalize_maker_translation_settings(settings)
-    if not st.get("normalize_source_newlines", True):
+    if not st.get("normalize_source_newlines", False):
         return src
     mode = str(st.get("newline_join_mode") or "auto")
     lines = src.split("\n")
@@ -1775,25 +1919,34 @@ def build_maker_character_prompt_text(prompts: Dict[str, Any] | None, speaker: A
     fixed = normalize_maker_character_prompts(prompts)
     key = _normal_character_key(speaker)
     profile = maker_character_prompt_for_speaker(fixed, key)
+    templates = get_runtime_prompt_templates()
     parts: List[str] = []
     if include_default and str(fixed.get("default_prompt") or "").strip():
         parts.append(str(fixed.get("default_prompt") or "").strip())
     if profile.get("enabled"):
         label = str(profile.get("display_name") or key).strip() or key
-        character_lines = [f"[Character: {label}]"]
-        if str(profile.get("tone") or "").strip():
-            character_lines.append(f"Tone: {str(profile.get('tone') or '').strip()}")
-        if str(profile.get("personality") or "").strip():
-            character_lines.append(f"Personality: {str(profile.get('personality') or '').strip()}")
-        if str(profile.get("relationship") or "").strip():
-            character_lines.append(f"Relationship/Context: {str(profile.get('relationship') or '').strip()}")
-        if str(profile.get("translation_rules") or "").strip():
-            character_lines.append(f"Translation rules: {str(profile.get('translation_rules') or '').strip()}")
-        if str(profile.get("forbidden_words") or "").strip():
-            character_lines.append(f"Forbidden/avoid: {str(profile.get('forbidden_words') or '').strip()}")
-        if str(profile.get("notes") or "").strip():
-            character_lines.append(f"Notes: {str(profile.get('notes') or '').strip()}")
-        if len(character_lines) > 1:
+        field_lines: List[str] = []
+        field_specs = (
+            ("tone", "character_profile_tone", "TONE"),
+            ("personality", "character_profile_personality", "PERSONALITY"),
+            ("relationship", "character_profile_relationship", "RELATIONSHIP"),
+            ("translation_rules", "character_profile_translation_rules", "TRANSLATION_RULES"),
+            ("forbidden_words", "character_profile_forbidden_words", "FORBIDDEN_WORDS"),
+            ("notes", "character_profile_notes", "NOTES"),
+        )
+        for profile_key, template_key, placeholder in field_specs:
+            value = str(profile.get(profile_key) or "").strip()
+            if not value:
+                continue
+            line = render_prompt_template(templates.get(template_key, ""), **{placeholder: value})
+            if line:
+                field_lines.append(line)
+        if field_lines:
+            character_lines: List[str] = []
+            header = render_prompt_template(templates.get("character_profile_header", ""), DISPLAY_NAME=label)
+            if header:
+                character_lines.append(header)
+            character_lines.extend(field_lines)
             parts.append("\n".join(character_lines))
     return "\n\n".join(part for part in parts if str(part or "").strip())
 
@@ -1871,12 +2024,67 @@ def _add_profile_hint(profile: Dict[str, Any], hint: str) -> None:
 
 
 def _maker_content_paths_for_project(project_dir: str | os.PathLike[str]) -> Tuple[Path, Path, Path, Dict[str, Any]]:
+    """Resolve the actual MV/MZ content root inside maker_game.
+
+    Imported games keep the folder selected by the user intact.  Therefore the
+    real data/js/img folders may live below an arbitrary wrapper directory such
+    as ``maker_game/게임데이터`` or a deployed ``resources/app.nw`` tree.
+    Prefer the import summary, but validate it and re-detect the clone when an
+    old/stale project summary still points at maker_game/data.
+    """
     project_root = Path(project_dir)
     game_root = project_root / MAKER_CLONE_DIR
     summary = _read_maker_import_summary(project_root)
     engine_info = summary.get("engine") if isinstance(summary, dict) else None
-    data_dir = _data_dir_from_engine_info(game_root, engine_info if isinstance(engine_info, dict) else None)
-    return game_root, data_dir, data_dir.parent, engine_info if isinstance(engine_info, dict) else {}
+    engine_dict = dict(engine_info) if isinstance(engine_info, dict) else {}
+
+    def resolve(info: Dict[str, Any] | None):
+        data = _data_dir_from_engine_info(game_root, info)
+        content = _content_root_from_engine_info(game_root, info)
+        return data, content
+
+    try:
+        data_dir, content_root = resolve(engine_dict or None)
+    except Exception:
+        data_dir, content_root = game_root / RPG_MAKER_DATA_DIR, game_root
+
+    # Old projects or manually moved clones can have a valid maker_game folder
+    # but an invalid/stale engine path in maker_import_summary.json.  Re-detect
+    # from the clone instead of silently falling back to maker_game/data.
+    marker_ok = (Path(data_dir) / "MapInfos.json").is_file()
+    try:
+        content_matches_data = Path(content_root).resolve() == Path(data_dir).parent.resolve()
+    except Exception:
+        content_matches_data = Path(content_root) == Path(data_dir).parent
+    if not marker_ok or not content_matches_data or not engine_dict.get("data_dir") or not engine_dict.get("project_root"):
+        detected = detect_maker_engine(game_root)
+        engine_dict = detected.to_dict()
+        data_dir, content_root = resolve(engine_dict)
+
+    return game_root, Path(data_dir), Path(content_root), engine_dict
+
+
+def maker_project_paths(project_dir: str | os.PathLike[str]) -> Dict[str, Any]:
+    """Return one canonical path set for all Maker readers and previews.
+
+    UI code must use this resolver instead of guessing maker_game/data,
+    maker_game/www/data, and similar layouts independently.
+    """
+    project_root = Path(project_dir)
+    game_root, data_dir, content_root, engine_info = _maker_content_paths_for_project(project_root)
+    js_dir = _js_dir_from_engine_info(game_root, engine_info)
+    if not Path(js_dir).is_dir():
+        js_dir = Path(content_root) / "js"
+    return {
+        "project_root": project_root,
+        "game_root": Path(game_root),
+        "content_root": Path(content_root),
+        "data_dir": Path(data_dir),
+        "js_dir": Path(js_dir),
+        "img_dir": Path(content_root) / "img",
+        "fonts_dir": Path(content_root) / "fonts",
+        "engine": dict(engine_info or {}),
+    }
 
 
 def _rel_from_game_root(game_root: Path, path: Path) -> str:
@@ -1901,12 +2109,40 @@ def _image_rel_candidate(game_root: Path, content_root: Path, folder: str, name:
     return _rel_from_game_root(game_root, content_root / "img" / folder / base)
 
 
-def _candidate_key(candidate: Dict[str, Any]) -> Tuple[str, str, int]:
-    return (str(candidate.get("kind") or ""), str(candidate.get("rel_path") or ""), int(candidate.get("index") or 0))
+def _candidate_key(candidate: Dict[str, Any]) -> Tuple[Any, ...]:
+    layers = candidate.get("layers") if isinstance(candidate, dict) else None
+    layer_key: Tuple[Any, ...] = tuple(
+        (
+            str(layer.get("role") or ""),
+            str(layer.get("rel_path") or ""),
+            int(layer.get("x") or 0),
+            int(layer.get("y") or 0),
+        )
+        for layer in (layers or [])
+        if isinstance(layer, dict)
+    )
+    return (
+        str(candidate.get("kind") or ""),
+        str(candidate.get("rel_path") or ""),
+        int(candidate.get("index") or 0),
+        layer_key,
+        str(candidate.get("plugin_name") or ""),
+        str(candidate.get("actor_key") or ""),
+        str(candidate.get("pose") or ""),
+        str(candidate.get("expression") or ""),
+    )
 
 
 def _add_image_candidate(profile: Dict[str, Any], candidate: Dict[str, Any]) -> None:
-    if not isinstance(candidate, dict) or not candidate.get("rel_path"):
+    if not isinstance(candidate, dict):
+        return
+    if not candidate.get("rel_path"):
+        layers = candidate.get("layers") if isinstance(candidate.get("layers"), list) else []
+        first_layer = next((x for x in layers if isinstance(x, dict) and x.get("rel_path")), None)
+        if first_layer:
+            candidate = dict(candidate)
+            candidate["rel_path"] = str(first_layer.get("rel_path") or "")
+    if not candidate.get("rel_path"):
         return
     images = profile.setdefault("images", [])
     key = _candidate_key(candidate)
@@ -1968,6 +2204,497 @@ def _name_similarity_hint(name: str, file_name: str) -> bool:
     n = norm(name)
     f = norm(Path(str(file_name or "")).stem)
     return bool(n and f and (n in f or f in n))
+
+
+def _maker_plugin_parameters_by_name(
+    game_root: Path,
+    engine_info: MakerEngineInfo | Dict[str, Any] | None,
+    plugin_name: str,
+) -> Dict[str, Any]:
+    """Return one enabled plugin's parameter dictionary from generated plugins.js."""
+    try:
+        content_root = _content_root_from_engine_info(Path(game_root), engine_info)
+    except Exception:
+        content_root = Path(game_root)
+    path = Path(content_root) / "js" / "plugins.js"
+    if not path.is_file():
+        return {}
+    try:
+        payload, _prefix, _suffix = _read_maker_plugins_js_array(path)
+    except Exception:
+        return {}
+    target = str(plugin_name or "").strip().casefold()
+    for plugin in payload:
+        if not isinstance(plugin, dict) or not bool(plugin.get("status", True)):
+            continue
+        if str(plugin.get("name") or "").strip().casefold() != target:
+            continue
+        params = plugin.get("parameters")
+        return dict(params) if isinstance(params, dict) else {}
+    return {}
+
+
+def load_maker_trp_skit_actor_config(
+    game_root: Path,
+    engine_info: MakerEngineInfo | Dict[str, Any] | None = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Parse TRP_SkitMZ actor aliases/poses for both preview and profile analysis."""
+    params = _maker_plugin_parameters_by_name(Path(game_root), engine_info, "TRP_SkitMZ_Config")
+    raw_list = params.get("SkitActorSettings") or "[]"
+    try:
+        arr = json.loads(raw_list) if isinstance(raw_list, str) else raw_list
+    except Exception:
+        arr = []
+    actors: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(arr, list):
+        return actors
+    for raw in arr:
+        try:
+            obj = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(obj, dict):
+                continue
+            file_name = str(obj.get("fileName") or "").strip()
+            input_name = str(obj.get("inputName") or "").strip()
+            display_name = str(obj.get("name") or "").strip()
+            aliases: List[str] = []
+            for alias in (input_name, display_name, file_name):
+                if alias and alias not in aliases:
+                    aliases.append(alias)
+            if not aliases:
+                continue
+            poses: List[str] = []
+            pose_info: Dict[str, Dict[str, Any]] = {}
+            pose_raw = obj.get("pose") or "[]"
+            try:
+                pose_arr = json.loads(pose_raw) if isinstance(pose_raw, str) else pose_raw
+            except Exception:
+                pose_arr = []
+            for pr in pose_arr if isinstance(pose_arr, list) else []:
+                try:
+                    po = json.loads(pr) if isinstance(pr, str) else pr
+                except Exception:
+                    po = None
+                if not isinstance(po, dict):
+                    continue
+                pose_name = str(po.get("name") or "").strip()
+                if pose_name:
+                    poses.append(pose_name)
+                    pose_info[pose_name.casefold()] = po
+            default_pose = poses[0] if poses else "normal"
+            default_position = str(
+                obj.get("defaultPosition")
+                or obj.get("position")
+                or obj.get("positionName")
+                or "center"
+            ).strip()
+            canonical = input_name or display_name or file_name
+            data = {
+                "configKey": canonical.casefold(),
+                "inputName": input_name,
+                "name": display_name,
+                "fileName": file_name,
+                "aliases": aliases,
+                "defaultPose": default_pose,
+                "defaultPosition": default_position,
+                "poses": poses,
+                "poseInfo": pose_info,
+                "raw": obj,
+            }
+            for alias in aliases:
+                cleaned = str(alias or "").replace("\\PX[160]", "").strip().casefold()
+                if cleaned:
+                    actors[cleaned] = data
+        except Exception:
+            continue
+    return actors
+
+
+def load_maker_trp_skit_display_config(
+    game_root: Path,
+    engine_info: MakerEngineInfo | Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    params = _maker_plugin_parameters_by_name(Path(game_root), engine_info, "TRP_SkitMZ_Config")
+
+    def to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            text = str(value).strip()
+            return float(text) if text else float(default)
+        except Exception:
+            return float(default)
+
+    positions: Dict[str, float] = {}
+    raw_positions = params.get("xPosition") or "[]"
+    try:
+        arr = json.loads(raw_positions) if isinstance(raw_positions, str) else raw_positions
+    except Exception:
+        arr = []
+    for raw in arr if isinstance(arr, list) else []:
+        try:
+            obj = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            obj = None
+        if not isinstance(obj, dict):
+            continue
+        name = str(obj.get("name") or "").strip().casefold()
+        if name:
+            positions[name] = to_float(obj.get("position"), 5.0) / 10.0
+    return {
+        "busts_scale": max(1.0, min(400.0, to_float(params.get("bustsScale"), 100.0))),
+        "base_offset_y": to_float(params.get("baseOffsetY"), 0.0),
+        "positions": positions,
+    }
+
+
+def maker_trp_position_ratio(position: Any, *, positions: Dict[str, Any] | None = None) -> float | None:
+    pos = str(position or "").strip().casefold()
+    position_map = positions if isinstance(positions, dict) else {}
+    if pos in position_map:
+        try:
+            return max(0.0, min(1.0, float(position_map[pos])))
+        except Exception:
+            pass
+    aliases = {
+        "left": 0.22, "l": 0.22,
+        "center": 0.50, "centre": 0.50, "c": 0.50, "def": 0.50, "d": 0.50,
+        "right": 0.78, "r": 0.78,
+    }
+    if pos in aliases:
+        return aliases[pos]
+    try:
+        value = float(pos)
+        if 0.0 <= value <= 1.0:
+            return value
+        if 0.0 <= value <= 10.0:
+            return value / 10.0
+    except Exception:
+        pass
+    return None
+
+
+def parse_maker_trp_skit_command(
+    line: Any,
+    actors_cfg: Dict[str, Any] | None,
+    positions: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    try:
+        import shlex
+        parts = shlex.split(str(line or ""), posix=False)
+    except Exception:
+        parts = str(line or "").split()
+    clean = [str(x or "").strip().strip(",;") for x in parts if str(x or "").strip()]
+    result = {"parts": clean, "op": "", "actor": "", "actor_index": -1, "position": "", "explicit_position": False}
+    if len(clean) < 2 or clean[0].casefold() != "skit":
+        return result
+    result["op"] = clean[1].casefold()
+    actor_map = actors_cfg if isinstance(actors_cfg, dict) else {}
+    for idx in range(2, len(clean)):
+        token = clean[idx]
+        key = token.replace("\\PX[160]", "").strip().casefold()
+        if key in actor_map:
+            result["actor"] = token
+            result["actor_index"] = idx
+            break
+    if not result["actor"] and len(clean) >= 3:
+        result["actor"] = clean[2]
+        result["actor_index"] = 2
+    position_map = positions if isinstance(positions, dict) else {}
+    for idx in range(max(2, int(result["actor_index"]) + 1), len(clean)):
+        token = clean[idx]
+        low = token.casefold()
+        is_named = low in position_map or low in {"left", "l", "center", "centre", "c", "def", "d", "right", "r"}
+        try:
+            value = float(low)
+            is_numeric = 0.0 <= value <= 10.0
+        except Exception:
+            is_numeric = False
+        if is_named or is_numeric:
+            result["position"] = token
+            result["explicit_position"] = True
+    return result
+
+
+def maker_trp_skit_layer_spec(
+    actor_key: Any,
+    pose: Any = None,
+    expression: Any = None,
+    *,
+    actors_cfg: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    actors = actors_cfg if isinstance(actors_cfg, dict) else {}
+    lookup_key = str(actor_key or "").replace("\\PX[160]", "").strip().casefold()
+    cfg = actors.get(lookup_key) or {}
+    file_name = str(cfg.get("fileName") or actor_key or "").strip()
+    resolved_pose = str(pose or cfg.get("defaultPose") or "normal").strip()
+    requested_expression = str(expression or "default").strip()
+    pose_info = (cfg.get("poseInfo") or {}).get(resolved_pose.casefold()) if isinstance(cfg.get("poseInfo"), dict) else {}
+    pose_info = pose_info if isinstance(pose_info, dict) else {}
+    numeric_expression_token = ""
+    normalized_expression = requested_expression
+    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", requested_expression):
+        numeric_expression_token = requested_expression
+        normalized_expression = str(
+            pose_info.get("defaultExpression")
+            or pose_info.get("defaultExp")
+            or "default"
+        ).strip() or "default"
+    default_expression = str(
+        pose_info.get("defaultExpression")
+        or pose_info.get("defaultExp")
+        or "default"
+    ).strip() or "default"
+    base_candidates = [f"busts/{file_name}/{resolved_pose}"] if file_name and resolved_pose else []
+    overlay_candidates = [f"busts/{file_name}/{resolved_pose}_{normalized_expression}"] if file_name and resolved_pose and normalized_expression else []
+    fallback_candidates: List[str] = []
+    if file_name and normalized_expression:
+        fallback_candidates.append(f"busts/{file_name}/{normalized_expression}")
+    if file_name and resolved_pose and normalized_expression:
+        fallback_candidates.append(f"busts/{file_name}/{resolved_pose}_{normalized_expression}")
+    return {
+        "actor_key": actor_key,
+        "config": cfg,
+        "file_name": file_name,
+        "pose": resolved_pose,
+        "requested_expression": requested_expression,
+        "normalized_expression": normalized_expression,
+        "numeric_expression_token": numeric_expression_token,
+        "default_expression": default_expression,
+        "pose_info": pose_info,
+        "base_candidates": base_candidates,
+        "overlay_candidates": overlay_candidates,
+        "fallback_candidates": fallback_candidates,
+    }
+
+
+def _maker_trp_asset_rel_from_candidate(game_root: Path, content_root: Path, candidate: str) -> str:
+    raw = str(candidate or "").strip().replace("\\", "/").lstrip("/")
+    if not raw:
+        return ""
+    suffixes = (".png", ".PNG", ".png_", ".PNG_", ".jpg", ".jpg_", ".jpeg", ".jpeg_", ".webp", ".webp_", ".bmp", ".bmp_", ".rpgmvp", ".rpgmvp_")
+    names = [raw]
+    if Path(raw).suffix == "":
+        names.extend(raw + ext for ext in suffixes)
+    bases = (
+        Path(content_root) / "img" / "pictures",
+        Path(content_root) / "pictures",
+        Path(game_root) / "img" / "pictures",
+        Path(game_root) / "pictures",
+    )
+    seen = set()
+    for base in bases:
+        for name in names:
+            path = base / name
+            key = str(path).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            if path.is_file():
+                return _rel_from_game_root(Path(game_root), path)
+    return ""
+
+
+def resolve_maker_trp_skit_layer_paths(
+    game_root: Path,
+    content_root: Path,
+    actor_key: Any,
+    pose: Any = None,
+    expression: Any = None,
+    *,
+    actors_cfg: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    spec = maker_trp_skit_layer_spec(actor_key, pose, expression, actors_cfg=actors_cfg)
+    base_rel = next((rel for rel in (_maker_trp_asset_rel_from_candidate(game_root, content_root, x) for x in spec.get("base_candidates") or []) if rel), "")
+    overlay_rel = next((rel for rel in (_maker_trp_asset_rel_from_candidate(game_root, content_root, x) for x in spec.get("overlay_candidates") or []) if rel), "")
+    resolved_expression = str(spec.get("normalized_expression") or "default")
+    fallback = None
+    if base_rel and not overlay_rel:
+        default_expr = str(spec.get("default_expression") or "default")
+        token = str(spec.get("normalized_expression") or "")
+        if default_expr and token.casefold() != default_expr.casefold():
+            default_candidate = f"busts/{spec.get('file_name')}/{spec.get('pose')}_{default_expr}"
+            default_rel = _maker_trp_asset_rel_from_candidate(game_root, content_root, default_candidate)
+            if default_rel:
+                overlay_rel = default_rel
+                resolved_expression = default_expr
+                fallback = {"from": token, "to": default_expr, "candidate": default_candidate}
+    if not base_rel and not overlay_rel:
+        merged_rel = next((rel for rel in (_maker_trp_asset_rel_from_candidate(game_root, content_root, x) for x in spec.get("fallback_candidates") or []) if rel), "")
+        if merged_rel:
+            base_rel = merged_rel
+    return {
+        **spec,
+        "base_rel_path": base_rel,
+        "overlay_rel_path": overlay_rel,
+        "resolved_expression": resolved_expression,
+        "expression_fallback": fallback,
+        "composition": "base_plus_expression_overlay" if base_rel and overlay_rel else ("base_only" if base_rel else "missing"),
+    }
+
+
+def iter_maker_trp_skit_dialogue_compositions(
+    commands: List[Any],
+    *,
+    actors_cfg: Dict[str, Any] | None,
+    positions: Dict[str, Any] | None = None,
+    event_name: str = "",
+    actor_lookup: Dict[str, Any] | None = None,
+) -> List[Dict[str, Any]]:
+    """Return TRP actor pose/expression snapshots at each Show Text command."""
+    actors = actors_cfg if isinstance(actors_cfg, dict) else {}
+    if not actors:
+        return []
+    position_map = positions if isinstance(positions, dict) else {}
+    states: Dict[str, Dict[str, Any]] = {}
+    out: List[Dict[str, Any]] = []
+    show_sequence = 0
+
+    def clean_name(value: Any) -> str:
+        text = str(value or "").replace("\\PX[160]", "").strip()
+        text = re.sub(r"(?:\\|¥)[A-Za-z_]+(?:\[[^\]]*\])?", "", text)
+        return text.strip()
+
+    def get_state(name: Any) -> Dict[str, Any]:
+        cleaned = clean_name(name)
+        lookup = cleaned.casefold()
+        cfg = actors.get(lookup) or {"fileName": cleaned, "defaultPose": "normal", "defaultPosition": "center", "configKey": lookup}
+        config_key = str(cfg.get("configKey") or lookup).casefold()
+        state = next((x for x in states.values() if str(x.get("config_key") or "").casefold() == config_key), None)
+        if state is None:
+            state = {
+                "key": lookup,
+                "config_key": config_key,
+                "actor": cleaned,
+                "pose": cfg.get("defaultPose") or "normal",
+                "expression": "default",
+                "visible": False,
+                "position": cfg.get("defaultPosition") or "center",
+                "show_sequence": -1,
+                "source_command_index": -1,
+            }
+            states[lookup] = state
+        return state
+
+    def occupy_position(actor_state: Dict[str, Any], *, explicit: bool) -> None:
+        ratio = maker_trp_position_ratio(actor_state.get("position"), positions=position_map)
+        if ratio is None or not explicit:
+            return
+        for other in states.values():
+            if other is actor_state or not other.get("visible"):
+                continue
+            other_ratio = maker_trp_position_ratio(other.get("position"), positions=position_map)
+            if other_ratio is not None and abs(float(other_ratio) - float(ratio)) < 0.001:
+                other["visible"] = False
+
+    i = 0
+    while i < len(commands):
+        cmd = commands[i] if isinstance(commands[i], dict) else {}
+        try:
+            code = int(cmd.get("code") or 0)
+        except Exception:
+            code = 0
+        params = cmd.get("parameters") if isinstance(cmd.get("parameters"), list) else []
+        if code in (355, 655):
+            for raw_line in params:
+                line = str(raw_line or "").strip()
+                if not line.casefold().startswith("skit"):
+                    continue
+                parsed = parse_maker_trp_skit_command(line, actors, position_map)
+                parts = parsed.get("parts") or []
+                op = str(parsed.get("op") or "").casefold()
+                actor = str(parsed.get("actor") or "").strip()
+                actor_idx = int(parsed.get("actor_index") or -1)
+                if op in ("start", ""):
+                    continue
+                if op in ("end", "clear"):
+                    states.clear()
+                    continue
+                if not actor:
+                    continue
+                state = get_state(actor)
+                state["source_command_index"] = i
+                if op in ("hide", "fadeout"):
+                    state["visible"] = False
+                elif op == "pose":
+                    cfg = actors.get(clean_name(actor).casefold()) or {}
+                    pose_names = {str(x).casefold(): str(x) for x in (cfg.get("poses") or [])}
+                    tail = parts[actor_idx + 1:] if actor_idx >= 0 else []
+                    pose_token = next((pose_names[str(x).casefold()] for x in tail if str(x).casefold() in pose_names), "")
+                    if not pose_token and tail:
+                        pose_token = str(tail[-1])
+                    if pose_token:
+                        state["pose"] = pose_token
+                    candidate_tokens = []
+                    for raw_token in tail:
+                        token = str(raw_token or "").strip()
+                        if not token or (pose_token and token.casefold() == str(pose_token).casefold()):
+                            continue
+                        if maker_trp_position_ratio(token, positions=position_map) is not None:
+                            continue
+                        if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", token):
+                            continue
+                        if token.casefold() in {"true", "false", "wait", "nowait", "linear", "easein", "easeout", "easeinout"}:
+                            continue
+                        candidate_tokens.append(token)
+                    if candidate_tokens:
+                        state["expression"] = candidate_tokens[-1]
+                elif op in ("exp", "expression"):
+                    tail = parts[actor_idx + 1:] if actor_idx >= 0 else []
+                    if tail:
+                        state["expression"] = str(tail[-1])
+                elif op in ("fadein", "show"):
+                    show_sequence += 1
+                    if parsed.get("explicit_position"):
+                        state["position"] = parsed.get("position")
+                    occupy_position(state, explicit=bool(parsed.get("explicit_position")))
+                    state["visible"] = True
+                    state["show_sequence"] = show_sequence
+                elif op == "move" and parsed.get("explicit_position"):
+                    state["position"] = parsed.get("position")
+                    occupy_position(state, explicit=True)
+            i += 1
+            continue
+        if code == 101:
+            lines: List[str] = []
+            j = i + 1
+            while j < len(commands):
+                nxt = commands[j] if isinstance(commands[j], dict) else {}
+                try:
+                    nxt_code = int(nxt.get("code") or 0)
+                except Exception:
+                    nxt_code = 0
+                if nxt_code != 401:
+                    break
+                nxt_params = nxt.get("parameters") if isinstance(nxt.get("parameters"), list) else []
+                if nxt_params:
+                    lines.append(str(nxt_params[0] or ""))
+                j += 1
+            info = infer_maker_speaker(params=params, event_name=event_name, text="\n".join(lines), actor_lookup=actor_lookup)
+            speaker = clean_name(info.get("speaker") or (params[4] if len(params) >= 5 else ""))
+            cfg = actors.get(speaker.casefold()) if speaker else None
+            if isinstance(cfg, dict):
+                state = get_state(speaker)
+                joined = " ".join([*(str(x or "") for x in params), *lines])
+                for match in re.finditer(r"(?:\\|¥)SE\[([^\]]+)\]", joined, re.I):
+                    expr = str(match.group(1) or "").strip()
+                    if expr:
+                        state["expression"] = expr
+                out.append({
+                    "command_index": i,
+                    "speaker": speaker,
+                    "speaker_source": str(info.get("speaker_source") or ""),
+                    "speaker_confidence": float(info.get("speaker_confidence") or 0.0),
+                    "actor_key": state.get("actor") or speaker,
+                    "config_key": state.get("config_key") or cfg.get("configKey") or speaker.casefold(),
+                    "pose": state.get("pose") or cfg.get("defaultPose") or "normal",
+                    "expression": state.get("expression") or "default",
+                    "visible": bool(state.get("visible")),
+                    "position": state.get("position") or cfg.get("defaultPosition") or "center",
+                    "source_command_index": int(state.get("source_command_index") or -1),
+                    "show_sequence": int(state.get("show_sequence") or -1),
+                })
+            i = j
+            continue
+        i += 1
+    return out
 
 
 def _collect_picture_candidates_from_commands(
@@ -2147,6 +2874,9 @@ def collect_maker_character_profiles(project_dir: str | os.PathLike[str], data: 
                 _add_image_candidate(profile, {"kind": "face", "label": "대사 얼굴칩 후보", "rel_path": _image_rel_candidate(game_root, content_root, "faces", face_name), "index": face_index, "crop_type": "face", "confidence": max(0.70, min(0.95, conf)), "count": 1, "evidence": f"대사 TextUnit faceName={face_name} faceIndex={face_index}"})
 
     actor_lookup = load_maker_actor_lookup(game_root, engine_info)
+    trp_actors = load_maker_trp_skit_actor_config(game_root, engine_info)
+    trp_display = load_maker_trp_skit_display_config(game_root, engine_info) if trp_actors else {}
+    trp_layer_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     try:
         for _map_id, map_name, map_path, map_data in iter_existing_maps(game_root, engine_info):
             events = map_data.get("events") if isinstance(map_data, dict) else []
@@ -2163,6 +2893,67 @@ def collect_maker_character_profiles(project_dir: str | os.PathLike[str], data: 
                     commands = page.get("list") if isinstance(page, dict) else []
                     if isinstance(commands, list):
                         _collect_picture_candidates_from_commands(profiles, commands, event_name=ev_name, map_name=map_name, source_file=map_path.name, game_root=game_root, content_root=content_root, actor_lookup=actor_lookup, speaker_aliases=speaker_aliases)
+                        if trp_actors:
+                            snapshots = iter_maker_trp_skit_dialogue_compositions(
+                                commands,
+                                actors_cfg=trp_actors,
+                                positions=(trp_display.get("positions") or {}) if isinstance(trp_display, dict) else {},
+                                event_name=ev_name,
+                                actor_lookup=actor_lookup,
+                            )
+                            for snapshot in snapshots:
+                                speaker = _maker_profile_key(snapshot.get("speaker") or "Unknown", speaker_aliases)
+                                if not speaker or speaker == "Unknown":
+                                    continue
+                                profile = _profile_entry(profiles, speaker)
+                                layer_key = (
+                                    str(snapshot.get("config_key") or snapshot.get("actor_key") or speaker).casefold(),
+                                    str(snapshot.get("pose") or "normal").casefold(),
+                                    str(snapshot.get("expression") or "default").casefold(),
+                                )
+                                layer_info = trp_layer_cache.get(layer_key)
+                                if not isinstance(layer_info, dict):
+                                    layer_info = resolve_maker_trp_skit_layer_paths(
+                                        game_root,
+                                        content_root,
+                                        snapshot.get("actor_key") or speaker,
+                                        snapshot.get("pose"),
+                                        snapshot.get("expression"),
+                                        actors_cfg=trp_actors,
+                                    )
+                                    trp_layer_cache[layer_key] = layer_info
+                                layers = []
+                                if layer_info.get("base_rel_path"):
+                                    layers.append({"role": "base_pose", "rel_path": str(layer_info.get("base_rel_path") or ""), "x": 0, "y": 0})
+                                if layer_info.get("overlay_rel_path"):
+                                    layers.append({"role": "expression_overlay", "rel_path": str(layer_info.get("overlay_rel_path") or ""), "x": 0, "y": 0})
+                                if not layers:
+                                    continue
+                                visible = bool(snapshot.get("visible"))
+                                confidence = 0.97 if visible else 0.89
+                                resolved_expression = str(layer_info.get("resolved_expression") or snapshot.get("expression") or "default")
+                                _add_profile_hint(profile, "TRP_SkitMZ")
+                                _add_image_candidate(profile, {
+                                    "kind": "plugin_composite",
+                                    "label": "플러그인 조합 스탠딩",
+                                    "rel_path": str(layers[0].get("rel_path") or ""),
+                                    "layers": layers,
+                                    "index": 0,
+                                    "crop_type": "composite",
+                                    "confidence": confidence,
+                                    "count": 1,
+                                    "plugin_name": "TRP_SkitMZ",
+                                    "actor_key": str(snapshot.get("actor_key") or speaker),
+                                    "pose": str(layer_info.get("pose") or snapshot.get("pose") or "normal"),
+                                    "expression": resolved_expression,
+                                    "visible_at_dialogue": visible,
+                                    "evidence": (
+                                        f"TRP_SkitMZ | map={map_name} | event={ev_name} | "
+                                        f"actor={snapshot.get('actor_key') or speaker} | "
+                                        f"pose={layer_info.get('pose') or snapshot.get('pose') or 'normal'} | "
+                                        f"expression={resolved_expression} | visible={str(visible).lower()}"
+                                    ),
+                                })
     except Exception:
         pass
 
@@ -2218,6 +3009,307 @@ _MAKER_CONTROL_CODE_RE = re.compile(
 # 번역 API에는 원문 그대로 보낸다. 가짜 보호 토큰으로 치환하지 않는다.
 _MAKER_MESSAGE_PLACEHOLDER_RE = re.compile(r"%(?:\d+)")
 
+# AI 자동 제어코드 반영용 불투명 토큰. 실제 RPG Maker 제어코드는 API 입력에서
+# 제거하고, 의미 위치만 이 토큰으로 표시한다. 모델 응답이 토큰을 정확히 보존했을
+# 때만 원래 코드를 되돌리므로 코드 인수 변형/누락을 프로그램 쪽에서 막을 수 있다.
+_MAKER_AI_CONTROL_TOKEN_RE = re.compile(r"⟦YSB_CC_(\d{4})⟧", re.IGNORECASE)
+_MAKER_AI_CONTROL_TOKEN_FUZZY_RE = re.compile(
+    r"(?:⟦|\[\[)\s*YSB[ _-]*CC[ _-]*(\d{4})\s*(?:⟧|\]\])",
+    re.IGNORECASE,
+)
+
+
+def _canonicalize_maker_ai_control_tokens(text: Any) -> str:
+    raw = str(text or "")
+    return _MAKER_AI_CONTROL_TOKEN_FUZZY_RE.sub(
+        lambda m: f"⟦YSB_CC_{int(m.group(1)):04d}⟧",
+        raw,
+    )
+
+
+def _maker_control_code_requires_line_edge(code: Any) -> bool:
+    """Return True only for controls whose edge position is structurally important.
+
+    Semantic/range controls such as ``\\C[n]`` are deliberately movable: the AI may
+    place them around the corresponding translated phrase. Layout/font-position and
+    timing controls that start or finish a physical message line stay anchored.
+    """
+    raw = str(code or "")
+    body = raw[1:] if raw.startswith(("\\", "¥")) else raw
+    name_match = re.match(r"([A-Za-z가-힣_]+)", body)
+    name = (name_match.group(1) if name_match else body[:1]).upper()
+    if name in {"FS", "PX", "PY", "SE"}:
+        return True
+    return body[:1] in {"!", ".", "|", "^"}
+
+
+def _maker_ai_control_token_line_layout(
+    text: Any,
+    mapping: Iterable[Tuple[str, str]] | None = None,
+) -> List[Dict[str, Any]]:
+    """Return per-line token order and structurally anchored edge tokens.
+
+    All tokens must remain on their source physical line and keep their order.
+    Only controls with a line-level role are required to stay at an edge. Semantic
+    controls (for example a color pair) may move with their translated phrase.
+    """
+    normalized = _canonicalize_maker_ai_control_tokens(text).replace("\r\n", "\n").replace("\r", "\n")
+    token_to_code = {
+        _canonicalize_maker_ai_control_tokens(token): str(code or "")
+        for token, code in (mapping or [])
+    }
+    layout: List[Dict[str, Any]] = []
+    for line in normalized.split("\n"):
+        matches = list(_MAKER_AI_CONTROL_TOKEN_RE.finditer(line))
+        tokens = [m.group(0) for m in matches]
+
+        edge_prefix_tokens: List[str] = []
+        cursor = 0
+        for m in matches:
+            between = line[cursor:m.start()]
+            if between.strip():
+                break
+            edge_prefix_tokens.append(m.group(0))
+            cursor = m.end()
+
+        edge_suffix_tokens_rev: List[str] = []
+        cursor = len(line)
+        for m in reversed(matches):
+            between = line[m.end():cursor]
+            if between.strip():
+                break
+            edge_suffix_tokens_rev.append(m.group(0))
+            cursor = m.start()
+        edge_suffix_tokens = list(reversed(edge_suffix_tokens_rev))
+
+        if token_to_code:
+            prefix_tokens = [
+                token for token in edge_prefix_tokens
+                if _maker_control_code_requires_line_edge(token_to_code.get(token, ""))
+            ]
+            suffix_tokens = [
+                token for token in edge_suffix_tokens
+                if _maker_control_code_requires_line_edge(token_to_code.get(token, ""))
+            ]
+        else:
+            # Compatibility fallback for a spec created without token/code metadata.
+            prefix_tokens = edge_prefix_tokens
+            suffix_tokens = edge_suffix_tokens
+
+        layout.append({
+            "tokens": tokens,
+            "prefix_tokens": prefix_tokens,
+            "suffix_tokens": suffix_tokens,
+        })
+    return layout
+
+
+def _maker_raw_control_code_lines(text: Any) -> List[List[str]]:
+    raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    return [[m.group(0) for m in _MAKER_CONTROL_CODE_RE.finditer(line)] for line in raw.split("\n")]
+
+
+def protect_maker_control_codes_for_ai(text: Any) -> Tuple[str, List[Tuple[str, str]]]:
+    r"""Replace every Maker control code with a stable opaque AI token.
+
+    The model never needs to reproduce ``\C[26]`` or another real command. It only
+    moves exact opaque tokens with the translated phrase. The original command text
+    stays in ``mapping`` and is restored only after strict validation.
+    """
+    raw = str(text or "")
+    mapping: List[Tuple[str, str]] = []
+
+    def repl(match):
+        token = f"⟦YSB_CC_{len(mapping) + 1:04d}⟧"
+        mapping.append((token, match.group(0)))
+        return token
+
+    return _MAKER_CONTROL_CODE_RE.sub(repl, raw), mapping
+
+
+def build_maker_control_code_auto_context(raw_text: Any, tokenized_text: Any, mapping: Iterable[Tuple[str, str]] | None) -> str:
+    pairs = [(str(token), str(code)) for token, code in (mapping or [])]
+    if not pairs:
+        return ""
+    templates = get_runtime_prompt_templates()
+    entry_template = templates.get("control_code_mapping_entry", "")
+    mapping_lines = "\n".join(
+        render_prompt_template(entry_template, TOKEN=token, CODE=code)
+        for token, code in pairs
+    )
+    return render_prompt_template(
+        templates.get("control_code_item_context", ""),
+        RAW_TEXT=str(raw_text or ""),
+        TOKENIZED_TEXT=str(tokenized_text or ""),
+        TOKEN_MAPPING=mapping_lines,
+    )
+
+
+def _maker_control_spec_parts(control_map: Any) -> Tuple[List[Tuple[str, str]], Dict[str, Any]]:
+    if isinstance(control_map, dict):
+        raw_mapping = control_map.get("mapping") or []
+        meta = dict(control_map)
+    else:
+        raw_mapping = control_map or []
+        meta = {}
+    pairs: List[Tuple[str, str]] = []
+    for pair in raw_mapping:
+        try:
+            token, code = pair
+        except Exception:
+            continue
+        token = str(token or "")
+        code = str(code or "")
+        if token and code:
+            pairs.append((token, code))
+    return pairs, meta
+
+
+def restore_maker_translation_text_checked(
+    text: Any,
+    control_map: Any = None,
+    raw_text: Any = "",
+) -> Tuple[str, str, Dict[str, Any]]:
+    """Validate AI tokens, restore exact codes, or fall back safely.
+
+    Status values:
+    - ``none``: automatic placement was not requested for this item.
+    - ``applied``: every opaque token was valid and restored.
+    - ``applied_raw``: the model returned the exact original raw codes instead.
+    - ``fallback_edge``: token validation failed, but deterministic edge restore was safe.
+    - ``failed_plain``: middle/range placement could not be trusted; plain translation is kept.
+    """
+    translated = _canonicalize_maker_ai_control_tokens(text)
+    mapping, meta = _maker_control_spec_parts(control_map)
+    if not mapping:
+        return translated, "none", {}
+
+    expected_tokens = [token for token, _code in mapping]
+    expected_codes = [code for _token, code in mapping]
+    seen_tokens = [m.group(0) for m in _MAKER_AI_CONTROL_TOKEN_RE.finditer(translated)]
+    normalized_expected = [_canonicalize_maker_ai_control_tokens(x) for x in expected_tokens]
+    expected_line_count = int(meta.get("expected_line_count") or 0) if isinstance(meta, dict) else 0
+    line_count_ok = not expected_line_count or translated.count("\n") + 1 == expected_line_count
+    raw_codes_in_output = [m.group(0) for m in _MAKER_CONTROL_CODE_RE.finditer(translated)]
+
+    expected_layout = meta.get("expected_token_line_layout") if isinstance(meta, dict) else None
+    if not isinstance(expected_layout, list):
+        expected_layout = _maker_ai_control_token_line_layout(meta.get("normalized_source") or "", mapping)
+    seen_layout = _maker_ai_control_token_line_layout(translated, mapping)
+
+    def _layout_matches(expected: Any, seen: Any) -> bool:
+        if not isinstance(expected, list) or not isinstance(seen, list) or len(expected) != len(seen):
+            return False
+        for expected_line, seen_line in zip(expected, seen):
+            if not isinstance(expected_line, dict) or not isinstance(seen_line, dict):
+                return False
+            expected_line_tokens = [
+                _canonicalize_maker_ai_control_tokens(token)
+                for token in (expected_line.get("tokens") or [])
+            ]
+            expected_prefix = [
+                _canonicalize_maker_ai_control_tokens(token)
+                for token in (expected_line.get("prefix_tokens") or [])
+            ]
+            expected_suffix = [
+                _canonicalize_maker_ai_control_tokens(token)
+                for token in (expected_line.get("suffix_tokens") or [])
+            ]
+            seen_line_tokens = list(seen_line.get("tokens") or [])
+            seen_prefix = list(seen_line.get("prefix_tokens") or [])
+            seen_suffix = list(seen_line.get("suffix_tokens") or [])
+            # A token may move with its translated phrase inside the same physical
+            # line, but no token may cross a line. Codes that originally preceded
+            # all visible text must remain at the beginning. The same rule applies
+            # to trailing edge codes. Extra inline/range tokens are allowed at an
+            # edge when their translated phrase itself moved to that edge.
+            if seen_line_tokens != expected_line_tokens:
+                return False
+            if expected_prefix and seen_prefix[:len(expected_prefix)] != expected_prefix:
+                return False
+            if expected_suffix and seen_suffix[-len(expected_suffix):] != expected_suffix:
+                return False
+        return True
+
+    line_layout_ok = _layout_matches(expected_layout, seen_layout)
+    valid_tokens = (
+        seen_tokens == normalized_expected
+        and len(seen_tokens) == len(set(seen_tokens))
+        and not raw_codes_in_output
+        and line_count_ok
+        and line_layout_ok
+    )
+    if valid_tokens:
+        restored = translated
+        for token, code in zip(normalized_expected, expected_codes):
+            restored = restored.replace(token, code, 1)
+        restored_codes = [m.group(0) for m in _MAKER_CONTROL_CODE_RE.finditer(restored)]
+        restored_code_lines = _maker_raw_control_code_lines(restored)
+        expected_code_lines = meta.get("expected_raw_code_lines") if isinstance(meta, dict) else None
+        if not isinstance(expected_code_lines, list):
+            expected_code_lines = _maker_raw_control_code_lines(meta.get("raw_text") or raw_text or "")
+        if restored_codes == expected_codes and restored_code_lines == expected_code_lines:
+            return restored, "applied", {
+                "count": len(mapping),
+                "line_count_ok": True,
+                "line_layout_ok": True,
+            }
+
+    # Some models ignore the opaque-token instruction and emit the exact original
+    # commands. Accept only an exact per-line ordered match with the original edge
+    # placement. Any changed argument, line move, or displaced edge code is rejected.
+    raw_layout_ok = False
+    expected_code_lines = meta.get("expected_raw_code_lines") if isinstance(meta, dict) else None
+    if not isinstance(expected_code_lines, list):
+        expected_code_lines = _maker_raw_control_code_lines(meta.get("raw_text") or raw_text or "")
+    if not seen_tokens and raw_codes_in_output == expected_codes and line_count_ok:
+        token_index = 0
+
+        def _raw_to_token(match):
+            nonlocal token_index
+            if token_index >= len(normalized_expected):
+                return match.group(0)
+            token = normalized_expected[token_index]
+            token_index += 1
+            return token
+
+        raw_as_tokens = _MAKER_CONTROL_CODE_RE.sub(_raw_to_token, translated)
+        raw_layout_ok = (
+            token_index == len(normalized_expected)
+            and _maker_raw_control_code_lines(translated) == expected_code_lines
+            and _layout_matches(expected_layout, _maker_ai_control_token_line_layout(raw_as_tokens, mapping))
+        )
+        if raw_layout_ok:
+            return translated, "applied_raw", {
+                "count": len(mapping),
+                "line_count_ok": True,
+                "line_layout_ok": True,
+            }
+
+    # Never leave malformed or invented tokens/codes in the user's translation.
+    plain = _MAKER_AI_CONTROL_TOKEN_RE.sub("", translated)
+    plain = _MAKER_AI_CONTROL_TOKEN_FUZZY_RE.sub("", plain)
+    plain = strip_maker_control_codes(plain)
+    source_raw = str(raw_text or meta.get("raw_text") or "")
+    if source_raw:
+        fallback, edge_status = apply_maker_edge_control_codes(plain, source_raw)
+        if edge_status in {"applied", "already"}:
+            return fallback, "fallback_edge", {
+                "expected_tokens": normalized_expected,
+                "seen_tokens": seen_tokens,
+                "line_count_ok": line_count_ok,
+                "line_layout_ok": line_layout_ok,
+                "raw_layout_ok": raw_layout_ok,
+            }
+    return plain, "failed_plain", {
+        "expected_tokens": normalized_expected,
+        "seen_tokens": seen_tokens,
+        "raw_codes": raw_codes_in_output,
+        "line_count_ok": line_count_ok,
+        "line_layout_ok": line_layout_ok,
+        "raw_layout_ok": raw_layout_ok,
+    }
+
 
 def strip_maker_control_codes(text: Any) -> str:
     """Return the human-readable text with RPG Maker control codes removed.
@@ -2228,19 +3320,9 @@ def strip_maker_control_codes(text: Any) -> str:
     return _MAKER_CONTROL_CODE_RE.sub("", str(text or ""))
 
 
-def analyze_maker_control_codes(text: Any) -> Dict[str, Any]:
-    """Classify RPG Maker control-code placement for UI assistance.
-
-    placement:
-    - none: no control code
-    - edge: all control codes are before the first meaningful text segment or
-      after the last meaningful text segment.  These can be safely copied to the
-      beginning/end of the translation on user command.
-    - middle: at least one control code appears between meaningful text segments.
-      These require manual handling because the translated phrase position is
-      ambiguous.
-    """
-    raw = str(text or "")
+def _analyze_maker_control_codes_flat(raw_text: Any) -> Dict[str, Any]:
+    """Classify control-code placement for one physical line."""
+    raw = str(raw_text or "")
     matches = list(_MAKER_CONTROL_CODE_RE.finditer(raw))
     plain = strip_maker_control_codes(raw)
     if not matches:
@@ -2298,6 +3380,94 @@ def analyze_maker_control_codes(text: Any) -> Dict[str, Any]:
         "control_codes": [m.group(0) for m in matches],
         "auto_restorable": placement == "edge" and bool(prefix_codes or suffix_codes),
     }
+
+
+def _analyze_maker_control_codes_multiline(raw_text: Any) -> Dict[str, Any] | None:
+    """Treat each source line as an independent restoration unit.
+
+    RPG Maker dialogue is often stored as multiple visible lines.  A code at the
+    beginning of line 2 must not be treated as a dangerous middle code for the
+    whole paragraph.  If every non-empty line is edge-only, the row is safe for
+    line-wise auto-restore.
+    """
+    raw = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if "\n" not in raw:
+        return None
+    if not _MAKER_CONTROL_CODE_RE.search(raw):
+        return None
+    lines = raw.split("\n")
+    units: List[Dict[str, Any]] = []
+    control_codes: List[str] = []
+    middle_codes: List[str] = []
+    has_codes = False
+    any_restorable = False
+    plain_lines: List[str] = []
+    for line_no, line in enumerate(lines):
+        info = _analyze_maker_control_codes_flat(line)
+        plain = str(info.get("plain_text") or "")
+        plain_lines.append(plain)
+        line_has_codes = bool(info.get("has_control_codes"))
+        has_codes = has_codes or line_has_codes
+        control_codes.extend(list(info.get("control_codes") or []))
+        if str(line or "").strip() == "" and not line_has_codes:
+            units.append({
+                "line_index": line_no,
+                "raw_text": line,
+                "plain_text": plain,
+                "prefix_codes": "",
+                "suffix_codes": "",
+                "placement": "none",
+                "auto_restorable": False,
+                "has_control_codes": False,
+            })
+            continue
+        if info.get("placement") == "middle":
+            middle_codes.extend(list(info.get("middle_codes") or []))
+        if info.get("auto_restorable"):
+            any_restorable = True
+        units.append({
+            "line_index": line_no,
+            "raw_text": line,
+            "plain_text": plain,
+            "prefix_codes": str(info.get("prefix_codes") or ""),
+            "suffix_codes": str(info.get("suffix_codes") or ""),
+            "placement": str(info.get("placement") or "none"),
+            "auto_restorable": bool(info.get("auto_restorable")),
+            "has_control_codes": line_has_codes,
+        })
+    if not has_codes:
+        return None
+    linewise_safe = not middle_codes and any_restorable
+    return {
+        "raw_text": raw,
+        "plain_text": "\n".join(plain_lines),
+        "has_control_codes": True,
+        "placement": "edge" if linewise_safe else "middle",
+        "prefix_codes": "",
+        "suffix_codes": "",
+        "middle_codes": middle_codes,
+        "control_codes": control_codes,
+        "auto_restorable": bool(linewise_safe),
+        "linewise_restore": bool(linewise_safe),
+        "line_units": units,
+    }
+
+
+def analyze_maker_control_codes(text: Any) -> Dict[str, Any]:
+    """Classify RPG Maker control-code placement for UI assistance.
+
+    placement:
+    - none: no control code
+    - edge: all control codes are before/after the meaningful text.  For
+      multi-line dialogue, each physical line is judged independently.
+    - middle: at least one control code appears between meaningful text segments
+      within the same line and requires manual handling.
+    """
+    raw = str(text or "")
+    info = _analyze_maker_control_codes_multiline(raw)
+    if info is not None:
+        return info
+    return _analyze_maker_control_codes_flat(raw)
 
 
 
@@ -2542,6 +3712,41 @@ def compose_maker_inline_speaker_writeback(item: Dict[str, Any], body_text: str)
         return speaker_line
     return body
 
+def _apply_line_edge_control_codes(translated: str, info: Dict[str, Any]) -> Tuple[str, str]:
+    """Apply line-wise edge codes when the source had explicit newlines."""
+    if not str(translated or "").strip():
+        return translated, "empty"
+    units = list(info.get("line_units") or [])
+    if not units:
+        return translated, "manual"
+    translated_norm = str(translated or "").replace("\r\n", "\n").replace("\r", "\n")
+    trans_lines = translated_norm.split("\n")
+    if len(trans_lines) != len(units):
+        # Do not guess line mapping.  The user's rule is that each source line is
+        # one restoration unit, so mismatched translation lines need manual review.
+        return translated_norm, "manual"
+    changed = False
+    out_lines: List[str] = []
+    for t_line, unit in zip(trans_lines, units):
+        line = str(t_line or "")
+        prefix = str(unit.get("prefix_codes") or "")
+        suffix = str(unit.get("suffix_codes") or "")
+        if unit.get("placement") == "middle":
+            return translated_norm, "manual"
+        if not (prefix or suffix):
+            out_lines.append(line)
+            continue
+        if prefix and not line.startswith(prefix):
+            line = prefix + line
+            changed = True
+        if suffix and not line.endswith(suffix):
+            line = line + suffix
+            changed = True
+        out_lines.append(line)
+    new_text = "\n".join(out_lines)
+    return new_text, "applied" if changed else "already"
+
+
 def apply_maker_edge_control_codes(translated_text: Any, raw_text: Any) -> Tuple[str, str]:
     """Apply edge-only control codes from raw_text to translated_text.
 
@@ -2551,6 +3756,10 @@ def apply_maker_edge_control_codes(translated_text: Any, raw_text: Any) -> Tuple
     - empty: no translated text to update
     - none: no control codes
     - manual: middle control codes require manual handling
+
+    Multi-line source text is handled line by line.  For example:
+    [C1]line one\n[C1]line two[C0]
+    restores each line's leading/trailing codes independently.
     """
     translated = str(translated_text or "")
     if not translated.strip():
@@ -2558,6 +3767,8 @@ def apply_maker_edge_control_codes(translated_text: Any, raw_text: Any) -> Tuple
     info = analyze_maker_control_codes(raw_text)
     if not info.get("has_control_codes"):
         return translated, "none"
+    if info.get("linewise_restore"):
+        return _apply_line_edge_control_codes(translated, info)
     if info.get("placement") != "edge" or not info.get("auto_restorable"):
         return translated, "manual"
     prefix = str(info.get("prefix_codes") or "")
@@ -2628,7 +3839,9 @@ def build_maker_translation_context(item: Dict[str, Any] | None, prompts: Dict[s
 
     # Row context is sent once per JSON item, so keep it extremely small.
     # Global RPG Maker/API rules are already in the system prompt.
-    if source_kind == "database":
+    if source_kind == "speaker":
+        parts.append("Page: Speaker Translation")
+    elif source_kind == "database":
         if meta.get("map_name"):
             parts.append(f"Page: {meta.get('map_name')}")
         if meta.get("db_kind"):
@@ -2658,70 +3871,108 @@ def build_maker_translation_context(item: Dict[str, Any] | None, prompts: Dict[s
 
     if meta.get("text_type"):
         parts.append(f"Type: {meta.get('text_type')}")
-    if speaker:
+    if speaker and source_kind != "speaker":
         parts.append(f"Speaker: {speaker}")
     if meta.get("face_name"):
         parts.append(f"Face: {meta.get('face_name')}")
 
     # Prompt text must be lifted into the system prompt once per API chunk.
     # Never repeat the full common prompt inside every row context.
-    if source_kind == "database":
-        # The project-level maker ``system_prompt`` is DB-only.
-        # Do not leak it into normal map/common-event/troop translation chunks.
+    templates = get_runtime_prompt_templates()
+    if source_kind == "speaker":
+        speaker_prompt = str(templates.get("speaker_name_prompt") or "").strip()
+        if speaker_prompt:
+            parts.append(f"{PROMPT_BLOCK_BEGIN}\n{speaker_prompt}\n{PROMPT_BLOCK_END}")
+    elif source_kind == "database":
+        # Project-specific DB instructions remain data, while the entire wrapper
+        # and built-in wording are controlled by the active editable preset.
         system_prompt = build_maker_system_prompt_text(prompts)
-        chunk_lines: List[str] = []
-        if system_prompt:
-            chunk_lines.append("Database-only system prompt:\n" + system_prompt)
-        chunk_lines.append(
-            "Database text is game UI/system text, not free dialogue. Translate it briefly and consistently. "
-            "RPG Maker message placeholders such as %1, %2, %3 are real game codes. Copy them exactly; do not translate, delete, reorder, or add spaces inside them. "
-            "If a Korean particle must follow a placeholder, use safe forms such as 은(는), 이(가), 을(를) or rewrite the sentence to avoid ambiguity."
+        database_prompt = render_prompt_template(
+            templates.get("database_prompt", ""),
+            PROJECT_DB_PROMPT=system_prompt,
         )
-        parts.append("Chunk prompt:\n" + "\n".join(x for x in chunk_lines if str(x or "").strip()))
+        if database_prompt:
+            parts.append(f"{PROMPT_BLOCK_BEGIN}\n{database_prompt}\n{PROMPT_BLOCK_END}")
     elif source_kind == "troop_event":
-        # Troop event rows are event dialogue/text, not database rows.
-        # Keep only the built-in battle-event guidance here; DB-only system_prompt is not applied.
-        chunk_lines: List[str] = []
-        chunk_lines.append(
-            "This is text from a Troops.json battle event. It can appear during combat, so translate it as visible in-game text. "
-            "Keep RPG Maker message placeholders such as %1, %2, and %3 exactly unchanged."
-        )
-        parts.append("Chunk prompt:\n" + "\n".join(x for x in chunk_lines if str(x or "").strip()))
+        battle_prompt = str(templates.get("battle_event_prompt") or "").strip()
+        if battle_prompt:
+            parts.append(f"{PROMPT_BLOCK_BEGIN}\n{battle_prompt}\n{PROMPT_BLOCK_END}")
     else:
         # Character prompt must contain only the speaker-specific profile.
         # The common/default prompt is sent through the engine system prompt once.
         char_prompt = build_maker_character_prompt_text(prompts, speaker, include_default=False)
         if char_prompt:
-            parts.append("Character prompt:\n" + char_prompt)
+            parts.append(f"{PROMPT_BLOCK_BEGIN}\n{char_prompt}\n{PROMPT_BLOCK_END}")
 
     return "\n".join(str(x) for x in parts if str(x or "").strip())
 
-def prepare_maker_translation_payload(item: Dict[str, Any] | None, prompts: Dict[str, Any] | None = None, translation_settings: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def prepare_maker_translation_payload(
+    item: Dict[str, Any] | None,
+    prompts: Dict[str, Any] | None = None,
+    translation_settings: Dict[str, Any] | None = None,
+    *,
+    auto_restore_control_codes: bool = False,
+) -> Dict[str, Any]:
     original = ""
+    meta: Dict[str, Any] = {}
     if isinstance(item, dict):
         original = str(item.get("text") or "")
-    # 쯔꾸르붕이: AI/API에는 제어코드 포함 원문을 직접 보내지 않는다.
-    # 제어코드가 필요한 줄은 UI의 참고 레이어로 보여주고, 앞/뒤 안전 코드는
-    # 사용자가 [자동복원] 버튼을 눌렀을 때만 번역문에 붙인다.
+        raw_meta = item.get("maker_text_unit")
+        if isinstance(raw_meta, dict):
+            meta = raw_meta
+
     raw_info = analyze_maker_control_codes(original)
     plain_source = str(raw_info.get("plain_text") or "")
-    normalized = normalize_maker_translation_source_text(plain_source, translation_settings)
-    protected, mapping = protect_maker_control_codes(normalized)
+    source_kind = str(meta.get("source_kind") or "map").strip().lower()
+    # DB/플러그인/화자 레이어는 순수 데이터 번역이다. 자동 제어코드 배치는
+    # 일반 맵/공통 이벤트/전투 이벤트 대사에서만 작동한다.
+    auto_allowed = source_kind not in {"database", "speaker"} and not source_kind.startswith("plugin")
+    auto_enabled = bool(auto_restore_control_codes and auto_allowed and raw_info.get("has_control_codes"))
+
+    control_spec: Any = []
+    context = build_maker_translation_context(item, prompts)
+    if auto_enabled:
+        tokenized_source, mapping = protect_maker_control_codes_for_ai(original)
+        # 줄 시작 제어코드는 실제 물리 줄에 묶여 있다. 자동 반영 경로에서는
+        # 원문 줄내림 제거 옵션보다 코드 위치 안전을 우선해 줄 구조를 유지한다.
+        auto_settings = dict(translation_settings or {}) if isinstance(translation_settings, dict) else {}
+        auto_settings["normalize_source_newlines"] = False
+        normalized = normalize_maker_translation_source_text(tokenized_source, auto_settings)
+        control_spec = {
+            "mapping": mapping,
+            "raw_text": original,
+            "tokenized_source": tokenized_source,
+            "normalized_source": normalized,
+            "expected_line_count": normalized.count("\n") + 1,
+            "expected_token_line_layout": _maker_ai_control_token_line_layout(normalized, mapping),
+            "expected_raw_code_lines": _maker_raw_control_code_lines(original),
+        }
+        auto_context = build_maker_control_code_auto_context(original, tokenized_source, mapping)
+        if auto_context:
+            context = (context + "\n\n" + auto_context).strip()
+        protected = normalized
+    else:
+        # 기본 경로: API에는 제어코드가 완전히 제거된 원문만 보낸다.
+        normalized = normalize_maker_translation_source_text(plain_source, translation_settings)
+        protected, _unused_mapping = protect_maker_control_codes(normalized)
+
     return {
         "text": protected,
         "raw_text": original,
         "plain_text": plain_source,
         "normalized_text": normalized,
-        "context": build_maker_translation_context(item, prompts),
-        "control_map": mapping,
+        "context": context,
+        "control_map": control_spec,
         "control_info": raw_info,
+        "control_auto_enabled": auto_enabled,
         "speaker": maker_item_speaker(item),
-        "source_newlines_removed": normalized != plain_source,
+        "source_newlines_removed": normalized != (tokenized_source if auto_enabled else plain_source),
     }
 
 
-def restore_maker_translation_text(text: Any, control_map: Iterable[Tuple[str, str]] | None = None) -> str:
-    return restore_maker_control_codes(text, control_map)
+def restore_maker_translation_text(text: Any, control_map: Any = None) -> str:
+    restored, _status, _detail = restore_maker_translation_text_checked(text, control_map)
+    return restored
 
 
 def normalize_maker_database_translation_result(text: Any, source_text: Any = "") -> str:
@@ -2984,6 +4235,24 @@ def backup_maker_original_json_snapshot(
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
             summary["files"].append(str(rel_from_game).replace("\\", "/"))
+
+        # Plugin parameters are stored outside data/ in generated js/plugins.js.
+        # Keep the same immutable baseline rule as RPG Maker JSON files so repeated
+        # write-back never accumulates escaping or loses another plugin row.
+        try:
+            content_root = _content_root_from_engine_info(game_root, engine_info)
+            plugins_src = Path(content_root) / "js" / "plugins.js"
+            if plugins_src.is_file():
+                try:
+                    rel_plugins = plugins_src.relative_to(game_root)
+                except Exception:
+                    rel_plugins = Path("js") / "plugins.js"
+                plugins_dst = backup_root / rel_plugins
+                plugins_dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(plugins_src, plugins_dst)
+                summary["files"].append(str(rel_plugins).replace("\\", "/"))
+        except Exception as plugin_backup_error:
+            summary["warnings"].append(f"plugins.js 원본 백업 실패: {plugin_backup_error}")
         summary["file_count"] = len(summary["files"])
         manifest = backup_root / "original_json_manifest.json"
         with manifest.open("w", encoding="utf-8") as f:
@@ -3557,6 +4826,7 @@ def apply_maker_translations_to_game(project_dir: str | os.PathLike[str], data: 
         "touched_maps": [],
         "touched_files": [],
         "touched_sidecars": [],
+        "touched_plugins": [],
         "backup_dir": "",
         "warnings": [],
         "errors": [],
@@ -3608,6 +4878,26 @@ def apply_maker_translations_to_game(project_dir: str | os.PathLike[str], data: 
             summary["requested_page_indices"] = []
     else:
         items = requested_items
+
+    plugin_parameter_items = [
+        item for item in items
+        if str(((item.get("maker_text_unit") or {}) if isinstance(item, dict) else {}).get("source_kind") or "") == "plugin_parameter"
+    ]
+    items = [
+        item for item in items
+        if str(((item.get("maker_text_unit") or {}) if isinstance(item, dict) else {}).get("source_kind") or "") != "plugin_parameter"
+    ]
+    if plugin_parameter_items:
+        written_plugins = apply_plugin_parameter_translations_to_game(project_dir, plugin_parameter_items)
+        if written_plugins:
+            summary["written_units"] += int(written_plugins)
+            summary.setdefault("touched_files", []).append("js/plugins.js")
+            summary.setdefault("touched_plugins", []).extend(sorted({
+                str(((item.get("maker_text_unit") or {}) if isinstance(item, dict) else {}).get("plugin_name") or "")
+                for item in plugin_parameter_items
+                if str(((item.get("maker_text_unit") or {}) if isinstance(item, dict) else {}).get("plugin_name") or "").strip()
+            }))
+
     if not items:
         _maker_meta_path(project_dir, MAKER_WRITEBACK_SUMMARY_FILE).parent.mkdir(parents=True, exist_ok=True)
         with _maker_meta_path(project_dir, MAKER_WRITEBACK_SUMMARY_FILE).open("w", encoding="utf-8") as f:
@@ -3651,7 +4941,10 @@ def apply_maker_translations_to_game(project_dir: str | os.PathLike[str], data: 
         for item in file_items_sorted:
             meta = item.get("maker_text_unit") or {}
             kind = str(meta.get("source_kind") or source_kind or "map")
-            if kind == "common_event":
+            if kind in {"plugin_json", "plugin_script_literal", "plugin_note"}:
+                if _apply_translation_to_plugin_json_data(payload, item):
+                    written_here += 1
+            elif kind == "common_event":
                 if not isinstance(payload, list):
                     raise MakerWriteBackError(f"CommonEvents.json 구조가 올바르지 않습니다: {live_path}")
                 if _apply_translation_to_common_event_data(payload, item):
@@ -3736,6 +5029,7 @@ def apply_maker_translations_to_game(project_dir: str | os.PathLike[str], data: 
         summary["touched_files"] = sorted(set(summary.get("touched_files") or []))
         summary["touched_maps"] = sorted(set(summary.get("touched_maps") or []))
         summary["touched_sidecars"] = sorted(set(summary.get("touched_sidecars") or []))
+        summary["touched_plugins"] = sorted(set(summary.get("touched_plugins") or []))
     except Exception:
         pass
     _maker_meta_path(project_dir, MAKER_WRITEBACK_SUMMARY_FILE).parent.mkdir(parents=True, exist_ok=True)
@@ -3770,6 +5064,14 @@ class MakerTextUnit:
     db_id: int | None = None
     db_field: str = ""
     db_path_keys: List[Any] | None = None
+    # Plugin translation metadata.  Plugin pages deliberately reuse the normal
+    # Maker text-row pipeline, but write-back needs the exact source container.
+    plugin_name: str = ""
+    plugin_kind: str = ""
+    plugin_root_path: List[Any] | None = None
+    plugin_access_steps: List[Dict[str, Any]] | None = None
+    plugin_note_tag: str = ""
+    plugin_note_occurrence: int = 0
     # Inline-speaker message pattern used by many MV projects/plugins:
     # first displayed line is a name drawn inside the message window with control
     # codes, not a real RPG Maker namebox.  The editor shows the codes, but API
@@ -4102,16 +5404,12 @@ def infer_maker_speaker(
             "confidence": 0.76,
         }
 
-    event_hint = _clean_speaker_name(event_name)
-    if event_hint and not _is_generic_event_name(event_hint):
-        return {
-            "speaker": event_hint,
-            "face_name": face_name,
-            "face_index": face_index,
-            "source": "event_name",
-            "confidence": 0.58,
-        }
-
+    # PATCH: UI scene reconstruction from game data.
+    # Event names are map/editor context, not RPG Maker speaker data.  Do not
+    # promote them into the editable speaker column or the preview name window.
+    # A speaker is accepted only when it comes from an actual Show Text name
+    # window, actor escape code, face/actor DB lookup, or a later explicit user
+    # edit.  The event name remains available in maker_text_unit.event_name.
     return {
         "speaker": "Unknown",
         "face_name": face_name,
@@ -4163,6 +5461,12 @@ def _append_text_unit(
     db_id: int | None = None,
     db_field: str = "",
     db_path_keys: List[Any] | None = None,
+    plugin_name: str = "",
+    plugin_kind: str = "",
+    plugin_root_path: List[Any] | None = None,
+    plugin_access_steps: List[Dict[str, Any]] | None = None,
+    plugin_note_tag: str = "",
+    plugin_note_occurrence: int = 0,
     inline_speaker: bool = False,
     speaker_plain: str = "",
     speaker_raw_visible: str = "",
@@ -4211,6 +5515,12 @@ def _append_text_unit(
             db_id=db_id,
             db_field=db_field or "",
             db_path_keys=list(db_path_keys or []),
+            plugin_name=plugin_name or "",
+            plugin_kind=plugin_kind or "",
+            plugin_root_path=list(plugin_root_path or []),
+            plugin_access_steps=[dict(x) for x in (plugin_access_steps or []) if isinstance(x, dict)],
+            plugin_note_tag=plugin_note_tag or "",
+            plugin_note_occurrence=int(plugin_note_occurrence or 0),
             inline_speaker=bool(inline_speaker),
             speaker_plain=resolved_speaker_plain,
             speaker_raw_visible=resolved_speaker_raw_visible,
@@ -5064,6 +6374,716 @@ def extract_database_text_units(data_dir: Path) -> Dict[str, List[MakerTextUnit]
     return pages
 
 
+# ---------------------------------------------------------------------------
+# Plugin translation extraction/write-back helpers
+# ---------------------------------------------------------------------------
+
+_PLUGIN_TEXT_KEY_HINTS = (
+    "text", "name", "label", "title", "caption", "message", "help", "description",
+    "command", "category", "confirm", "format", "display", "term", "word", "prompt",
+)
+_PLUGIN_INTERNAL_KEY_HINTS = (
+    "file", "image", "picture", "icon", "path", "folder", "script", "eval", "formula",
+    "code", "class", "symbol", "variable", "switch", "fontface", "windowskin", "audio",
+    "bgm", "bgs", "se", "me", "color", "width", "height", "offset", "scale", "origin",
+    "opacity", "rotation", "rate", "speed", "duration", "id", "index", "x", "y",
+)
+
+
+def _maker_contains_translatable_chars(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    # Japanese/CJK/Hangul and normal sentence punctuation are the primary target.
+    if re.search(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7a3]", text):
+        return True
+    # Latin-only strings are included only when they look like actual prose.
+    return bool(re.search(r"[A-Za-z]", text) and re.search(r"\s", text) and len(text) >= 8)
+
+
+def _maker_plugin_string_is_translatable(value: Any, key_hint: str = "") -> bool:
+    text = str(value or "").strip()
+    if not text or not _maker_contains_translatable_chars(text):
+        return False
+    key = str(key_hint or "").strip().lower().replace("_", " ")
+    compact_key = re.sub(r"[^a-z0-9]", "", key)
+    if compact_key:
+        if any(h in compact_key for h in _PLUGIN_INTERNAL_KEY_HINTS):
+            # Strongly visible labels such as ImageHelpText are still allowed only
+            # when the key explicitly contains a display-text hint.
+            if not any(h in compact_key for h in _PLUGIN_TEXT_KEY_HINTS):
+                return False
+    # Resource identifiers / expressions / pure control-code containers are unsafe.
+    if re.fullmatch(r"[A-Za-z0-9_./\\:-]+", text):
+        return False
+    if text.lower() in {"true", "false", "null", "none", "undefined"}:
+        return False
+    if re.search(r"\b(this|window|scene|return|function|math|gamevariables|gameswitches)\b", text, re.I):
+        return False
+    if ("=>" in text or "${" in text or ";" in text) and not any(h in compact_key for h in ("text", "message", "help", "description")):
+        return False
+    if compact_key and any(h in compact_key for h in _PLUGIN_TEXT_KEY_HINTS):
+        return True
+    # Unknown keys are accepted only for unmistakable CJK prose, not short IDs.
+    return bool(len(text) >= 2 and re.search(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7a3]", text))
+
+
+def _read_maker_plugins_js_array(path: Path) -> Tuple[List[Any], str, str]:
+    """Parse RPG Maker's generated ``var $plugins = [...]`` file.
+
+    Returns the array plus untouched prefix/suffix so write-back changes only the
+    JSON payload and keeps generated comments/assignment syntax valid.
+    """
+    text = Path(path).read_text(encoding="utf-8-sig")
+    marker = text.find("$plugins")
+    start = text.find("[", marker if marker >= 0 else 0)
+    if start < 0:
+        raise MakerProjectError(f"plugins.js 배열을 찾지 못했습니다: {path}")
+    payload, consumed = json.JSONDecoder().raw_decode(text[start:])
+    if not isinstance(payload, list):
+        raise MakerProjectError(f"plugins.js 구조가 배열이 아닙니다: {path}")
+    return payload, text[:start], text[start + consumed:]
+
+
+def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".ysb_tmp")
+    tmp.write_text(text, encoding=encoding)
+    os.replace(tmp, path)
+
+
+def _set_plugin_access_value(current: Any, steps: List[Dict[str, Any]], value: str) -> Any:
+    """Apply a translation through nested JSON strings used by plugin parameters."""
+    if not steps:
+        return _maker_normalize_writeback_newlines(value)
+    step = steps[0] if isinstance(steps[0], dict) else {}
+    op = str(step.get("op") or "")
+    rest = steps[1:]
+    if op == "json":
+        if not isinstance(current, str):
+            raise MakerWriteBackError("플러그인 중첩 JSON 문자열 구조가 변경되었습니다.")
+        try:
+            decoded = json.loads(current)
+        except Exception as e:
+            raise MakerWriteBackError("플러그인 중첩 JSON을 다시 읽지 못했습니다.") from e
+        updated = _set_plugin_access_value(decoded, rest, value)
+        return json.dumps(updated, ensure_ascii=False, separators=(",", ":"))
+    if op == "key":
+        if not isinstance(current, dict):
+            raise MakerWriteBackError("플러그인 파라미터 딕셔너리 구조가 변경되었습니다.")
+        key = step.get("value")
+        if key not in current:
+            raise MakerWriteBackError(f"플러그인 파라미터 키를 찾지 못했습니다: {key}")
+        current[key] = _set_plugin_access_value(current[key], rest, value)
+        return current
+    if op == "index":
+        if not isinstance(current, list):
+            raise MakerWriteBackError("플러그인 파라미터 목록 구조가 변경되었습니다.")
+        idx = int(step.get("value") or 0)
+        if not (0 <= idx < len(current)):
+            raise MakerWriteBackError(f"플러그인 파라미터 목록 위치가 범위를 벗어났습니다: {idx}")
+        current[idx] = _set_plugin_access_value(current[idx], rest, value)
+        return current
+    raise MakerWriteBackError(f"알 수 없는 플러그인 접근 단계입니다: {op}")
+
+
+def _walk_plugin_parameter_value(
+    units: List[MakerTextUnit],
+    *,
+    plugin_name: str,
+    root_path: List[Any],
+    value: Any,
+    key_hint: str,
+    access_steps: List[Dict[str, Any]] | None = None,
+    depth: int = 0,
+):
+    if depth > 16:
+        return
+    steps = list(access_steps or [])
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw[:1] in {"[", "{"}:
+            try:
+                decoded = json.loads(value)
+            except Exception:
+                decoded = None
+            if isinstance(decoded, (list, dict)):
+                _walk_plugin_parameter_value(
+                    units,
+                    plugin_name=plugin_name,
+                    root_path=root_path,
+                    value=decoded,
+                    key_hint=key_hint,
+                    access_steps=steps + [{"op": "json"}],
+                    depth=depth + 1,
+                )
+                return
+        if _maker_plugin_string_is_translatable(value, key_hint):
+            display_path = "/".join(str(x.get("value")) for x in steps if x.get("op") in {"key", "index"})
+            _append_text_unit(
+                units,
+                map_id=0,
+                map_file="js/plugins.js",
+                map_name=f"Plugin - {plugin_name}",
+                event_id=None,
+                event_name=plugin_name,
+                page_index=None,
+                command_index=None,
+                code=None,
+                text_type="plugin_parameter",
+                text=value,
+                speaker="System",
+                speaker_source="plugin_parameter",
+                speaker_confidence=1.0,
+                source_kind="plugin_parameter",
+                source_file="js/plugins.js",
+                json_path=f"js/plugins.js/{plugin_name}/" + "/".join(str(x) for x in root_path + ([display_path] if display_path else [])),
+                db_kind=plugin_name,
+                db_field=str(key_hint or "parameter"),
+                db_path_keys=[],
+                plugin_name=plugin_name,
+                plugin_kind="parameter",
+                plugin_root_path=root_path,
+                plugin_access_steps=steps,
+            )
+        return
+    if isinstance(value, dict):
+        for key, child in value.items():
+            _walk_plugin_parameter_value(
+                units,
+                plugin_name=plugin_name,
+                root_path=root_path,
+                value=child,
+                key_hint=str(key),
+                access_steps=steps + [{"op": "key", "value": key}],
+                depth=depth + 1,
+            )
+        return
+    if isinstance(value, list):
+        for idx, child in enumerate(value):
+            _walk_plugin_parameter_value(
+                units,
+                plugin_name=plugin_name,
+                root_path=root_path,
+                value=child,
+                key_hint=key_hint,
+                access_steps=steps + [{"op": "index", "value": idx}],
+                depth=depth + 1,
+            )
+
+
+def extract_plugin_parameter_text_units(game_root: Path, engine_info: MakerEngineInfo | Dict[str, Any] | None = None) -> Dict[str, List[MakerTextUnit]]:
+    pages: Dict[str, List[MakerTextUnit]] = {}
+    try:
+        content_root = _content_root_from_engine_info(game_root, engine_info)
+    except Exception:
+        content_root = Path(game_root)
+    plugins_path = Path(content_root) / "js" / "plugins.js"
+    if not plugins_path.is_file():
+        return pages
+    try:
+        payload, _prefix, _suffix = _read_maker_plugins_js_array(plugins_path)
+    except Exception:
+        return pages
+    for plugin_index, plugin in enumerate(payload):
+        if not isinstance(plugin, dict) or not bool(plugin.get("status", True)):
+            continue
+        plugin_name = str(plugin.get("name") or f"Plugin{plugin_index}").strip() or f"Plugin{plugin_index}"
+        params = plugin.get("parameters")
+        if not isinstance(params, dict):
+            continue
+        units: List[MakerTextUnit] = []
+        for param_key, raw_value in params.items():
+            _walk_plugin_parameter_value(
+                units,
+                plugin_name=plugin_name,
+                root_path=[plugin_index, "parameters", str(param_key)],
+                value=raw_value,
+                key_hint=str(param_key),
+                access_steps=[],
+            )
+        if units:
+            pages[f"plugin:{plugin_name}"] = units
+    return pages
+
+
+def _decode_js_string_literal(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if len(raw) < 2 or raw[0] not in {"'", '"'} or raw[-1] != raw[0]:
+        return None
+    try:
+        parsed = ast.literal_eval(raw)
+        return str(parsed) if isinstance(parsed, str) else None
+    except Exception:
+        if raw[0] == '"':
+            try:
+                parsed = json.loads(raw)
+                return str(parsed) if isinstance(parsed, str) else None
+            except Exception:
+                return None
+    return None
+
+
+def _append_plugin_command_text_unit(
+    units: List[MakerTextUnit], *, source_file: str, page_name: str,
+    plugin_name: str, command_name: str, text: str, key_hint: str,
+    root_path: List[Any], access_steps: List[Dict[str, Any]] | None,
+    event_id: int | None, event_name: str, page_index: int | None,
+    command_index: int,
+):
+    display_parts = [str(x.get("value")) for x in (access_steps or []) if isinstance(x, dict) and x.get("op") in {"key", "index"}]
+    display_suffix = ("/" + "/".join(display_parts)) if display_parts else ""
+    _append_text_unit(
+        units,
+        map_id=0,
+        map_file=source_file,
+        map_name=page_name,
+        event_id=event_id,
+        event_name=event_name,
+        page_index=page_index,
+        command_index=command_index,
+        code=357,
+        text_type="plugin_command_argument",
+        text=text,
+        speaker="System",
+        speaker_source="plugin_command",
+        speaker_confidence=1.0,
+        source_kind="plugin_json",
+        source_file=source_file,
+        json_path=f"{source_file}/" + "/".join(str(x) for x in root_path) + display_suffix,
+        db_kind=plugin_name,
+        db_field=key_hint,
+        db_path_keys=root_path,
+        plugin_name=plugin_name,
+        plugin_kind="command_argument",
+        plugin_root_path=root_path,
+        plugin_access_steps=list(access_steps or []),
+    )
+
+
+def _walk_plugin_command_nested_json(
+    units: List[MakerTextUnit], *, source_file: str, page_name: str,
+    plugin_name: str, command_name: str, value: Any, root_path: List[Any],
+    access_steps: List[Dict[str, Any]], event_id: int | None, event_name: str,
+    page_index: int | None, command_index: int, depth: int = 0,
+):
+    if depth > 16:
+        return
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw[:1] in {"[", "{"}:
+            try:
+                decoded = json.loads(value)
+            except Exception:
+                decoded = None
+            if isinstance(decoded, (list, dict)):
+                _walk_plugin_command_nested_json(
+                    units, source_file=source_file, page_name=page_name,
+                    plugin_name=plugin_name, command_name=command_name, value=decoded,
+                    root_path=root_path, access_steps=access_steps + [{"op": "json"}],
+                    event_id=event_id, event_name=event_name, page_index=page_index,
+                    command_index=command_index, depth=depth + 1,
+                )
+                return
+        key_hint = str(access_steps[-1].get("value")) if access_steps and isinstance(access_steps[-1], dict) else command_name
+        if _maker_plugin_string_is_translatable(value, key_hint):
+            _append_plugin_command_text_unit(
+                units, source_file=source_file, page_name=page_name,
+                plugin_name=plugin_name, command_name=command_name, text=value,
+                key_hint=key_hint, root_path=root_path, access_steps=access_steps,
+                event_id=event_id, event_name=event_name, page_index=page_index,
+                command_index=command_index,
+            )
+        return
+    if isinstance(value, dict):
+        for key, child in value.items():
+            _walk_plugin_command_nested_json(
+                units, source_file=source_file, page_name=page_name,
+                plugin_name=plugin_name, command_name=command_name, value=child,
+                root_path=root_path, access_steps=access_steps + [{"op": "key", "value": key}],
+                event_id=event_id, event_name=event_name, page_index=page_index,
+                command_index=command_index, depth=depth + 1,
+            )
+    elif isinstance(value, list):
+        for idx, child in enumerate(value):
+            _walk_plugin_command_nested_json(
+                units, source_file=source_file, page_name=page_name,
+                plugin_name=plugin_name, command_name=command_name, value=child,
+                root_path=root_path, access_steps=access_steps + [{"op": "index", "value": idx}],
+                event_id=event_id, event_name=event_name, page_index=page_index,
+                command_index=command_index, depth=depth + 1,
+            )
+
+
+def _walk_plugin_command_argument_strings(
+    units: List[MakerTextUnit],
+    *, source_file: str, page_name: str, command_path: List[Any], plugin_name: str,
+    command_name: str, value: Any, path: List[Any], event_id: int | None,
+    event_name: str, page_index: int | None, command_index: int,
+):
+    if isinstance(value, str):
+        full_path = command_path + path
+        raw = value.strip()
+        if raw[:1] in {"[", "{"}:
+            try:
+                decoded = json.loads(value)
+            except Exception:
+                decoded = None
+            if isinstance(decoded, (list, dict)):
+                _walk_plugin_command_nested_json(
+                    units, source_file=source_file, page_name=page_name,
+                    plugin_name=plugin_name, command_name=command_name, value=decoded,
+                    root_path=full_path, access_steps=[{"op": "json"}],
+                    event_id=event_id, event_name=event_name, page_index=page_index,
+                    command_index=command_index,
+                )
+                return
+        key_hint = str(path[-1]) if path else command_name
+        if _maker_plugin_string_is_translatable(value, key_hint):
+            _append_plugin_command_text_unit(
+                units, source_file=source_file, page_name=page_name,
+                plugin_name=plugin_name, command_name=command_name, text=value,
+                key_hint=key_hint, root_path=full_path, access_steps=[],
+                event_id=event_id, event_name=event_name, page_index=page_index,
+                command_index=command_index,
+            )
+        return
+    if isinstance(value, dict):
+        for key, child in value.items():
+            _walk_plugin_command_argument_strings(
+                units, source_file=source_file, page_name=page_name, command_path=command_path,
+                plugin_name=plugin_name, command_name=command_name, value=child, path=path + [key],
+                event_id=event_id, event_name=event_name, page_index=page_index, command_index=command_index,
+            )
+    elif isinstance(value, list):
+        for idx, child in enumerate(value):
+            _walk_plugin_command_argument_strings(
+                units, source_file=source_file, page_name=page_name, command_path=command_path,
+                plugin_name=plugin_name, command_name=command_name, value=child, path=path + [idx],
+                event_id=event_id, event_name=event_name, page_index=page_index, command_index=command_index,
+            )
+
+
+def _extract_plugin_units_from_command_list(
+    units: List[MakerTextUnit], *, source_file: str, page_name: str, commands: Any,
+    command_list_path: List[Any], event_id: int | None, event_name: str, page_index: int | None,
+):
+    if not isinstance(commands, list):
+        return
+    for command_index, command in enumerate(commands):
+        if not isinstance(command, dict):
+            continue
+        try:
+            code = int(command.get("code") or 0)
+        except Exception:
+            code = 0
+        params = command.get("parameters")
+        command_path = list(command_list_path) + [command_index, "parameters"]
+        # Control Variables: script operand containing a quoted string literal.
+        if code == 122 and isinstance(params, list) and len(params) >= 5:
+            try:
+                operand_type = int(params[3])
+            except Exception:
+                operand_type = -1
+            decoded = _decode_js_string_literal(params[4]) if operand_type == 4 else None
+            if decoded is not None and _maker_contains_translatable_chars(decoded):
+                variable_from = params[0] if len(params) > 0 else ""
+                variable_to = params[1] if len(params) > 1 else variable_from
+                _append_text_unit(
+                    units,
+                    map_id=0,
+                    map_file=source_file,
+                    map_name=page_name,
+                    event_id=event_id,
+                    event_name=event_name,
+                    page_index=page_index,
+                    command_index=command_index,
+                    code=122,
+                    text_type="plugin_variable_string",
+                    text=decoded,
+                    speaker="System",
+                    speaker_source="plugin_variable",
+                    speaker_confidence=1.0,
+                    source_kind="plugin_script_literal",
+                    source_file=source_file,
+                    json_path=f"{source_file}/" + "/".join(str(x) for x in command_path + [4]),
+                    db_kind="Variables",
+                    db_field=f"Variable {variable_from}" if variable_from == variable_to else f"Variables {variable_from}-{variable_to}",
+                    db_path_keys=command_path + [4],
+                    plugin_name="Game Variables",
+                    plugin_kind="variable_string",
+                )
+        # RPG Maker MZ plugin command arguments.
+        if code == 357 and isinstance(params, list) and len(params) >= 4 and isinstance(params[3], dict):
+            plugin_name = str(params[0] or "Plugin")
+            command_name = str(params[1] or params[2] or "Command")
+            _walk_plugin_command_argument_strings(
+                units,
+                source_file=source_file,
+                page_name=page_name,
+                command_path=command_path + [3],
+                plugin_name=plugin_name,
+                command_name=command_name,
+                value=params[3],
+                path=[],
+                event_id=event_id,
+                event_name=event_name,
+                page_index=page_index,
+                command_index=command_index,
+            )
+
+
+def extract_plugin_event_text_units(data_dir: Path) -> Dict[str, List[MakerTextUnit]]:
+    pages: Dict[str, List[MakerTextUnit]] = {}
+    data_dir = Path(data_dir)
+    if not data_dir.is_dir():
+        return pages
+    files = sorted(list(data_dir.glob("Map*.json")) + [data_dir / "CommonEvents.json", data_dir / "Troops.json"], key=lambda p: p.name.lower())
+    for path in files:
+        if not path.is_file():
+            continue
+        try:
+            payload = _read_json(path)
+        except Exception:
+            continue
+        units: List[MakerTextUnit] = []
+        if re.fullmatch(r"Map\d+\.json", path.name, re.I) and isinstance(payload, dict):
+            for ev_idx, event in enumerate(payload.get("events") or []):
+                if not isinstance(event, dict):
+                    continue
+                event_id = int(event.get("id") or ev_idx)
+                event_name = str(event.get("name") or f"Event {event_id}")
+                for page_idx, page in enumerate(event.get("pages") or []):
+                    if not isinstance(page, dict):
+                        continue
+                    _extract_plugin_units_from_command_list(
+                        units, source_file=path.name, page_name=path.stem,
+                        commands=page.get("list"), command_list_path=["events", event_id, "pages", page_idx, "list"],
+                        event_id=event_id, event_name=event_name, page_index=page_idx,
+                    )
+        elif path.name == "CommonEvents.json" and isinstance(payload, list):
+            for ce_idx, event in enumerate(payload):
+                if not isinstance(event, dict):
+                    continue
+                event_id = int(event.get("id") or ce_idx)
+                event_name = str(event.get("name") or f"Common Event {event_id}")
+                _extract_plugin_units_from_command_list(
+                    units, source_file=path.name, page_name="Common Events",
+                    commands=event.get("list"), command_list_path=[event_id, "list"],
+                    event_id=event_id, event_name=event_name, page_index=0,
+                )
+        elif path.name == "Troops.json" and isinstance(payload, list):
+            for troop_idx, troop in enumerate(payload):
+                if not isinstance(troop, dict):
+                    continue
+                troop_id = int(troop.get("id") or troop_idx)
+                troop_name = str(troop.get("name") or f"Troop {troop_id}")
+                for page_idx, page in enumerate(troop.get("pages") or []):
+                    if not isinstance(page, dict):
+                        continue
+                    _extract_plugin_units_from_command_list(
+                        units, source_file=path.name, page_name="Troop Events",
+                        commands=page.get("list"), command_list_path=[troop_id, "pages", page_idx, "list"],
+                        event_id=troop_id, event_name=troop_name, page_index=page_idx,
+                    )
+        if units:
+            pages[f"event:{path.name}"] = units
+    return pages
+
+
+def _iter_note_tag_values(note: str):
+    """Yield RPG Maker note-tag values while preserving tag name/occurrence."""
+    text = str(note or "")
+    pattern = re.compile(r"<([^<>:\r\n]+):([\s\S]*?)>", re.M)
+    counts: Dict[str, int] = {}
+    for match in pattern.finditer(text):
+        tag = str(match.group(1) or "").strip()
+        value = str(match.group(2) or "")
+        idx = counts.get(tag, 0)
+        counts[tag] = idx + 1
+        yield tag, idx, value
+
+
+def extract_plugin_note_text_units(data_dir: Path) -> Dict[str, List[MakerTextUnit]]:
+    pages: Dict[str, List[MakerTextUnit]] = {}
+    data_dir = Path(data_dir)
+    for path in sorted(data_dir.glob("*.json"), key=lambda p: p.name.lower()):
+        if re.fullmatch(r"Map\d+\.json", path.name, re.I) or path.name in {"CommonEvents.json", "Troops.json", "System.json"}:
+            continue
+        try:
+            payload = _read_json(path)
+        except Exception:
+            continue
+        if not isinstance(payload, list):
+            continue
+        units: List[MakerTextUnit] = []
+        for row_idx, record in enumerate(payload):
+            if not isinstance(record, dict) or not isinstance(record.get("note"), str):
+                continue
+            rec_id = int(record.get("id") or row_idx)
+            rec_name = str(record.get("name") or f"{path.stem} {rec_id}")
+            note = record.get("note") or ""
+            for tag, occurrence, value in _iter_note_tag_values(note):
+                key_compact = re.sub(r"[^a-z0-9\u3040-\u30ff\u3400-\u9fff]", "", tag.lower())
+                # Numeric/layout/resource tags stay untouched; descriptions,
+                # categories and other unmistakable visible values are editable.
+                if any(x in key_compact for x in ("picture", "image", "icon", "x", "y", "scale", "rate", "order", "id", "switch", "variable")):
+                    continue
+                if not _maker_plugin_string_is_translatable(value, tag):
+                    continue
+                _append_text_unit(
+                    units,
+                    map_id=0,
+                    map_file=path.name,
+                    map_name=f"Plugin Notes - {path.stem}",
+                    event_id=rec_id,
+                    event_name=rec_name,
+                    page_index=None,
+                    command_index=None,
+                    code=None,
+                    text_type="plugin_note_tag",
+                    text=value,
+                    speaker="System",
+                    speaker_source="plugin_note",
+                    speaker_confidence=1.0,
+                    source_kind="plugin_note",
+                    source_file=path.name,
+                    json_path=f"{path.name}/{row_idx}/note/{tag}[{occurrence}]",
+                    db_kind=path.stem,
+                    db_id=rec_id,
+                    db_field=tag,
+                    db_path_keys=[row_idx, "note"],
+                    plugin_name=path.stem,
+                    plugin_kind="note_tag",
+                    plugin_note_tag=tag,
+                    plugin_note_occurrence=occurrence,
+                )
+        if units:
+            pages[f"note:{path.name}"] = units
+    return pages
+
+
+def extract_plugin_text_units(game_root: Path, data_dir: Path, engine_info: MakerEngineInfo | Dict[str, Any] | None = None) -> Dict[str, List[MakerTextUnit]]:
+    """Collect safe plugin-facing strings into isolated virtual pages."""
+    pages: Dict[str, List[MakerTextUnit]] = {}
+    for source in (
+        extract_plugin_parameter_text_units(game_root, engine_info),
+        extract_plugin_event_text_units(data_dir),
+        extract_plugin_note_text_units(data_dir),
+    ):
+        for key, units in (source or {}).items():
+            if units:
+                pages[key] = units
+    return pages
+
+
+def _replace_note_tag_occurrence(note: str, tag: str, occurrence: int, value: str) -> str:
+    text = str(note or "")
+    pattern = re.compile(r"<(" + re.escape(str(tag)) + r"):([\s\S]*?)>", re.M)
+    seen = -1
+    def repl(match):
+        nonlocal seen
+        seen += 1
+        if seen != int(occurrence or 0):
+            return match.group(0)
+        return "<" + match.group(1) + ":" + _maker_normalize_writeback_newlines(value) + ">"
+    updated = pattern.sub(repl, text)
+    if seen < int(occurrence or 0):
+        raise MakerWriteBackError(f"플러그인 메모 태그를 찾지 못했습니다: {tag}[{occurrence}]")
+    return updated
+
+
+def _apply_translation_to_plugin_json_data(payload: Any, item: Dict[str, Any]) -> bool:
+    meta = item.get("maker_text_unit") if isinstance(item, dict) else None
+    if not isinstance(meta, dict):
+        return False
+    translated = _maker_item_writeback_text(item)
+    kind = str(meta.get("source_kind") or "")
+    path_keys = list(meta.get("db_path_keys") or [])
+    if kind == "plugin_script_literal":
+        # Store as a valid JS string expression; RPG Maker evaluates this operand.
+        _set_nested_value(payload, path_keys, json.dumps(_maker_normalize_writeback_newlines(translated), ensure_ascii=False))
+        return True
+    if kind == "plugin_json" and list(meta.get("plugin_access_steps") or []):
+        old_value = _get_by_path(payload, path_keys, None)
+        if old_value is None:
+            raise MakerWriteBackError(f"플러그인 명령 인수 경로를 찾지 못했습니다: {path_keys}")
+        updated = _set_plugin_access_value(old_value, list(meta.get("plugin_access_steps") or []), translated)
+        _set_nested_value(payload, path_keys, updated)
+        return True
+    if kind == "plugin_note":
+        old_note = _get_by_path(payload, path_keys, None)
+        if not isinstance(old_note, str):
+            raise MakerWriteBackError(f"플러그인 메모 경로를 찾지 못했습니다: {path_keys}")
+        new_note = _replace_note_tag_occurrence(
+            old_note,
+            str(meta.get("plugin_note_tag") or ""),
+            int(meta.get("plugin_note_occurrence") or 0),
+            translated,
+        )
+        _set_nested_value(payload, path_keys, new_note)
+        return True
+    _set_nested_value(payload, path_keys, translated)
+    return True
+
+
+def apply_plugin_parameter_translations_to_game(project_dir: Path, items: List[Dict[str, Any]]) -> int:
+    if not items:
+        return 0
+    game_root = _maker_game_dir(project_dir)
+    import_summary = _read_maker_import_summary(project_dir)
+    engine_info = import_summary.get("engine") if isinstance(import_summary.get("engine"), dict) else None
+    try:
+        content_root = _content_root_from_engine_info(game_root, engine_info)
+    except Exception:
+        content_root = game_root
+    path = Path(content_root) / "js" / "plugins.js"
+    if not path.is_file():
+        raise MakerWriteBackError(f"plugins.js를 찾지 못했습니다: {path}")
+    try:
+        rel_plugins = path.relative_to(game_root)
+    except Exception:
+        rel_plugins = Path("js") / "plugins.js"
+    baseline_path = _maker_original_json_backup_dir(project_dir) / rel_plugins
+    source_path = baseline_path if baseline_path.is_file() else path
+    payload, prefix, suffix = _read_maker_plugins_js_array(source_path)
+    changed = 0
+    for item in items:
+        meta = item.get("maker_text_unit") if isinstance(item, dict) else {}
+        root_path = list((meta or {}).get("plugin_root_path") or [])
+        steps = [dict(x) for x in ((meta or {}).get("plugin_access_steps") or []) if isinstance(x, dict)]
+        translated = _maker_item_writeback_text(item)
+        if not root_path:
+            continue
+        old = _get_by_path(payload, root_path, None)
+        if old is None:
+            raise MakerWriteBackError(f"플러그인 파라미터 경로를 찾지 못했습니다: {root_path}")
+        new = _set_plugin_access_value(old, steps, translated)
+        if new != old:
+            _set_by_path(payload, root_path, new)
+            changed += 1
+    if changed:
+        rendered = prefix + json.dumps(payload, ensure_ascii=False, indent=4, separators=(",", ":")) + suffix
+        # Validate the exact text before replacing the live file.
+        tmp_payload, _p, _s = _read_maker_plugins_js_array_from_text(rendered)
+        if not isinstance(tmp_payload, list):
+            raise MakerWriteBackError("plugins.js 저장 검증에 실패했습니다.")
+        _atomic_write_text(path, rendered, encoding="utf-8")
+    return changed
+
+
+def _read_maker_plugins_js_array_from_text(text: str) -> Tuple[List[Any], str, str]:
+    marker = text.find("$plugins")
+    start = text.find("[", marker if marker >= 0 else 0)
+    if start < 0:
+        raise MakerProjectError("plugins.js 배열을 찾지 못했습니다.")
+    payload, consumed = json.JSONDecoder().raw_decode(text[start:])
+    if not isinstance(payload, list):
+        raise MakerProjectError("plugins.js 구조가 배열이 아닙니다.")
+    return payload, text[:start], text[start + consumed:]
+
+
 def _virtual_page_placeholder_image(
     path: Path,
     *,
@@ -5385,27 +7405,63 @@ def _maker_write_map_placeholder_cache(cache_path: Path | None, img) -> bool:
     except Exception:
         return False
 
-def _maker_resolve_tileset_image_path(project_root: Path, content_root: Path, name: str) -> Path | None:
+def _maker_asset_search_dirs(project_root: Path, content_root: Path, category: str) -> List[Path]:
+    """Return compatible RPG Maker asset folders for one image category.
+
+    Normal MV/MZ projects store images under img/<category>.  Some extracted or
+    partial resource packs, however, are distributed as the *contents* of the
+    img folder, so users may end up with tilesets/, characters/, system/ directly
+    beside data/ and js/.  Treat those direct category folders as read-only
+    compatibility fallbacks for preview rendering.
+    """
+    cat = str(category or '').strip().replace('\\', '/').strip('/')
+    if not cat:
+        return []
+    roots = [
+        Path(content_root),
+        Path(project_root) / MAKER_CLONE_DIR,
+        Path(project_root) / MAKER_CLONE_DIR / 'www',
+    ]
+    dirs: List[Path] = []
+    seen = set()
+    for root in roots:
+        for folder in (root / 'img' / cat, root / cat):
+            try:
+                key = str(folder.resolve()) if folder.exists() else str(folder)
+            except Exception:
+                key = str(folder)
+            if key in seen:
+                continue
+            seen.add(key)
+            dirs.append(folder)
+    return dirs
+
+
+def _maker_resolve_image_asset_path(project_root: Path, content_root: Path, category: str, name: str) -> Path | None:
     base = str(name or '').strip()
     if not base:
         return None
-    candidates = []
-    for folder in (content_root / 'img' / 'tilesets', project_root / MAKER_CLONE_DIR / 'img' / 'tilesets'):
-        candidates.extend([
-            folder / f'{base}.png', folder / f'{base}.PNG',
-            folder / f'{base}.png_', folder / f'{base}.PNG_',
-            folder / f'{base}.rpgmvp', folder / f'{base}.rpgmvp_',
-        ])
-    for c in candidates:
-        try:
-            if c.is_file():
-                return c
-        except Exception:
-            continue
+    # RPG Maker database values normally contain a bare asset name.  If a plugin
+    # or hand-edited project passes a path-like value, keep only the filename to
+    # avoid escaping the intended asset category.
+    base = base.replace('\\', '/').split('/')[-1]
+    if not base:
+        return None
+    exts = ('.png', '.PNG', '.png_', '.PNG_', '.rpgmvp', '.rpgmvp_', '.webp', '.webp_', '.jpg', '.jpg_', '.jpeg', '.jpeg_', '.bmp', '.bmp_')
+    has_ext = bool(re.search(r'\.(png|png_|rpgmvp|rpgmvp_|webp|webp_|jpg|jpg_|jpeg|jpeg_|bmp|bmp_)$', base, flags=re.I))
+    names = [base] if has_ext else [f'{base}{ext}' for ext in exts]
+    for folder in _maker_asset_search_dirs(project_root, content_root, category):
+        for filename in names:
+            c = folder / filename
+            try:
+                if c.is_file():
+                    return c
+            except Exception:
+                continue
     # Case-insensitive fallback for deployed games copied between platforms.
     # Also catches encrypted MZ assets like TileA1.PNG_ / tilea1.png_.
-    wanted = {f'{base}{ext}'.lower() for ext in ('.png', '.PNG', '.png_', '.PNG_', '.rpgmvp', '.rpgmvp_', '.webp', '.webp_', '.jpg', '.jpg_', '.jpeg', '.jpeg_', '.bmp', '.bmp_')}
-    for folder in (content_root / 'img' / 'tilesets', project_root / MAKER_CLONE_DIR / 'img' / 'tilesets', project_root / MAKER_CLONE_DIR / 'www' / 'img' / 'tilesets'):
+    wanted = {str(filename).lower() for filename in names}
+    for folder in _maker_asset_search_dirs(project_root, content_root, category):
         try:
             if not folder.is_dir():
                 continue
@@ -5415,6 +7471,10 @@ def _maker_resolve_tileset_image_path(project_root: Path, content_root: Path, na
         except Exception:
             continue
     return None
+
+
+def _maker_resolve_tileset_image_path(project_root: Path, content_root: Path, name: str) -> Path | None:
+    return _maker_resolve_image_asset_path(project_root, content_root, 'tilesets', name)
 
 
 def _maker_map_get_tile(data: List[Any], mw: int, mh: int, x: int, y: int, z: int) -> int:
@@ -5855,23 +7915,7 @@ def _maker_alpha_blit(dst, src, x: int, y: int):
 
 
 def _maker_resolve_character_image_path(project_root: Path, content_root: Path, name: str) -> Path | None:
-    base = str(name or '').strip()
-    if not base:
-        return None
-    candidates = []
-    for folder in (content_root / 'img' / 'characters', project_root / MAKER_CLONE_DIR / 'img' / 'characters'):
-        candidates.extend([
-            folder / f'{base}.png', folder / f'{base}.PNG',
-            folder / f'{base}.png_', folder / f'{base}.PNG_',
-            folder / f'{base}.rpgmvp', folder / f'{base}.rpgmvp_',
-        ])
-    for c in candidates:
-        try:
-            if c.is_file():
-                return c
-        except Exception:
-            continue
-    return None
+    return _maker_resolve_image_asset_path(project_root, content_root, 'characters', name)
 
 
 def _maker_select_event_preview_page(event: Dict[str, Any], preferred_index: int | None = None) -> Dict[str, Any] | None:
@@ -7429,6 +9473,12 @@ def _ysb_text_item_from_unit(unit: MakerTextUnit, idx: int, *, page_w: int = 960
             "db_id": unit.db_id,
             "db_field": unit.db_field or "",
             "db_path_keys": list(unit.db_path_keys or []),
+            "plugin_name": unit.plugin_name or "",
+            "plugin_kind": unit.plugin_kind or "",
+            "plugin_root_path": list(unit.plugin_root_path or []),
+            "plugin_access_steps": [dict(x) for x in (unit.plugin_access_steps or []) if isinstance(x, dict)],
+            "plugin_note_tag": unit.plugin_note_tag or "",
+            "plugin_note_occurrence": int(unit.plugin_note_occurrence or 0),
             "json_path": unit.json_path,
             "preview_payload": {
                 "engine": engine or "",
@@ -7458,6 +9508,106 @@ def _ysb_text_item_from_unit(unit: MakerTextUnit, idx: int, *, page_w: int = 960
     apply_maker_preview_settings_to_item(item, st)
     return item
 
+
+
+MAKER_MAP_TEXT_SPLIT_LIMIT = 300
+
+def _maker_unit_event_key(unit: MakerTextUnit) -> tuple:
+    try:
+        event_id = int(unit.event_id or 0)
+    except Exception:
+        event_id = 0
+    try:
+        page_index = int(unit.page_index or 0)
+    except Exception:
+        page_index = 0
+    return (event_id, page_index)
+
+def _split_maker_map_units_by_event(units: List[MakerTextUnit], *, limit: int = MAKER_MAP_TEXT_SPLIT_LIMIT) -> List[Dict[str, Any]]:
+    """Split a large map text list into editor-only chunks.
+
+    The RPG Maker MapXXX.json stays physically intact.  Only the YSB editor
+    page/table is split so very large maps do not force a 1000+ row QTableWidget
+    and preview sync loop.  The normal boundary is the RPG Maker event/page,
+    because event commands, choices and picture state are naturally grouped there.
+    If a single event itself exceeds the limit, that one event is chunked as a
+    safety fallback rather than allowing one huge editor page.
+    """
+    try:
+        limit = max(1, int(limit or MAKER_MAP_TEXT_SPLIT_LIMIT))
+    except Exception:
+        limit = MAKER_MAP_TEXT_SPLIT_LIMIT
+    source = list(units or [])
+    if len(source) <= limit:
+        return [{
+            "split_index": 1,
+            "split_total": 1,
+            "units": source,
+            "event_ids": sorted({int(u.event_id or 0) for u in source if getattr(u, "event_id", None) is not None}),
+            "split_within_event": False,
+        }]
+
+    groups: List[List[MakerTextUnit]] = []
+    current_group: List[MakerTextUnit] = []
+    current_key = None
+    for unit in source:
+        key = _maker_unit_event_key(unit)
+        if current_group and key != current_key:
+            groups.append(current_group)
+            current_group = []
+        current_key = key
+        current_group.append(unit)
+    if current_group:
+        groups.append(current_group)
+
+    chunks: List[Dict[str, Any]] = []
+    current: List[MakerTextUnit] = []
+    current_split_within = False
+
+    def flush() -> None:
+        nonlocal current, current_split_within
+        if not current:
+            return
+        chunks.append({
+            "split_index": len(chunks) + 1,
+            "split_total": 0,
+            "units": current,
+            "event_ids": sorted({int(u.event_id or 0) for u in current if getattr(u, "event_id", None) is not None}),
+            "split_within_event": bool(current_split_within),
+        })
+        current = []
+        current_split_within = False
+
+    for group in groups:
+        if not group:
+            continue
+        if len(group) > limit:
+            flush()
+            for start in range(0, len(group), limit):
+                part = group[start:start + limit]
+                chunks.append({
+                    "split_index": len(chunks) + 1,
+                    "split_total": 0,
+                    "units": part,
+                    "event_ids": sorted({int(u.event_id or 0) for u in part if getattr(u, "event_id", None) is not None}),
+                    "split_within_event": True,
+                })
+            continue
+        if current and len(current) + len(group) > limit:
+            flush()
+        current.extend(group)
+    flush()
+
+    total = len(chunks) or 1
+    for chunk in chunks:
+        chunk["split_total"] = total
+    return chunks or [{
+        "split_index": 1,
+        "split_total": 1,
+        "units": source,
+        "event_ids": sorted({int(u.event_id or 0) for u in source if getattr(u, "event_id", None) is not None}),
+        "split_within_event": False,
+    }]
 
 def build_maker_pages(project_dir: str | os.PathLike[str], game_clone_dir: str | os.PathLike[str], engine_info: MakerEngineInfo | Dict[str, Any] | None = None, progress_callback=None) -> Tuple[List[str], Dict[int, dict], Dict[str, Any]]:
     project_dir = Path(project_dir)
@@ -7502,6 +9652,7 @@ def build_maker_pages(project_dir: str | os.PathLike[str], game_clone_dir: str |
         "maps": [],
         "common_events": [],
         "database_pages": [],
+        "plugin_pages": [],
         "virtual_pages": [],
         "total_text_units": 0,
     }
@@ -7513,9 +9664,12 @@ def build_maker_pages(project_dir: str | os.PathLike[str], game_clone_dir: str |
         _map_total = 0
     _emit_maker_progress(progress_callback, 0, max(_map_total, 1), f"맵 목록을 분석하는 중... 0/{max(_map_total, 1)}")
 
-    for page_idx, (map_id, map_name, map_path, map_data) in enumerate(iter_existing_maps(game_clone_dir, engine_info)):
+    for map_pos, (map_id, map_name, map_path, map_data) in enumerate(iter_existing_maps(game_clone_dir, engine_info), start=1):
         units = extract_map_text_units(map_id, map_name, map_path, map_data, actor_lookup=actor_lookup)
-        _emit_maker_progress(progress_callback, page_idx + 1, max(_map_total, page_idx + 1, 1), f"맵 대사 추출 중... {page_idx + 1}/{max(_map_total, page_idx + 1, 1)}\n{map_path.name} / 텍스트 {len(units)}개")
+        chunks = _split_maker_map_units_by_event(units, limit=MAKER_MAP_TEXT_SPLIT_LIMIT)
+        split_total = max(1, len(chunks))
+        split_note = f" / 분할 {split_total}개" if split_total > 1 else ""
+        _emit_maker_progress(progress_callback, map_pos, max(_map_total, map_pos, 1), f"맵 대사 추출 중... {map_pos}/{max(_map_total, map_pos, 1)}\n{map_path.name} / 텍스트 {len(units)}개{split_note}")
         events = [e for e in (map_data.get("events") or []) if isinstance(e, dict)] if isinstance(map_data, dict) else []
         try:
             mw = int(map_data.get("width") or 17)
@@ -7523,77 +9677,101 @@ def build_maker_pages(project_dir: str | os.PathLike[str], game_clone_dir: str |
         except Exception:
             mw, mh = 17, 13
         safe_name = _safe_map_name(map_name, f"Map{map_id:03d}")
-        image_name = f"Map{map_id:03d}_{safe_name}.png"
-        image_path = images_dir / image_name
-        maker_page_meta = {
-            "engine": engine_dict.get("engine"),
-            "engine_label": engine_dict.get("engine_label"),
-            "map_id": map_id,
-            "map_name": map_name,
-            "map_file": map_path.name,
-            "width": mw,
-            "height": mh,
-            "event_count": len(events),
-            "text_unit_count": len(units),
-            "events": [
-                {
-                    "id": int(ev.get("id") or 0),
-                    "name": _event_name(ev),
-                    "x": int(ev.get("x") or 0),
-                    "y": int(ev.get("y") or 0),
-                }
-                for ev in events
-                if isinstance(ev, dict)
-            ],
-        }
-        initial_preview_settings = dict(preview_settings)
-        initial_preview_settings["defer_tile_render"] = True
-        maker_page_meta["preview_render_deferred"] = True
-        _placeholder_image(image_path, map_id=map_id, map_name=map_name, width=mw, height=mh, events=events, text_count=len(units), engine_label=str(engine_dict.get("engine_label") or "RPG Maker"), preview_settings=initial_preview_settings, page_meta=maker_page_meta)
-        text_items = [_ysb_text_item_from_unit(unit, i, preview_settings=preview_settings, engine=str(engine_dict.get("engine") or "")) for i, unit in enumerate(units)]
-        try:
-            source_counts = summary["speaker_inference"].setdefault("source_counts", {})
-            speaker_counts = summary["speaker_inference"].setdefault("speaker_counts", {})
-            for unit in units:
-                src_key = str(unit.speaker_source or "unknown")
-                source_counts[src_key] = int(source_counts.get(src_key, 0) or 0) + 1
-                sp_key = str(unit.speaker or "Unknown")
-                speaker_counts[sp_key] = int(speaker_counts.get(sp_key, 0) or 0) + 1
-        except Exception:
-            pass
-        paths.append(str(image_path))
-        data[page_idx] = {
-            "ori": None,
-            "data": text_items,
-            "mask_merge": None,
-            "mask_inpaint": None,
-            "mask_merge_off": None,
-            "mask_inpaint_off": None,
-            "mask_merge_path": None,
-            "mask_inpaint_path": None,
-            "mask_merge_off_path": None,
-            "mask_inpaint_off_path": None,
-            "mask_toggle_enabled": False,
-            "use_inpainted_as_source": False,
-            "bg_clean": None,
-            "working_source": None,
-            "final_paint": None,
-            "final_paint_above": None,
-            "original_name": image_name,
-            "ocr_analysis_regions": [],
-            "maker_preview_settings": dict(preview_settings),
-            "maker_runtime_profile": dict(runtime_profile),
-            "maker_page": dict(maker_page_meta),
-        }
-        summary["maps"].append({
-            "page_index": page_idx,
-            "map_id": map_id,
-            "map_name": map_name,
-            "map_file": map_path.name,
-            "text_unit_count": len(units),
-            "event_count": len(events),
-        })
-        summary["total_text_units"] += len(units)
+
+        for chunk in chunks:
+            chunk_units = list(chunk.get("units") or [])
+            split_index = int(chunk.get("split_index") or 1)
+            split_total = int(chunk.get("split_total") or len(chunks) or 1)
+            page_idx = len(paths)
+            suffix = f"-{split_index}" if split_total > 1 else ""
+            image_name = f"Map{map_id:03d}{suffix}_{safe_name}.png"
+            image_path = images_dir / image_name
+            display_map_name = f"{map_name}-{split_index}" if split_total > 1 else map_name
+            maker_page_meta = {
+                "engine": engine_dict.get("engine"),
+                "engine_label": engine_dict.get("engine_label"),
+                "map_id": map_id,
+                "map_name": map_name,
+                "display_map_name": display_map_name,
+                "map_file": map_path.name,
+                "width": mw,
+                "height": mh,
+                "event_count": len(events),
+                "text_unit_count": len(chunk_units),
+                "physical_map_text_unit_count": len(units),
+                "editor_split_enabled": bool(split_total > 1),
+                "editor_split_index": split_index,
+                "editor_split_total": split_total,
+                "editor_split_limit": MAKER_MAP_TEXT_SPLIT_LIMIT,
+                "editor_split_event_ids": list(chunk.get("event_ids") or []),
+                "editor_split_within_event": bool(chunk.get("split_within_event", False)),
+                "editor_split_canonical_image": f"Map{map_id:03d}-1_{safe_name}.png" if split_total > 1 else image_name,
+                "events": [
+                    {
+                        "id": int(ev.get("id") or 0),
+                        "name": _event_name(ev),
+                        "x": int(ev.get("x") or 0),
+                        "y": int(ev.get("y") or 0),
+                    }
+                    for ev in events
+                    if isinstance(ev, dict)
+                ],
+            }
+            initial_preview_settings = dict(preview_settings)
+            initial_preview_settings["defer_tile_render"] = True
+            maker_page_meta["preview_render_deferred"] = True
+            _placeholder_image(image_path, map_id=map_id, map_name=display_map_name, width=mw, height=mh, events=events, text_count=len(chunk_units), engine_label=str(engine_dict.get("engine_label") or "RPG Maker"), preview_settings=initial_preview_settings, page_meta=maker_page_meta)
+            text_items = [_ysb_text_item_from_unit(unit, i, preview_settings=preview_settings, engine=str(engine_dict.get("engine") or "")) for i, unit in enumerate(chunk_units)]
+            try:
+                source_counts = summary["speaker_inference"].setdefault("source_counts", {})
+                speaker_counts = summary["speaker_inference"].setdefault("speaker_counts", {})
+                for unit in chunk_units:
+                    src_key = str(unit.speaker_source or "unknown")
+                    source_counts[src_key] = int(source_counts.get(src_key, 0) or 0) + 1
+                    sp_key = str(unit.speaker or "Unknown")
+                    speaker_counts[sp_key] = int(speaker_counts.get(sp_key, 0) or 0) + 1
+            except Exception:
+                pass
+            paths.append(str(image_path))
+            data[page_idx] = {
+                "ori": None,
+                "data": text_items,
+                "mask_merge": None,
+                "mask_inpaint": None,
+                "mask_merge_off": None,
+                "mask_inpaint_off": None,
+                "mask_merge_path": None,
+                "mask_inpaint_path": None,
+                "mask_merge_off_path": None,
+                "mask_inpaint_off_path": None,
+                "mask_toggle_enabled": False,
+                "use_inpainted_as_source": False,
+                "bg_clean": None,
+                "working_source": None,
+                "final_paint": None,
+                "final_paint_above": None,
+                "original_name": image_name,
+                "ocr_analysis_regions": [],
+                "maker_preview_settings": dict(preview_settings),
+                "maker_runtime_profile": dict(runtime_profile),
+                "maker_page": dict(maker_page_meta),
+            }
+            summary["maps"].append({
+                "page_index": page_idx,
+                "map_id": map_id,
+                "map_name": map_name,
+                "map_file": map_path.name,
+                "text_unit_count": len(chunk_units),
+                "physical_map_text_unit_count": len(units),
+                "event_count": len(events),
+                "editor_split_enabled": bool(split_total > 1),
+                "editor_split_index": split_index,
+                "editor_split_total": split_total,
+                "editor_split_limit": MAKER_MAP_TEXT_SPLIT_LIMIT,
+                "editor_split_event_ids": list(chunk.get("event_ids") or []),
+                "editor_split_within_event": bool(chunk.get("split_within_event", False)),
+            })
+            summary["total_text_units"] += len(chunk_units)
 
     # Virtual pages: CommonEvents and Database/System text.  These do not have
     # a real map canvas, but they should still behave like Maker pages in the
@@ -7811,6 +9989,79 @@ def build_maker_pages(project_dir: str | os.PathLike[str], game_clone_dir: str |
             except Exception:
                 pass
 
+        # Plugin translation pages are a third editor layer.  They deliberately
+        # stay separate from map dialogue and database rows because their source
+        # containers and write-back rules are different.
+        try:
+            plugin_pages = extract_plugin_text_units(Path(game_clone_dir), Path(data_dir), engine_info)
+        except Exception:
+            plugin_pages = {}
+        _plugin_items = list(plugin_pages.items()) if isinstance(plugin_pages, dict) else []
+        for _plugin_pos, (plugin_key, units) in enumerate(_plugin_items, start=1):
+            if not units:
+                continue
+            first = units[0]
+            plugin_name = str(first.plugin_name or first.db_kind or plugin_key).strip()
+            if str(plugin_key).startswith("plugin:"):
+                page_title = f"Plugin - {plugin_name}"
+            elif str(plugin_key).startswith("event:"):
+                page_title = f"Plugin Events - {Path(str(first.source_file or plugin_key)).stem}"
+            elif str(plugin_key).startswith("note:"):
+                page_title = f"Plugin Notes - {Path(str(first.source_file or plugin_key)).stem}"
+            else:
+                page_title = f"Plugin - {plugin_name or plugin_key}"
+            _emit_maker_progress(
+                progress_callback, _plugin_pos, max(len(_plugin_items), 1),
+                f"플러그인 텍스트 페이지 구성 중... {_plugin_pos}/{max(len(_plugin_items), 1)}\n{page_title} / 텍스트 {len(units)}개",
+            )
+            page_idx = len(paths)
+            safe_name = _safe_map_name(page_title, f"Plugin{_plugin_pos:03d}")
+            image_name = f"{safe_name}.png"
+            image_path = images_dir / image_name
+            _virtual_page_placeholder_image(
+                image_path, title=page_title,
+                subtitle=str(first.source_file or "plugin data"),
+                text_count=len(units),
+                engine_label=str(engine_dict.get("engine_label") or "RPG Maker"),
+                preview_settings=preview_settings,
+            )
+            text_items = [_ysb_text_item_from_unit(unit, i, preview_settings=preview_settings, engine=str(engine_dict.get("engine") or "")) for i, unit in enumerate(units)]
+            paths.append(str(image_path))
+            data[page_idx] = {
+                "ori": None, "data": text_items,
+                "mask_merge": None, "mask_inpaint": None,
+                "mask_merge_off": None, "mask_inpaint_off": None,
+                "mask_merge_path": None, "mask_inpaint_path": None,
+                "mask_merge_off_path": None, "mask_inpaint_off_path": None,
+                "mask_toggle_enabled": False, "use_inpainted_as_source": False,
+                "bg_clean": None, "working_source": None,
+                "final_paint": None, "final_paint_above": None,
+                "original_name": image_name, "ocr_analysis_regions": [],
+                "maker_preview_settings": dict(preview_settings),
+                "maker_runtime_profile": dict(runtime_profile),
+                "maker_page": {
+                    "engine": engine_dict.get("engine"),
+                    "engine_label": engine_dict.get("engine_label"),
+                    "page_type": "plugin",
+                    "page_title": page_title,
+                    "source_file": str(first.source_file or ""),
+                    "plugin_key": str(plugin_key),
+                    "plugin_name": plugin_name,
+                    "map_id": 0, "map_name": page_title,
+                    "map_file": str(first.source_file or ""),
+                    "width": 20, "height": 11,
+                    "event_count": 0, "text_unit_count": len(units),
+                    "events": [],
+                },
+            }
+            summary["plugin_pages"].append({
+                "page_index": page_idx, "plugin_key": str(plugin_key),
+                "plugin_name": plugin_name, "source_file": str(first.source_file or ""),
+                "page_title": page_title, "text_unit_count": len(units),
+            })
+            summary["virtual_pages"].append({"page_index": page_idx, "page_type": "plugin", "source_file": str(first.source_file or "")})
+            summary["total_text_units"] += len(units)
+
     if not paths:
         raise MakerProjectError("MapXXX.json을 찾지 못했습니다. MV/MZ 프로젝트의 data 폴더를 확인해 주세요.")
 
@@ -7834,6 +10085,7 @@ def build_maker_pages(project_dir: str | os.PathLike[str], game_clone_dir: str |
             json.dump({
                 "common_events": summary.get("common_events") or [],
                 "database_pages": summary.get("database_pages") or [],
+                "plugin_pages": summary.get("plugin_pages") or [],
                 "virtual_pages": summary.get("virtual_pages") or [],
             }, f, ensure_ascii=False, indent=2)
     except Exception:
@@ -7848,25 +10100,16 @@ def build_maker_pages(project_dir: str | os.PathLike[str], game_clone_dir: str |
 
 def _maker_project_engine_info(project_dir: str | os.PathLike[str]) -> Dict[str, Any] | None:
     try:
-        summary = _read_maker_import_summary(project_dir)
-        engine = summary.get("engine") if isinstance(summary, dict) else None
-        if isinstance(engine, dict):
-            return engine
-    except Exception:
-        pass
-    try:
-        return detect_maker_engine(_maker_game_dir(project_dir)).to_dict()
+        return dict(maker_project_paths(project_dir).get("engine") or {})
     except Exception:
         return None
 
 
 def maker_content_root(project_dir: str | os.PathLike[str]) -> Path:
-    game_root = _maker_game_dir(project_dir)
-    engine_info = _maker_project_engine_info(project_dir)
     try:
-        return _content_root_from_engine_info(game_root, engine_info)
+        return Path(maker_project_paths(project_dir).get("content_root"))
     except Exception:
-        return game_root
+        return _maker_game_dir(project_dir)
 
 
 def maker_fonts_dir(project_dir: str | os.PathLike[str]) -> Path:
@@ -8254,7 +10497,10 @@ def collect_maker_database_glossary(data: Dict[int, dict] | None) -> List[Dict[s
             meta = row.get("maker_text_unit") or {}
             if not isinstance(meta, dict):
                 meta = {}
-            if page_type != "database" and str(meta.get("source_kind") or "") != "database":
+            source_kind = str(meta.get("source_kind") or "").strip().lower()
+            is_database_name = page_type == "database" or source_kind == "database"
+            is_speaker_name = page_type == "speaker" or source_kind == "speaker"
+            if not (is_database_name or is_speaker_name):
                 continue
             if not _is_maker_database_name_field(meta):
                 continue

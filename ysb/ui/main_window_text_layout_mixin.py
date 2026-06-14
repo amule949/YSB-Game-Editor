@@ -1,4 +1,5 @@
 from ysb.ui.main_window_support import *
+from ysb.core.perf_tracer import perf_counter, log_elapsed as perf_log_elapsed, next_action_id
 
 
 class MainWindowTextLayoutMixin:
@@ -2363,25 +2364,22 @@ class MainWindowTextLayoutMixin:
             except Exception:
                 pass
 
-        # 쯔꾸르붕이의 작업 본체는 project.json이다. 번역문/화자/메모 편집은
-        # maker_game JSON writeback만 믿지 말고 프로그램 프로젝트에도 즉시 남긴다.
+        # 쯔꾸르붕이에서는 표 텍스트 수정 중 프로젝트 본체를 즉시 저장하지 않는다.
+        # 전체 프로젝트 저장 + 작업용 게임 JSON 반영은 Ctrl+S / [프로젝트 저장]에서만 수행한다.
+        # 대신 충돌 복구를 위해 아주 작은 JSONL 복구 로그만 남긴다.
+        maker_page = False
         try:
-            maker_page = False
             if hasattr(self, "data") and isinstance(getattr(self, "data", None), dict):
                 page = self.data.get(int(page_idx)) or {}
                 maker_page = isinstance(page, dict) and isinstance(page.get("maker_page"), dict) and bool(page.get("maker_page"))
-            field_set = {str(x or "") for x in (fields or [])}
-            persist_fields = {"translated_text", "maker_speaker", "maker_memo", "speaker", "text"}
-            if maker_page and (not field_set or bool(field_set & persist_fields)):
-                store = getattr(self, "project_store", None)
-                if store is not None:
-                    try:
-                        self.save_project_store(store, force_full=False)
-                    except Exception:
-                        try:
-                            store.save_page_data_delta(getattr(self, "data", {}) or {}, [int(page_idx)], current_index=getattr(self, "idx", 0))
-                        except Exception:
-                            pass
+            if maker_page and hasattr(self, "append_maker_recovery_event"):
+                self.append_maker_recovery_event({
+                    "type": "finalize_text_change",
+                    "page_idx": int(page_idx),
+                    "ids": list(ids or []),
+                    "fields": [str(x or "") for x in (fields or [])],
+                    "reason": str(reason or "텍스트 변경"),
+                })
         except Exception:
             pass
 
@@ -2398,16 +2396,21 @@ class MainWindowTextLayoutMixin:
                 except Exception:
                     pass
             try:
-                self.schedule_deferred_auto_save_project(delay_ms)
+                # 쯔꾸르붕이 표 편집은 Ctrl+S 수동 저장으로 확정한다.
+                # 자동 프로젝트 저장은 하지 않고, 위의 경량 복구 로그만 남긴다.
+                if not bool(maker_page):
+                    self.schedule_deferred_auto_save_project(delay_ms)
             except Exception:
-                try:
-                    self.auto_save_project()
-                except Exception:
-                    pass
+                if not bool(maker_page):
+                    try:
+                        self.auto_save_project()
+                    except Exception:
+                        pass
         else:
             try:
-                # 다른 페이지도 복구 대상 journal에 포함해야 하므로 타이머는 현재 페이지에서 한 번 예약한다.
-                self.schedule_deferred_auto_save_project(delay_ms)
+                if not bool(maker_page):
+                    # 다른 페이지도 복구 대상 journal에 포함해야 하므로 타이머는 현재 페이지에서 한 번 예약한다.
+                    self.schedule_deferred_auto_save_project(delay_ms)
             except Exception:
                 pass
         return ids
@@ -3809,7 +3812,21 @@ class MainWindowTextLayoutMixin:
                 mask[y1:y2, x1:x2, :] = 0
             curr[key] = mask
 
-    def delete_text_data_items(self, data_items=None, ask=True):
+    def delete_text_data_items(self, *args, **kwargs):
+        _perf_t0 = perf_counter()
+        _perf_action_id = next_action_id("delete_text_data_items")
+        _perf_ok = False
+        try:
+            _res = self._perf_impl_delete_text_data_items(*args, **kwargs)
+            _perf_ok = True
+            return _res
+        finally:
+            try:
+                perf_log_elapsed(self, "PERF_USER_ACTION", _perf_t0, action="delete_text_data_items", action_id=_perf_action_id, ok=bool(_perf_ok), args_count=len(args), kwargs=','.join(sorted([str(k) for k in kwargs.keys()])))
+            except Exception:
+                pass
+
+    def _perf_impl_delete_text_data_items(self, data_items=None, ask=True):
         curr = self.data.get(self.idx)
         if not curr:
             return False

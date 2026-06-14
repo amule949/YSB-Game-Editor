@@ -1,6 +1,7 @@
 from PyQt6.QtWidgets import QStyledItemDelegate, QTextEdit
 from PyQt6.QtGui import QTextCursor, QKeySequence
 from PyQt6.QtCore import Qt, QEvent, QTimer
+import time
 
 from ysb.settings.shortcut_settings import key_event_matches_sequence
 
@@ -17,8 +18,61 @@ class MultilineDelegate(QStyledItemDelegate):
         editor.setAcceptRichText(False)
         editor.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         editor.installEventFilter(self)
+        try:
+            editor.selectionChanged.connect(lambda ed=editor: self._remember_editor_selection(ed))
+        except Exception:
+            pass
         self._install_symbol_shortcuts(editor)
         return editor
+
+    def _owner_window(self, editor):
+        try:
+            table = self.parent()
+            if table is not None and hasattr(table, 'window'):
+                return table.window()
+        except Exception:
+            pass
+        try:
+            return editor.window()
+        except Exception:
+            return None
+
+    def _remember_editor_selection(self, editor):
+        """Remember the last explicit QTextEdit selection for selected-line translation.
+
+        Clicking the translate button can close or defocus the delegate editor before
+        the main window can inspect QTextCursor directly.  Keep a short-lived copy of
+        the selected range on the owner window, and clear it only through an explicit
+        ESC path or when another selection replaces it.
+        """
+        try:
+            cursor = editor.textCursor()
+            if not cursor.hasSelection():
+                return
+            row = getattr(editor, "_ysb_table_row", None)
+            col = getattr(editor, "_ysb_table_col", None)
+            owner = self._owner_window(editor)
+            if owner is None or row is None or col is None:
+                return
+            owner._ysb_table_text_selection_for_translation = {
+                "row": int(row),
+                "col": int(col),
+                "selection_start": int(cursor.selectionStart()),
+                "selection_end": int(cursor.selectionEnd()),
+                "full_text": editor.toPlainText(),
+                "selected_text": cursor.selectedText(),
+                "timestamp": time.time(),
+            }
+        except Exception:
+            pass
+
+    def _clear_remembered_editor_selection(self, editor):
+        try:
+            owner = self._owner_window(editor)
+            if owner is not None:
+                owner._ysb_table_text_selection_for_translation = None
+        except Exception:
+            pass
 
     def _install_symbol_shortcuts(self, editor):
         # QTextEdit 위에 QShortcut을 직접 얹으면 Ctrl+Alt+Shift 계열에서
@@ -125,6 +179,17 @@ class MultilineDelegate(QStyledItemDelegate):
                 event.accept()
                 return True
         if event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Escape:
+                try:
+                    cursor = editor.textCursor()
+                    if cursor.hasSelection():
+                        cursor.clearSelection()
+                        editor.setTextCursor(cursor)
+                        self._clear_remembered_editor_selection(editor)
+                        event.accept()
+                        return True
+                except Exception:
+                    pass
             if self._handle_symbol_shortcut(editor, event):
                 return True
             if self._linebreak_matches(event):

@@ -1,12 +1,21 @@
 import gc
+import time
+import uuid
+import urllib.request
+import urllib.error
 from ysb.ui.main_window_support import *
 from ysb.utils.runtime_logger import append_log, memory_text, numpy_shape_text
+from ysb.ui.gemini_delayed_translation import (
+    GeminiDelayedTranslationController,
+    GeminiDelayedTranslationDialog,
+)
 from ysb.tools.maker_project import (
     load_maker_character_prompts,
     load_maker_translation_settings,
     normalize_maker_database_translation_result,
     prepare_maker_translation_payload,
     restore_maker_translation_text,
+    restore_maker_translation_text_checked,
     analyze_maker_control_codes,
     strip_maker_control_codes,
     apply_maker_edge_control_codes,
@@ -31,6 +40,7 @@ class MainWindowOperationsMixin:
             "deepseek": int(getattr(self.api_settings, "deepseek_chunk_size", 50) or 50),
             "google": int(getattr(self.api_settings, "google_translate_chunk_size", 50) or 50),
             "gemini": int(getattr(self.api_settings, "gemini_chunk_size", 50) or 50),
+            "gemini_deferred": int(getattr(self.api_settings, "gemini_delayed_chunk_size", 50) or 50),
             "custom": int(getattr(self.api_settings, "custom_translation_chunk_size", 50) or 50),
         }
         if hasattr(self, "cb_trans_provider"):
@@ -46,45 +56,55 @@ class MainWindowOperationsMixin:
         self.log("🔑 API settings cache saved" if self.ui_language == LANG_EN else "🔑 API 설정 캐시 저장 완료")
 
     def open_translation_prompt_dialog(self):
-        old_prompt = str(self.app_options.get(TRANSLATION_PROMPT_KEY, "") or "")
-        dlg = TranslationPromptDialog(old_prompt, self)
-        if not dlg.exec():
-            self.log("↩️ 번역 프롬프트 저장 취소")
-            return
-
-        new_prompt = dlg.get_prompt_text()
-        self.app_options[TRANSLATION_PROMPT_KEY] = new_prompt
-        self.save_app_options_cache()
-        self.sync_translation_option_cache_to_config()
-        self.log(f"📝 번역 프롬프트 캐시 저장 완료 ({len(new_prompt):,}자)")
+        """Legacy entry point: all prompt management now opens one manager."""
+        return self.open_maker_character_prompts_dialog()
 
     def open_glossary_dialog(self):
         try:
-            # 단어장 창은 항상 현재 프로젝트 DB name 번역 상태를 먼저 반영한다.
-            # 특정 번역 경로에서 갱신 트리거가 누락돼도 창을 열 때 자동 블록이 최신화된다.
+            # Always refresh the current project's database glossary first.
             if hasattr(self, "refresh_maker_database_auto_glossary"):
                 self.refresh_maker_database_auto_glossary(show_log=False)
         except Exception:
             pass
-        old_text = str(self.app_options.get(TRANSLATION_GLOSSARY_TEXT_KEY, "") or "")
-        old_path = str(self.app_options.get(TRANSLATION_GLOSSARY_PATH_KEY, "") or "")
-        dlg = GlossaryDialog(old_text, old_path, self)
-        dlg.exec()
 
-        new_text, new_path, changed = dlg.get_glossary_state()
-        if not changed:
+        auto_entries = normalize_glossary_entry_dict(
+            self.app_options.get(TRANSLATION_AUTO_DB_GLOSSARY_ENTRIES_KEY, {})
+        )
+        user_entries = normalize_glossary_entry_dict(
+            self.app_options.get(TRANSLATION_USER_GLOSSARY_ENTRIES_KEY, {})
+        )
+        user_notes = str(self.app_options.get(TRANSLATION_USER_GLOSSARY_NOTES_KEY, "") or "")
+
+        # One-time migration from the former mixed TXT cache.  Nothing is discarded:
+        # recognized pairs become structured dictionaries and the remaining lines
+        # stay as user notes/rules.
+        legacy_text = str(self.app_options.get(TRANSLATION_GLOSSARY_TEXT_KEY, "") or "")
+        if legacy_text and (not auto_entries or not user_entries or not user_notes):
+            migrated_auto, migrated_user, migrated_notes = split_legacy_glossary_cache(legacy_text)
+            if not auto_entries:
+                auto_entries = migrated_auto
+            if not user_entries:
+                user_entries = migrated_user
+            if not user_notes:
+                user_notes = migrated_notes
+
+        dlg = GlossaryDialog(auto_entries, user_entries, user_notes, self)
+        if not dlg.exec():
+            self.log(self.tr_ui("↩️ 단어장 저장 취소"))
             return
 
-        self.app_options[TRANSLATION_GLOSSARY_TEXT_KEY] = new_text
-        self.app_options[TRANSLATION_GLOSSARY_PATH_KEY] = new_path
+        _auto_snapshot, new_user_entries, new_user_notes = dlg.get_glossary_state()
+        self.app_options[TRANSLATION_USER_GLOSSARY_ENTRIES_KEY] = dict(new_user_entries)
+        self.app_options[TRANSLATION_USER_GLOSSARY_NOTES_KEY] = str(new_user_notes or "")
+        # The old mixed text key now keeps only free-form notes for compatibility.
+        self.app_options[TRANSLATION_GLOSSARY_TEXT_KEY] = str(new_user_notes or "")
+        self.app_options[TRANSLATION_GLOSSARY_PATH_KEY] = ""
         self.save_app_options_cache()
         self.sync_translation_option_cache_to_config()
-
-        if new_text:
-            self.log(f"📚 단어장 캐시 저장 완료 ({len(new_text):,}자)")
-        else:
-            self.log("📚 단어장 캐시 초기화 완료")
-
+        saved_message = self.tr_ui("📚 사용자 단어장 저장 완료: {count}개").format(count=f"{len(new_user_entries):,}")
+        if new_user_notes:
+            saved_message += self.tr_ui(" / 메모 {count}자").format(count=f"{len(new_user_notes):,}")
+        self.log(saved_message)
 
 
     def capture_magic_wand_state(self):
@@ -3863,6 +3883,34 @@ class MainWindowOperationsMixin:
             current_mode = int(self.cb_mode.currentIndex()) if hasattr(self, "cb_mode") else -1
         except Exception:
             current_mode = -1
+
+        # 일반 대사 프리뷰가 꺼져 있으면 현재 페이지 이미지/마스크/프리뷰 캐시를
+        # 읽지 않는다. 오른쪽 표만 구성하고 왼쪽은 검은 화면으로 유지한다.
+        maker_preview_suppressed = False
+        try:
+            maker_preview_suppressed = bool(
+                hasattr(self, "_is_current_maker_page")
+                and self._is_current_maker_page()
+                and hasattr(self, "is_maker_preview_enabled")
+                and not self.is_maker_preview_enabled()
+            )
+        except Exception:
+            maker_preview_suppressed = False
+        if maker_preview_suppressed:
+            try:
+                self.ref_tab()
+            except Exception:
+                pass
+            try:
+                self._clear_maker_normal_preview_to_black(reason="page_load_preview_disabled")
+            except Exception:
+                pass
+            try:
+                self.update_maker_database_mode_bar()
+            except Exception:
+                pass
+            return
+
         try:
             self.ensure_page_runtime_loaded(
                 self.idx,
@@ -3918,15 +3966,20 @@ class MainWindowOperationsMixin:
         return QColor("#E8E1E6") if checked else QColor("#A99FA5")
 
     def table_current_row_color(self):
-        # Maker text table current-row marker.  This is a visual row marker only;
-        # actual selection remains cell/range based like Excel.
-        return QColor("#F6D9DE") if self.is_light_theme() else QColor("#4A2029")
+        # Maker row highlight is visual only.  The real table selection remains
+        # cell/range based, but every row touched by selected cells is filled so
+        # the user can read each row as one dialogue object.
+        return QColor("#F5E8EA") if self.is_light_theme() else QColor("#5B3136")
 
     def table_current_row_text_color(self):
-        return QColor("#201316") if self.is_light_theme() else QColor("#FFFFFF")
+        return QColor("#202124") if self.is_light_theme() else QColor("#FFFFFF")
 
     def _paint_maker_table_row_marker_state(self, row, marked=False):
-        """Paint one Maker table row as normal/current marker."""
+        """Paint one Maker table row as selected/current or normal.
+
+        Qt still selects cells.  This helper only paints the full row touched by
+        those cells, and ESC/invalid selection restores it to its normal color.
+        """
         try:
             table = getattr(self, "tab", None)
             if table is None:
@@ -3937,34 +3990,68 @@ class MainWindowOperationsMixin:
             if row == 0:
                 self.paint_all_row_header()
                 return True
-            if bool(marked):
+            if marked:
                 bg = self.table_current_row_color()
                 fg = self.table_current_row_text_color()
                 for c in range(table.columnCount()):
-                    item = table.item(row, c)
-                    if item is not None:
-                        item.setBackground(bg)
-                        item.setForeground(fg)
-                try:
-                    widget = table.cellWidget(row, 1)
-                    if widget:
-                        widget.setStyleSheet(self.table_check_widget_style(bg))
-                except Exception:
-                    pass
+                    cell = table.item(row, c)
+                    if cell:
+                        cell.setBackground(bg)
+                        cell.setForeground(fg)
+                widget = table.cellWidget(row, 1)
+                if widget:
+                    widget.setStyleSheet(self.table_check_widget_style(bg))
             else:
-                # Maker rows do not use the old inpaint checkbox meaning.  They
-                # should repaint as normal active rows, not dimmed unchecked rows.
                 self.set_table_row_visual(row, True if self._is_maker_text_table_mode() else self.get_table_check_state(row))
             return True
         except Exception:
             return False
 
-    def refresh_maker_table_current_row_marker(self):
-        """Repaint only the previous and current Maker table marker rows.
+    def _maker_table_selected_marker_rows(self):
+        """Return Maker table rows touched by the current real cell selection.
 
-        The old implementation repainted the whole table on every selection
-        change.  That was too expensive on long maps and image-heavy preview
-        rows.  This version touches at most two rows and never changes selection.
+        Large drag/range selections can expose thousands of selected indexes.
+        For Maker tables we only need row numbers, so prefer selectedRanges()
+        and expand rows once.  This keeps multi-select as a light text-table
+        operation instead of making selectionChanged walk every selected cell.
+        """
+        rows = set()
+        try:
+            table = getattr(self, "tab", None)
+            if table is None:
+                return rows
+            try:
+                ranges = list(table.selectedRanges() or [])
+            except Exception:
+                ranges = []
+            if ranges:
+                row_count = int(table.rowCount())
+                for rg in ranges:
+                    try:
+                        top = max(1, int(rg.topRow()))
+                        bottom = min(row_count - 1, int(rg.bottomRow()))
+                    except Exception:
+                        continue
+                    if bottom >= top:
+                        rows.update(range(top, bottom + 1))
+                return rows
+            for idx in table.selectedIndexes() or []:
+                try:
+                    row = int(idx.row())
+                except Exception:
+                    continue
+                if row > 0:
+                    rows.add(row)
+        except Exception:
+            pass
+        return rows
+
+    def refresh_maker_table_current_row_marker(self):
+        """Update Maker row-marker state without touching cell/widget data.
+
+        Selection is a text-table operation.  Store only the selected row ids and
+        ask the viewport to repaint its lightweight overlay.  No item background,
+        foreground, checkbox stylesheet, preview, cache, or scene work belongs here.
         """
         try:
             if not self._is_maker_text_table_mode():
@@ -3972,27 +4059,18 @@ class MainWindowOperationsMixin:
             table = getattr(self, "tab", None)
             if table is None:
                 return False
-            current_row = int(table.currentRow())
-            if current_row < 1 or current_row >= table.rowCount():
-                current_row = -1
+            current_rows = set(self._maker_table_selected_marker_rows() or set())
+            self._maker_table_current_marker_rows = current_rows
+            self._maker_table_current_marker_row = min(current_rows) if current_rows else -1
             try:
-                old_row = int(getattr(self, "_maker_table_current_marker_row", -1))
+                table._ysb_selected_marker_rows = set(current_rows)
             except Exception:
-                old_row = -1
-
-            old_block = table.blockSignals(True)
+                pass
             try:
-                if 0 <= old_row < table.rowCount() and old_row != current_row:
-                    self._paint_maker_table_row_marker_state(old_row, marked=False)
-                if 0 <= current_row < table.rowCount():
-                    self._paint_maker_table_row_marker_state(current_row, marked=True)
-                self._maker_table_current_marker_row = current_row
-                return True
-            finally:
-                try:
-                    table.blockSignals(old_block)
-                except Exception:
-                    pass
+                table.viewport().update()
+            except Exception:
+                pass
+            return True
         except Exception:
             return False
 
@@ -4023,6 +4101,7 @@ class MainWindowOperationsMixin:
                 self.set_table_row_visual(row, True if self._is_maker_text_table_mode() else self.get_table_check_state(row))
             try:
                 self._maker_table_current_marker_row = -1
+                self._maker_table_current_marker_rows = set()
                 if self._is_maker_text_table_mode():
                     self.refresh_maker_table_current_row_marker()
             except Exception:
@@ -4146,6 +4225,10 @@ class MainWindowOperationsMixin:
                 all_checked = len(curr_data['data']) > 0 and all(x.get('use_inpaint', True) for x in curr_data['data'])
                 self.set_table_check_state(0, all_checked)
                 self.paint_all_row_header()
+            try:
+                self.refresh_maker_translation_summary_header()
+            except Exception:
+                pass
         finally:
             self.tab.blockSignals(False)
             self._table_check_lock = False
@@ -4170,7 +4253,7 @@ class MainWindowOperationsMixin:
     def _is_maker_text_table_mode(self):
         """Return True when the right text table should use the Maker/Game columns."""
         try:
-            if hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode():
+            if hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode():
                 return True
             return bool(hasattr(self, "_is_current_maker_page") and self._is_current_maker_page())
         except Exception:
@@ -4214,7 +4297,9 @@ class MainWindowOperationsMixin:
                 except Exception:
                     pass
                 try:
-                    table.selectRow(row)
+                    # Do not select or fill the row.  The current-cell/focus
+                    # outline alone is the Maker single-line translation marker.
+                    table.clearSelection()
                 except Exception:
                     pass
                 try:
@@ -4248,38 +4333,376 @@ class MainWindowOperationsMixin:
                 pass
             return False
 
-    def _apply_maker_live_writeback_now(self, *, page_indices=None, reason="live_edit", log_result=False):
-        """Immediately sync edited text into maker_game JSON.
-
-        The cloned game folder is the live finished build.  This helper is used
-        after direct user edits and after batch/AI results are committed.
-        """
+    def _maker_clean_page_indices(self, page_indices=None):
+        cleaned = []
         try:
-            if not self._is_current_or_page_maker((getattr(self, "data", {}) or {}).get(getattr(self, "idx", 0)) or {}):
+            if page_indices is None:
                 return None
+            for x in page_indices:
+                try:
+                    cleaned.append(int(x))
+                except Exception:
+                    pass
         except Exception:
             return None
+        seen = set()
+        out = []
+        for x in cleaned:
+            if x in seen:
+                continue
+            seen.add(x)
+            out.append(x)
+        return out
+
+    def maker_recovery_dir(self):
+        try:
+            project_dir = getattr(self, "project_dir", None)
+            if not project_dir:
+                return None
+            path = Path(str(project_dir)) / ".recovery"
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except Exception:
+            return None
+
+    def append_maker_recovery_event(self, payload):
+        """Append a tiny JSONL recovery record for crash recovery without saving the full project."""
+        try:
+            if not isinstance(payload, dict):
+                return False
+            root = self.maker_recovery_dir()
+            if root is None:
+                return False
+            session = str(getattr(self, "_maker_recovery_session_id", "") or "session")
+            path = root / f"maker_recovery_{session}.jsonl"
+            rec = dict(payload)
+            rec.setdefault("ts", datetime.now().isoformat(timespec="seconds"))
+            rec.setdefault("page_idx", int(getattr(self, "idx", 0) or 0))
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+            return True
+        except Exception:
+            return False
+
+    def clear_maker_recovery_events(self):
+        try:
+            root = self.maker_recovery_dir()
+            if root is None or not root.exists():
+                return
+            for p in root.glob("maker_recovery_*.jsonl"):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def has_maker_writeback_dirty(self):
+        try:
+            return bool(getattr(self, "_maker_game_writeback_dirty_pages", set()) or getattr(self, "_maker_game_writeback_dirty_reasons", set()))
+        except Exception:
+            return False
+
+    def mark_maker_writeback_dirty(self, page_indices=None, reason="maker_edit", schedule_save=False):
+        """Mark edited pages as waiting for manual Ctrl+S project save/game writeback."""
         try:
             if page_indices is None:
                 page_indices = [int(getattr(self, "idx", 0) or 0)]
         except Exception:
             page_indices = None
+        pages = self._maker_clean_page_indices(page_indices) if hasattr(self, "_maker_clean_page_indices") else None
         try:
-            return self.apply_maker_writeback_to_clone(mark_dirty=False, log_result=log_result, backup=False, page_indices=page_indices)
-        except TypeError:
+            if not hasattr(self, "_maker_game_writeback_dirty_pages"):
+                self._maker_game_writeback_dirty_pages = set()
+            if not hasattr(self, "_maker_game_writeback_dirty_reasons"):
+                self._maker_game_writeback_dirty_reasons = set()
+            if pages:
+                self._maker_game_writeback_dirty_pages.update(int(x) for x in pages)
+            else:
+                # page_indices=None은 전체 반영 대기 의미로 남긴다.
+                self._maker_game_writeback_dirty_reasons.add("ALL")
+            if reason:
+                self._maker_game_writeback_dirty_reasons.add(str(reason))
+        except Exception:
+            pass
+        try:
+            self.has_unsaved_changes = True
+        except Exception:
+            pass
+        try:
+            self.append_maker_recovery_event({
+                "type": "maker_dirty",
+                "pages": sorted(int(x) for x in (pages or [])),
+                "reason": str(reason or "maker_edit"),
+            })
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "audit_boundary_event"):
+                self.audit_boundary_event(
+                    "MAKER_WRITEBACK_DIRTY_MARK",
+                    dirty_pages=sorted(int(x) for x in getattr(self, "_maker_game_writeback_dirty_pages", set()) or set()),
+                    reason=str(reason or ""),
+                )
+        except Exception:
+            pass
+        try:
+            self.sync_maker_writeback_ui_state()
+        except Exception:
+            pass
+        if schedule_save:
             try:
-                return self.apply_maker_writeback_to_clone(mark_dirty=False, log_result=log_result)
-            except Exception as e:
-                try:
-                    self.log(f"⚠️ 쯔꾸르 JSON 실시간 반영 실패: {e}")
-                except Exception:
-                    pass
-        except Exception as e:
-            try:
-                self.log(f"⚠️ 쯔꾸르 JSON 실시간 반영 실패: {e}")
+                self.schedule_deferred_auto_save_project(1200)
             except Exception:
                 pass
+
+    def clear_maker_writeback_dirty(self, page_indices=None, *, save_state=True):
+        try:
+            pages = self._maker_clean_page_indices(page_indices) if page_indices is not None else None
+            if not hasattr(self, "_maker_game_writeback_dirty_pages"):
+                self._maker_game_writeback_dirty_pages = set()
+            if pages is None:
+                self._maker_game_writeback_dirty_pages.clear()
+                self._maker_game_writeback_dirty_reasons = set()
+            else:
+                for pidx in pages:
+                    self._maker_game_writeback_dirty_pages.discard(int(pidx))
+                if not self._maker_game_writeback_dirty_pages:
+                    self._maker_game_writeback_dirty_reasons = set()
+        except Exception:
+            pass
+        try:
+            self.sync_maker_writeback_ui_state()
+        except Exception:
+            pass
+        if save_state:
+            try:
+                self.schedule_deferred_auto_save_project(800)
+            except Exception:
+                pass
+
+    def sync_maker_writeback_ui_state(self):
+        dirty = bool(self.has_maker_writeback_dirty()) if hasattr(self, "has_maker_writeback_dirty") else False
+        running = getattr(self, "_maker_writeback_worker", None) is not None
+        try:
+            has_project = bool(self._maker_project_has_imported_game()) if hasattr(self, "_maker_project_has_imported_game") else bool(getattr(self, "project_dir", None))
+        except Exception:
+            has_project = bool(getattr(self, "project_dir", None))
+        enabled = bool(has_project and not running)
+        label = self.tr_ui("프로젝트 저장") if hasattr(self, "tr_ui") else "프로젝트 저장"
+        if dirty:
+            label = label + " *"
+        tip = self.tr_ui("현재 작업 폴더와 작업용 게임 JSON을 저장합니다. 단축키: Ctrl+S") if hasattr(self, "tr_ui") else "현재 작업 폴더와 작업용 게임 JSON을 저장합니다. 단축키: Ctrl+S"
+        if running:
+            tip = self.tr_ui("프로젝트 저장 작업이 진행 중입니다.") if hasattr(self, "tr_ui") else "프로젝트 저장 작업이 진행 중입니다."
+        try:
+            action = (getattr(self, "actions", {}) or {}).get("project_save")
+            if action is not None:
+                action.setText(label)
+                action.setToolTip(tip)
+                action.setStatusTip(tip)
+                action.setWhatsThis(tip)
+                action.setEnabled(enabled)
+        except Exception:
+            pass
+        try:
+            action = (getattr(self, "actions", {}) or {}).get("work_apply_maker_game_json")
+            if action is not None:
+                action.setEnabled(False)
+                action.setVisible(False)
+        except Exception:
+            pass
+        try:
+            btn = getattr(self, "btn_maker_apply_game", None)
+            if btn is not None:
+                btn.setVisible(False)
+                btn.setEnabled(False)
+        except Exception:
+            pass
+
+    def _maker_pending_writeback_page_indices(self):
+        try:
+            pages = sorted(int(x) for x in (getattr(self, "_maker_game_writeback_dirty_pages", set()) or set()))
+            if pages:
+                return pages
+        except Exception:
+            pass
         return None
+
+    def _apply_maker_live_writeback_now(self, *, page_indices=None, reason="live_edit", log_result=False):
+        """Compatibility shim: live writeback is intentionally disabled.
+
+        Editing now only marks Maker pages as pending.  Actual working game JSON
+        files are updated only by Ctrl+S / [프로젝트 저장].  Keeping this shim lets
+        older edit routes call the old name without accidentally saving JSON or
+        causing recursive project-store writes during table editing.
+        """
+        try:
+            self.mark_maker_writeback_dirty(page_indices=page_indices, reason=reason)
+        except Exception:
+            pass
+        return None
+
+    def apply_maker_writeback_to_game_action(self):
+        # 구버전 액션 호환: 게임 반영은 프로젝트 저장(Ctrl+S)으로 통합되었다.
+        try:
+            self.save_project()
+        except Exception as e:
+            try:
+                QMessageBox.warning(self, self.tr_ui("프로젝트 저장 실패"), str(e))
+            except Exception:
+                pass
+
+    def apply_maker_writeback_to_game_async(self, *, page_indices=None, reason="manual_apply", after_done=None):
+        """Apply pending Maker edits to game JSON in a QThread with progress dialog."""
+        try:
+            if getattr(self, "_maker_writeback_worker", None) is not None:
+                return False
+            project_dir = getattr(self, "project_dir", None)
+            if not project_dir:
+                return False
+            pages = self._maker_clean_page_indices(page_indices)
+            if pages is None:
+                pages = self._maker_pending_writeback_page_indices()
+            # Deep-copy data before the worker starts so the UI thread can continue editing safely.
+            data_snapshot = copy.deepcopy(getattr(self, "data", {}) or {})
+            progress = QProgressDialog(self.tr_ui("작업용 게임 JSON을 저장하는 중..."), "", 0, 0, self)
+            progress.setWindowTitle(self.tr_ui("프로젝트 저장"))
+            progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+            progress.setMinimumDuration(0)
+            progress.setAutoClose(False)
+            progress.setAutoReset(False)
+            try:
+                progress.setCancelButton(None)
+            except Exception:
+                pass
+            progress.show()
+            worker = MakerWritebackWorker(project_dir, data_snapshot, page_indices=pages, backup=False)
+            self._maker_writeback_worker = worker
+            self._maker_writeback_progress = progress
+            self._maker_writeback_after_done = after_done
+            self.sync_maker_writeback_ui_state()
+            try:
+                self.audit_boundary_event("MAKER_WRITEBACK_ASYNC_START", dirty_pages=pages, reason=str(reason or ""))
+            except Exception:
+                pass
+
+            def _finish_ok(summary):
+                try:
+                    if getattr(self, "_maker_writeback_progress", None) is not None:
+                        self._maker_writeback_progress.close()
+                except Exception:
+                    pass
+                self._maker_writeback_progress = None
+                self._maker_writeback_worker = None
+                try:
+                    self.clear_maker_writeback_dirty(page_indices=pages, save_state=False)
+                except Exception:
+                    pass
+                try:
+                    written = summary.get("written_units", summary.get("written", summary.get("translated", summary.get("updated", "?")))) if isinstance(summary, dict) else "?"
+                    touched_maps = summary.get("touched_maps", []) if isinstance(summary, dict) else []
+                    touched = len(touched_maps) if isinstance(touched_maps, (list, tuple, set)) else summary.get("touched_files", summary.get("files", summary.get("pages", "?")))
+                    self.log(f"🎮 게임 반영 완료: 텍스트 {written}개 / 맵 {touched}개")
+                except Exception:
+                    pass
+                try:
+                    self.schedule_deferred_auto_save_project(200)
+                except Exception:
+                    pass
+                try:
+                    self.sync_maker_writeback_ui_state()
+                except Exception:
+                    pass
+                cb = getattr(self, "_maker_writeback_after_done", None)
+                self._maker_writeback_after_done = None
+                if callable(cb):
+                    try:
+                        cb(True)
+                    except Exception:
+                        pass
+
+            def _finish_error(message):
+                try:
+                    if getattr(self, "_maker_writeback_progress", None) is not None:
+                        self._maker_writeback_progress.close()
+                except Exception:
+                    pass
+                self._maker_writeback_progress = None
+                self._maker_writeback_worker = None
+                try:
+                    self.sync_maker_writeback_ui_state()
+                except Exception:
+                    pass
+                try:
+                    QMessageBox.warning(self, self.tr_ui("프로젝트 저장 실패"), str(message or ""))
+                except Exception:
+                    pass
+                cb = getattr(self, "_maker_writeback_after_done", None)
+                self._maker_writeback_after_done = None
+                if callable(cb):
+                    try:
+                        cb(False)
+                    except Exception:
+                        pass
+
+            try:
+                worker.progress.connect(lambda msg: progress.setLabelText(str(msg or "")))
+                worker.finished.connect(_finish_ok)
+                worker.error.connect(_finish_error)
+                worker.start()
+            except Exception:
+                self._maker_writeback_worker = None
+                self._maker_writeback_progress = None
+                raise
+            return True
+        except Exception as e:
+            try:
+                self.log(f"❌ 게임 JSON 반영 시작 실패: {e}")
+            except Exception:
+                pass
+            try:
+                self.sync_maker_writeback_ui_state()
+            except Exception:
+                pass
+            return False
+
+    def prompt_maker_writeback_before_leave(self, title=None):
+        """Return 'apply', 'discard', or 'cancel' for pending project save/writeback."""
+        try:
+            if not self.has_maker_writeback_dirty():
+                return "discard"
+        except Exception:
+            return "discard"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(title or self.tr_ui("프로젝트 저장 확인"))
+        message = self.tr_ui("저장하지 않은 변경사항이 있습니다.\n저장할까요?")
+        box.setText(message)
+        apply_btn = box.addButton(self.tr_ui("저장"), QMessageBox.ButtonRole.AcceptRole)
+        discard_btn = box.addButton(self.tr_ui("저장 안 함"), QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = box.addButton(self.tr_ui("취소"), QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(apply_btn)
+        try:
+            fm = QFontMetrics(box.font())
+            text_w = max(fm.horizontalAdvance(line) for line in str(message).splitlines() if line)
+            button_w = 0
+            for btn in (apply_btn, discard_btn, cancel_btn):
+                bw = max(86, fm.horizontalAdvance(btn.text()) + 36)
+                btn.setMinimumWidth(bw)
+                button_w += bw
+            # QMessageBox sometimes keeps a too-small native width after custom styling.
+            # Reserve room for icon, margins, and button spacing so Korean labels are not clipped.
+            box.setMinimumWidth(max(420, text_w + 150, button_w + 110))
+        except Exception:
+            box.setMinimumWidth(420)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is apply_btn:
+            return "apply"
+        if clicked is discard_btn:
+            return "discard"
+        return "cancel"
 
     def _advance_table_editor_after_enter(self, row=None, col=None, stay_current=False):
         """After committing a table QTextEdit with Enter, move to the same cell below.
@@ -4303,7 +4726,7 @@ class MainWindowOperationsMixin:
                 next_row = row
             if next_row < 1 or next_row >= table.rowCount():
                 return
-            db_mode = bool(hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode())
+            db_mode = bool(hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode())
             if db_mode:
                 # DB mode now mirrors the normal Maker/map text table.
                 editable_cols = {6, 7, 5, 2, 1}
@@ -4321,9 +4744,8 @@ class MainWindowOperationsMixin:
             table.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
             if bool(stay_current):
                 try:
-                    if bool(hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode()):
+                    if bool(hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode()):
                         self.commit_current_database_ui_to_layer()
-                        self.refresh_maker_database_preview_from_selection()
                     else:
                         self.apply_current_maker_row_without_move()
                 except Exception:
@@ -4380,6 +4802,10 @@ class MainWindowOperationsMixin:
                 return False
             row["translated_text"] = new_text
             row["maker_status"] = self.tr_ui("번역완료") if new_text.strip() else self.tr_ui("미번역")
+            if new_text.strip():
+                row["maker_translation_origin"] = "manual_edit"
+            else:
+                row.pop("maker_translation_origin", None)
             try:
                 status_item = table.item(row_no, 1)
                 if status_item is not None:
@@ -4388,18 +4814,12 @@ class MainWindowOperationsMixin:
                 pass
             self._apply_maker_live_writeback_now(page_indices=[page_idx], reason="ctrl_enter_stay", log_result=False)
             try:
-                ids = [row.get("id")]
-                if not self.refresh_final_text_items_by_ids(ids):
-                    self.schedule_final_text_scene_refresh(30)
-            except Exception:
-                pass
-            try:
                 table.setCurrentCell(row_no, trans_col)
                 table.scrollToItem(table.item(row_no, trans_col), QAbstractItemView.ScrollHint.PositionAtCenter)
             except Exception:
                 pass
             try:
-                self.finalize_text_change(ids=[row.get("id")], fields=["translated_text"], reason="Ctrl+Enter 현재 줄 반영", delay_ms=500)
+                self.finalize_maker_text_data_change([row.get("id")], fields=["translated_text"], page_idx=page_idx, reason="Ctrl+Enter 현재 줄 반영")
             except Exception:
                 pass
             return True
@@ -4436,7 +4856,11 @@ class MainWindowOperationsMixin:
         return [b for b in blocks if str(b or "").strip()]
 
     def _select_maker_translation_paste_range(self, start_row, end_row, trans_col):
-        """Show the pasted target cells after table refresh/writeback work."""
+        """Show the pasted target cells after table refresh/writeback work.
+
+        This is visual feedback only.  Keep selection signals and preview rebuilds
+        blocked so bulk paste remains a text-to-text operation.
+        """
         try:
             table = getattr(self, "tab", None)
             if table is None:
@@ -4446,22 +4870,546 @@ class MainWindowOperationsMixin:
             trans_col = int(trans_col)
             if end_row < start_row or trans_col < 0 or trans_col >= int(table.columnCount()):
                 return False
-            table.clearSelection()
-            table.setRangeSelected(QTableWidgetSelectionRange(start_row, trans_col, end_row, trans_col), True)
-            table.setCurrentCell(start_row, trans_col)
+            old_bulk = bool(getattr(self, "_maker_bulk_text_editing", False))
+            old_block = table.blockSignals(True)
+            old_updates = True
+            viewport = None
+            viewport_updates = True
             try:
-                item0 = table.item(start_row, trans_col)
-                if item0 is not None:
-                    table.scrollToItem(item0, QAbstractItemView.ScrollHint.PositionAtCenter)
-            except Exception:
-                pass
-            try:
-                table.setFocus(Qt.FocusReason.OtherFocusReason)
-            except Exception:
-                pass
+                self._maker_bulk_text_editing = True
+                try:
+                    old_updates = bool(table.updatesEnabled())
+                    table.setUpdatesEnabled(False)
+                except Exception:
+                    pass
+                try:
+                    viewport = table.viewport()
+                    if viewport is not None:
+                        viewport_updates = bool(viewport.updatesEnabled())
+                        viewport.setUpdatesEnabled(False)
+                except Exception:
+                    viewport = None
+                table.clearSelection()
+                table.setRangeSelected(QTableWidgetSelectionRange(start_row, trans_col, end_row, trans_col), True)
+                table.setCurrentCell(start_row, trans_col)
+                try:
+                    self.refresh_maker_table_current_row_marker()
+                except Exception:
+                    pass
+                try:
+                    item0 = table.item(start_row, trans_col)
+                    if item0 is not None:
+                        table.scrollToItem(item0, QAbstractItemView.ScrollHint.PositionAtCenter)
+                except Exception:
+                    pass
+                try:
+                    table.setFocus(Qt.FocusReason.OtherFocusReason)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    if viewport is not None:
+                        viewport.setUpdatesEnabled(viewport_updates)
+                except Exception:
+                    pass
+                try:
+                    table.setUpdatesEnabled(old_updates)
+                except Exception:
+                    pass
+                try:
+                    table.blockSignals(old_block)
+                except Exception:
+                    pass
+                try:
+                    self._maker_bulk_text_editing = old_bulk
+                except Exception:
+                    pass
+                try:
+                    if viewport is not None:
+                        viewport.update()
+                except Exception:
+                    pass
             return True
         except Exception:
             return False
+
+    def _maker_preview_commit_epoch_value(self):
+        try:
+            return int(getattr(self, "_maker_preview_commit_epoch", 0) or 0)
+        except Exception:
+            return 0
+
+    def _invalidate_maker_preview_commits(self, reason="maker_text_mutation"):
+        """Invalidate already queued table-preview commits without redrawing anything."""
+        try:
+            epoch = self._maker_preview_commit_epoch_value() + 1
+            self._maker_preview_commit_epoch = int(epoch)
+            try:
+                self.audit_boundary_event(
+                    "MAKER_PREVIEW_COMMIT_INVALIDATED",
+                    epoch=int(epoch),
+                    reason=str(reason or "maker_text_mutation"),
+                )
+            except Exception:
+                pass
+            return int(epoch)
+        except Exception:
+            return 0
+
+    def _begin_maker_text_mutation(self, reason="maker_text_mutation"):
+        """Enter a text-data-only mutation scope.
+
+        While this scope is active, Maker preview entry points must refuse work.
+        The epoch bump also invalidates callbacks queued before the mutation.
+        """
+        try:
+            depth = int(getattr(self, "_maker_text_mutation_depth", 0) or 0)
+        except Exception:
+            depth = 0
+        if depth <= 0:
+            self._invalidate_maker_preview_commits(reason)
+        self._maker_text_mutation_depth = depth + 1
+        self._maker_text_mutation_reason = str(reason or "maker_text_mutation")
+        try:
+            self.audit_boundary_event(
+                "MAKER_TEXT_MUTATION_BEGIN",
+                depth=int(self._maker_text_mutation_depth),
+                reason=str(reason or "maker_text_mutation"),
+            )
+        except Exception:
+            pass
+        return int(self._maker_preview_commit_epoch_value())
+
+    def _end_maker_text_mutation(self, reason="maker_text_mutation"):
+        try:
+            depth = max(0, int(getattr(self, "_maker_text_mutation_depth", 0) or 0) - 1)
+        except Exception:
+            depth = 0
+        self._maker_text_mutation_depth = int(depth)
+        if depth <= 0:
+            self._maker_text_mutation_reason = ""
+        try:
+            self.audit_boundary_event(
+                "MAKER_TEXT_MUTATION_END",
+                depth=int(depth),
+                reason=str(reason or "maker_text_mutation"),
+                preview_refresh=False,
+            )
+        except Exception:
+            pass
+        return depth
+
+    def _is_maker_text_mutation_active(self):
+        try:
+            return int(getattr(self, "_maker_text_mutation_depth", 0) or 0) > 0
+        except Exception:
+            return False
+
+    def finalize_maker_text_data_change(self, ids=None, *, fields=None, page_idx=None, reason="메이커 텍스트 변경"):
+        """Finalize Maker text data without any preview/table reconstruction path.
+
+        This is the only common finalizer for bulk paste/delete/translation/
+        control-code text mutations.  It records dirty/recovery state only.
+        """
+        try:
+            page_idx = int(getattr(self, "idx", 0) if page_idx is None else page_idx)
+        except Exception:
+            page_idx = int(getattr(self, "idx", 0) or 0)
+        clean_ids = [x for x in (ids or []) if x is not None]
+        field_list = [str(x or "") for x in (fields or ["translated_text"])]
+        self._invalidate_maker_preview_commits(reason)
+        try:
+            te = getattr(self, "text_engine", None)
+            if te is not None:
+                te.mark_dirty(page_idx, clean_ids, field_list)
+        except Exception:
+            pass
+        try:
+            if page_idx == int(getattr(self, "idx", 0) or 0):
+                self.mark_active_page_dirty("text")
+            else:
+                pe = getattr(self, "project_engine", None)
+                if pe is not None and hasattr(pe, "mark_page_dirty"):
+                    pe.mark_page_dirty(page_idx, "text")
+        except Exception:
+            pass
+        try:
+            self.has_unsaved_changes = True
+        except Exception:
+            pass
+        try:
+            pages = getattr(self, "_checkpoint_dirty_pages", None)
+            if pages is None:
+                pages = set()
+                self._checkpoint_dirty_pages = pages
+            pages.add(int(page_idx))
+            kinds = getattr(self, "_checkpoint_dirty_kinds", None)
+            if kinds is None:
+                kinds = {}
+                self._checkpoint_dirty_kinds = kinds
+            kinds.setdefault(int(page_idx), set()).add("text")
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "append_maker_recovery_event"):
+                self.append_maker_recovery_event({
+                    "type": "maker_text_data_change",
+                    "page_idx": int(page_idx),
+                    "ids": list(clean_ids),
+                    "fields": list(field_list),
+                    "reason": str(reason or "메이커 텍스트 변경"),
+                    "preview_refresh": False,
+                })
+        except Exception:
+            pass
+        try:
+            self.audit_boundary_event(
+                "MAKER_TEXT_DATA_FINALIZED",
+                page_idx=int(page_idx),
+                ids_count=len(clean_ids),
+                fields=",".join(field_list),
+                reason=str(reason or "메이커 텍스트 변경"),
+                preview_refresh=False,
+                table_rebuild=False,
+            )
+        except Exception:
+            pass
+        return clean_ids
+
+    def _maker_table_pending_refresh_key(self, page_idx=None, *, db_mode=False):
+        """Return a project/page scoped key for deferred table-row refresh state."""
+        try:
+            if page_idx is None:
+                page_idx = getattr(self, "maker_database_idx", 0) if db_mode else getattr(self, "idx", 0)
+            page_idx = int(page_idx or 0)
+        except Exception:
+            page_idx = 0
+        try:
+            data_scope = id(getattr(self, "data", None))
+        except Exception:
+            data_scope = 0
+        return (int(data_scope), "db" if bool(db_mode) else "page", int(page_idx))
+
+    def _maker_table_pending_refresh_rows(self, page_idx=None, *, db_mode=False):
+        try:
+            store = getattr(self, "_maker_table_pending_refresh_by_page", None)
+            if not isinstance(store, dict):
+                return set()
+            key = self._maker_table_pending_refresh_key(page_idx, db_mode=db_mode)
+            return set(store.get(key) or set())
+        except Exception:
+            return set()
+
+    def _maker_table_page_has_pending_refresh(self, page_idx=None, *, db_mode=False):
+        return bool(self._maker_table_pending_refresh_rows(page_idx, db_mode=db_mode))
+
+    def _sync_maker_table_rows_text_only(self, table_rows, *, page_idx=None, db_mode=False, reason="bulk_text_data_change"):
+        """Show current translated text/status immediately without resizing rows.
+
+        Bulk Maker text operations must remain data-first, but the user still needs
+        immediate visual confirmation that text was pasted, deleted, translated,
+        restored, or undone.  This path updates only the existing table item text
+        and status while signals, painting, and automatic row-height calculation
+        are suspended.  The row remains pending so a later plain single-row click
+        can run resizeRowToContents() for that row only.
+        """
+        if bool(db_mode):
+            return 0
+        table = getattr(self, "tab", None)
+        if table is None:
+            return 0
+        try:
+            if page_idx is None:
+                page_idx = int(getattr(self, "idx", 0) or 0)
+            page_idx = int(page_idx or 0)
+            if page_idx != int(getattr(self, "idx", 0) or 0):
+                return 0
+            if not self._is_maker_text_table_mode():
+                return 0
+        except Exception:
+            return 0
+
+        clean_rows = []
+        for raw in table_rows or []:
+            try:
+                row = int(raw)
+            except Exception:
+                continue
+            if row > 0 and row < int(table.rowCount()):
+                clean_rows.append(row)
+        clean_rows = sorted(set(clean_rows))
+        if not clean_rows:
+            return 0
+
+        page = (getattr(self, "data", {}) or {}).get(page_idx) or {}
+        data_rows = page.get("data") or []
+        if not isinstance(data_rows, list):
+            return 0
+
+        # ResizeToContents is the expensive part of bulk setText().  Maker map
+        # tables use manually sized rows: ref_tab() sizes all rows once on load,
+        # and a later plain single-row click sizes only that row.
+        try:
+            table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        except Exception:
+            pass
+
+        old_block = False
+        old_updates = True
+        viewport = table.viewport()
+        old_view_updates = True
+        updated = 0
+        trans_col = int(self._table_translation_column())
+        try:
+            old_block = table.blockSignals(True)
+            old_updates = bool(table.updatesEnabled())
+            old_view_updates = bool(viewport.updatesEnabled()) if viewport is not None else True
+            table.setUpdatesEnabled(False)
+            if viewport is not None:
+                viewport.setUpdatesEnabled(False)
+            for table_row in clean_rows:
+                data_index = self._maker_data_index_for_table_row(table_row, db_mode=False)
+                if data_index < 0 or data_index >= len(data_rows):
+                    continue
+                row_data = data_rows[data_index]
+                if not isinstance(row_data, dict):
+                    continue
+                text = str(row_data.get("translated_text") or "")
+                status = str(row_data.get("maker_status") or (self.tr_ui("번역완료") if text.strip() else self.tr_ui("미번역")))
+
+                item = table.item(table_row, trans_col)
+                if item is None:
+                    item = self._make_table_item("", editable=True, user_value="")
+                    table.setItem(table_row, trans_col, item)
+                if str(item.text() or "") != text:
+                    item.setText(text)
+                if item.data(Qt.ItemDataRole.UserRole) != text:
+                    item.setData(Qt.ItemDataRole.UserRole, text)
+
+                status_item = table.item(table_row, 1)
+                if status_item is None:
+                    status_item = self._make_table_item(status, editable=True, center=True, user_value=status)
+                    table.setItem(table_row, 1, status_item)
+                else:
+                    if str(status_item.text() or "") != status:
+                        status_item.setText(status)
+                    if status_item.data(Qt.ItemDataRole.UserRole) != status:
+                        status_item.setData(Qt.ItemDataRole.UserRole, status)
+                updated += 1
+        finally:
+            try:
+                if viewport is not None:
+                    viewport.setUpdatesEnabled(old_view_updates)
+            except Exception:
+                pass
+            try:
+                table.setUpdatesEnabled(old_updates)
+            except Exception:
+                pass
+            try:
+                table.blockSignals(old_block)
+            except Exception:
+                pass
+
+        try:
+            if viewport is not None:
+                viewport.update()
+        except Exception:
+            pass
+        try:
+            self.refresh_maker_translation_summary_header()
+        except Exception:
+            pass
+        try:
+            self.audit_boundary_event(
+                "MAKER_TABLE_BULK_TEXT_VISIBLE_SYNCED",
+                page_idx=int(page_idx),
+                rows_count=int(updated),
+                resized=False,
+                reason=str(reason or "bulk_text_data_change"),
+            )
+        except Exception:
+            pass
+        return int(updated)
+
+    def _mark_maker_table_rows_pending_refresh(self, table_rows, *, page_idx=None, db_mode=False, reason="bulk_text_data_change"):
+        """Mark rows whose height still needs a later single-row refresh.
+
+        Bulk text operations update the visible translated text/status immediately
+        through a no-resize path, but never calculate row height.  A plain
+        single-row click later resizes only that row and clears this pending mark.
+        """
+        clean = set()
+        for raw in table_rows or []:
+            try:
+                row = int(raw)
+            except Exception:
+                continue
+            if row > 0:
+                clean.add(row)
+        if not clean:
+            return 0
+        try:
+            store = getattr(self, "_maker_table_pending_refresh_by_page", None)
+            if not isinstance(store, dict):
+                store = {}
+                self._maker_table_pending_refresh_by_page = store
+            key = self._maker_table_pending_refresh_key(page_idx, db_mode=db_mode)
+            store.setdefault(key, set()).update(clean)
+        except Exception:
+            return 0
+        try:
+            self.audit_boundary_event(
+                "MAKER_TABLE_BULK_UI_DEFERRED",
+                page_idx=int(getattr(self, "idx", 0) if page_idx is None else page_idx),
+                rows_count=len(clean),
+                db_mode=bool(db_mode),
+                reason=str(reason or "bulk_text_data_change"),
+            )
+        except Exception:
+            pass
+        try:
+            self._sync_maker_table_rows_text_only(
+                clean,
+                page_idx=page_idx,
+                db_mode=bool(db_mode),
+                reason=reason,
+            )
+        except Exception:
+            pass
+        return len(clean)
+
+    def _clear_maker_table_pending_refresh(self, page_idx=None, *, db_mode=False, table_rows=None):
+        try:
+            store = getattr(self, "_maker_table_pending_refresh_by_page", None)
+            if not isinstance(store, dict):
+                return 0
+            key = self._maker_table_pending_refresh_key(page_idx, db_mode=db_mode)
+            current = set(store.get(key) or set())
+            if table_rows is None:
+                removed = len(current)
+                store.pop(key, None)
+                return removed
+            remove_rows = set()
+            for raw in table_rows or []:
+                try:
+                    row = int(raw)
+                except Exception:
+                    continue
+                if row > 0:
+                    remove_rows.add(row)
+            before = len(current)
+            current.difference_update(remove_rows)
+            if current:
+                store[key] = current
+            else:
+                store.pop(key, None)
+            return max(0, before - len(current))
+        except Exception:
+            return 0
+
+    def sync_maker_table_row_from_data(self, table_row, *, page_idx=None, db_mode=None, resize=True, force=False):
+        """Synchronize one visible Maker row from model data and resize only it.
+
+        This is the sole UI synchronization path for rows changed by bulk operations.
+        It is called from an explicit plain single-row activation, never from paste,
+        Delete, translation, restore, or Undo loops.
+        """
+        table = getattr(self, "tab", None)
+        if table is None:
+            return False
+        try:
+            table_row = int(table_row)
+        except Exception:
+            return False
+        if table_row <= 0 or table_row >= int(table.rowCount()):
+            return False
+        if db_mode is None:
+            try:
+                db_mode = bool(hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode())
+            except Exception:
+                db_mode = False
+        try:
+            if page_idx is None:
+                page_idx = getattr(self, "maker_database_idx", 0) if db_mode else getattr(self, "idx", 0)
+            page_idx = int(page_idx or 0)
+        except Exception:
+            page_idx = 0
+        pending = self._maker_table_pending_refresh_rows(page_idx, db_mode=bool(db_mode))
+        needs_data_sync = bool(force or table_row in pending)
+        page = (getattr(self, "data", {}) or {}).get(page_idx) or {}
+        rows = page.get("data") or []
+        data_index = self._maker_data_index_for_table_row(table_row, db_mode=bool(db_mode))
+        if data_index < 0 or data_index >= len(rows):
+            return False
+        row_data = rows[data_index]
+        if not isinstance(row_data, dict):
+            return False
+
+        old_block = False
+        old_updates = True
+        try:
+            old_block = table.blockSignals(True)
+            old_updates = bool(table.updatesEnabled())
+            table.setUpdatesEnabled(False)
+            if needs_data_sync:
+                trans_col = int(self._table_translation_column())
+                text = str(row_data.get("translated_text") or "")
+                status = str(row_data.get("maker_status") or (self.tr_ui("번역완료") if text.strip() else self.tr_ui("미번역")))
+                item = table.item(table_row, trans_col)
+                if item is None:
+                    item = self._make_table_item("", editable=True, user_value="")
+                    table.setItem(table_row, trans_col, item)
+                if str(item.text() or "") != text:
+                    item.setText(text)
+                if item.data(Qt.ItemDataRole.UserRole) != text:
+                    item.setData(Qt.ItemDataRole.UserRole, text)
+                status_item = table.item(table_row, 1)
+                if status_item is None:
+                    status_item = self._make_table_item(status, editable=True, center=True, user_value=status)
+                    table.setItem(table_row, 1, status_item)
+                else:
+                    if str(status_item.text() or "") != status:
+                        status_item.setText(status)
+                    if status_item.data(Qt.ItemDataRole.UserRole) != status:
+                        status_item.setData(Qt.ItemDataRole.UserRole, status)
+        finally:
+            try:
+                table.setUpdatesEnabled(old_updates)
+            except Exception:
+                pass
+            try:
+                table.blockSignals(old_block)
+            except Exception:
+                pass
+
+        self._clear_maker_table_pending_refresh(page_idx, db_mode=bool(db_mode), table_rows=[table_row])
+        if resize:
+            try:
+                table.resizeRowToContents(table_row)
+            except Exception:
+                pass
+        try:
+            table.viewport().update()
+        except Exception:
+            pass
+        try:
+            if not db_mode:
+                self.refresh_maker_translation_summary_header()
+        except Exception:
+            pass
+        try:
+            self.audit_boundary_event(
+                "MAKER_TABLE_SINGLE_ROW_SYNCED",
+                page_idx=int(page_idx),
+                table_row=int(table_row),
+                data_index=int(data_index),
+                data_synced=bool(needs_data_sync),
+                resized=bool(resize),
+            )
+        except Exception:
+            pass
+        return True
 
     def _maker_translation_selected_table_rows(self, trans_col=None):
         """Return table rows whose translation cells are selected/current."""
@@ -4526,6 +5474,8 @@ class MainWindowOperationsMixin:
                     "new_text": str(ch.get("new_text", "") or ""),
                     "old_status": str(ch.get("old_status", "") or ""),
                     "new_status": str(ch.get("new_status", "") or ""),
+                    "old_origin": str(ch.get("old_origin", "") or ""),
+                    "new_origin": str(ch.get("new_origin", "") or ""),
                     "id": ch.get("id"),
                 })
             if not clean:
@@ -4555,6 +5505,8 @@ class MainWindowOperationsMixin:
             return False
 
     def undo_maker_table_edit_once(self):
+        reason = "표 셀 편집 Undo"
+        self._begin_maker_text_mutation(reason)
         try:
             stack = getattr(self, "_maker_table_edit_undo_stack", None)
             if not isinstance(stack, list) or not stack:
@@ -4567,16 +5519,18 @@ class MainWindowOperationsMixin:
                 return False
             changes = list(rec.get("changes") or [])
             changed_ids = []
+            changed_table_rows = []
             table = getattr(self, "tab", None)
+            db_mode = bool(rec.get("db_mode", False))
             trans_col = self._table_translation_column()
             status_col = 1
             old_block = False
+            old_updates = True
             try:
-                if table is not None:
+                if db_mode and table is not None:
                     old_block = table.blockSignals(True)
-            except Exception:
-                old_block = False
-            try:
+                    old_updates = bool(table.updatesEnabled())
+                    table.setUpdatesEnabled(False)
                 for ch in changes:
                     data_index = int(ch.get("data_index", -1) or -1)
                     if data_index < 0 or data_index >= len(rows):
@@ -4588,55 +5542,58 @@ class MainWindowOperationsMixin:
                     old_status = str(ch.get("old_status", "") or "")
                     row_data["translated_text"] = old_text
                     row_data["maker_status"] = old_status or (self.tr_ui("번역완료") if old_text.strip() else self.tr_ui("미번역"))
+                    old_origin = str(ch.get("old_origin", "") or "")
+                    if old_origin:
+                        row_data["maker_translation_origin"] = old_origin
+                    else:
+                        row_data.pop("maker_translation_origin", None)
                     changed_ids.append(row_data.get("id"))
                     table_row = int(ch.get("table_row", data_index + 1) or data_index + 1)
-                    if table is not None and 0 <= table_row < table.rowCount():
+                    changed_table_rows.append(table_row)
+                    if db_mode and table is not None and 0 <= table_row < table.rowCount():
                         item = table.item(table_row, trans_col)
                         if item is None:
                             item = QTableWidgetItem("")
                             table.setItem(table_row, trans_col, item)
                         item.setText(old_text)
+                        item.setData(Qt.ItemDataRole.UserRole, old_text)
                         st_item = table.item(table_row, status_col)
                         if st_item is not None:
-                            st_item.setText(str(row_data.get("maker_status") or ""))
+                            status_text = str(row_data.get("maker_status") or "")
+                            st_item.setText(status_text)
+                            st_item.setData(Qt.ItemDataRole.UserRole, status_text)
             finally:
-                try:
-                    if table is not None:
+                if db_mode and table is not None:
+                    try:
+                        table.setUpdatesEnabled(old_updates)
                         table.blockSignals(old_block)
-                except Exception:
-                    pass
-            try:
-                if changes:
-                    sr = min(int(ch.get("table_row", 0) or 0) for ch in changes)
-                    er = max(int(ch.get("table_row", 0) or 0) for ch in changes)
-                    self._select_maker_translation_paste_range(sr, er, trans_col)
-            except Exception:
-                pass
-            db_mode = bool(rec.get("db_mode", False))
+                        table.viewport().update()
+                    except Exception:
+                        pass
+            if not db_mode:
+                self._mark_maker_table_rows_pending_refresh(
+                    changed_table_rows, page_idx=page_idx, db_mode=False, reason="maker_table_cell_undo"
+                )
             if db_mode:
                 try:
                     self.data[int(page_idx)] = page
-                    self.has_unsaved_changes = True
-                    self.mark_project_structure_dirty("maker_database_page_edit")
                     self.commit_current_database_ui_to_layer()
-                    self.refresh_maker_database_preview_from_selection()
+                    self._finalize_maker_database_page_change(
+                        page_idx,
+                        changed_ids=changed_ids,
+                        fields=["translated_text"],
+                        reason="maker_table_cell_undo",
+                        refresh_preview=False,
+                        writeback=True,
+                    )
                 except Exception:
-                    pass
+                    self.finalize_maker_text_data_change(changed_ids, fields=["translated_text"], page_idx=page_idx, reason=reason)
             else:
                 try:
-                    self._apply_maker_live_writeback_now(page_indices=[page_idx], reason="maker_table_cell_undo", log_result=False)
+                    self.mark_maker_writeback_dirty(page_indices=[page_idx], reason="maker_table_cell_undo")
                 except Exception:
                     pass
-                try:
-                    ids = [x for x in changed_ids if x is not None]
-                    if ids and not self.refresh_final_text_items_by_ids(ids):
-                        self.schedule_final_text_scene_refresh(40)
-                except Exception:
-                    pass
-                try:
-                    self.finalize_text_change(ids=[x for x in changed_ids if x is not None], fields=["translated_text"], page_idx=page_idx, reason="표 셀 편집 Undo", delay_ms=500)
-                except Exception:
-                    pass
+                self.finalize_maker_text_data_change(changed_ids, fields=["translated_text"], page_idx=page_idx, reason=reason)
             try:
                 self.log(f"↩️ {rec.get('reason') or '표 셀 편집'} 되돌림: {len(changes)}개")
             except Exception:
@@ -4648,13 +5605,17 @@ class MainWindowOperationsMixin:
             except Exception:
                 pass
             return False
+        finally:
+            self._end_maker_text_mutation(reason)
 
     def clear_maker_translation_cells_for_selection(self, *, reason="Delete 번역문 셀 비우기"):
+        """Clear selected Maker translation cells as a data-only mutation."""
+        self._begin_maker_text_mutation(reason)
         try:
             table = getattr(self, "tab", None)
             if table is None or not self._is_maker_text_table_mode():
                 return False
-            db_mode = bool(hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode())
+            db_mode = bool(hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode())
             page_idx = int((getattr(self, "maker_database_idx", 0) if db_mode else getattr(self, "idx", 0)) or 0)
             page = (getattr(self, "data", {}) or {}).get(page_idx) or {}
             rows = page.get("data") or []
@@ -4664,11 +5625,21 @@ class MainWindowOperationsMixin:
             table_rows = self._maker_translation_selected_table_rows(trans_col)
             if not table_rows:
                 return False
+
             status_col = 1
             changes = []
             changed_ids = []
-            old_block = table.blockSignals(True)
+            lazy_table_ui = not db_mode
+            old_bulk = bool(getattr(self, "_maker_bulk_text_editing", False))
+            old_block = table.blockSignals(True) if not lazy_table_ui else False
+            old_updates = bool(table.updatesEnabled())
+            viewport = table.viewport()
             try:
+                self._maker_bulk_text_editing = True
+                if not lazy_table_ui:
+                    table.setUpdatesEnabled(False)
+                    if viewport is not None:
+                        viewport.setUpdatesEnabled(False)
                 for table_row in table_rows:
                     data_index = self._maker_data_index_for_table_row(table_row, db_mode=db_mode)
                     if data_index < 0 or data_index >= len(rows):
@@ -4678,10 +5649,12 @@ class MainWindowOperationsMixin:
                         continue
                     old_text = str(row_data.get("translated_text") or "")
                     old_status = str(row_data.get("maker_status") or "")
+                    old_origin = str(row_data.get("maker_translation_origin") or "")
                     if old_text == "":
                         continue
                     row_data["translated_text"] = ""
                     row_data["maker_status"] = self.tr_ui("미번역")
+                    row_data.pop("maker_translation_origin", None)
                     changes.append({
                         "table_row": int(table_row),
                         "data_index": int(data_index),
@@ -4689,82 +5662,94 @@ class MainWindowOperationsMixin:
                         "new_text": "",
                         "old_status": old_status,
                         "new_status": str(row_data.get("maker_status") or ""),
+                        "old_origin": old_origin,
+                        "new_origin": "",
                         "id": row_data.get("id"),
                     })
                     changed_ids.append(row_data.get("id"))
-                    item = table.item(table_row, trans_col)
-                    if item is None:
-                        item = QTableWidgetItem("")
-                        table.setItem(table_row, trans_col, item)
-                    item.setText("")
-                    st_item = table.item(table_row, status_col)
-                    if st_item is not None:
-                        st_item.setText(str(row_data.get("maker_status") or ""))
+                    if not lazy_table_ui:
+                        item = table.item(table_row, trans_col)
+                        if item is None:
+                            item = QTableWidgetItem("")
+                            table.setItem(table_row, trans_col, item)
+                        item.setText("")
+                        item.setData(Qt.ItemDataRole.UserRole, "")
+                        st_item = table.item(table_row, status_col)
+                        if st_item is not None:
+                            status_text = str(row_data.get("maker_status") or "")
+                            st_item.setText(status_text)
+                            st_item.setData(Qt.ItemDataRole.UserRole, status_text)
+                selected_set = {int(x) for x in table_rows if int(x) > 0}
+                self._maker_table_current_marker_rows = set(selected_set)
+                self._maker_last_selected_translate_rows = set(selected_set)
             finally:
-                try:
-                    table.blockSignals(old_block)
-                except Exception:
-                    pass
+                if not lazy_table_ui:
+                    try:
+                        if viewport is not None:
+                            viewport.setUpdatesEnabled(True)
+                    except Exception:
+                        pass
+                    try:
+                        table.setUpdatesEnabled(old_updates)
+                        table.blockSignals(old_block)
+                        table.viewport().update()
+                    except Exception:
+                        pass
+                self._maker_bulk_text_editing = old_bulk
+
             if not changes:
                 return False
             self.push_maker_table_edit_undo(reason, page_idx, changes, db_mode=db_mode)
-            try:
-                self._select_maker_translation_paste_range(min(table_rows), max(table_rows), trans_col)
-            except Exception:
-                pass
+            if lazy_table_ui:
+                self._mark_maker_table_rows_pending_refresh(
+                    [ch.get("table_row") for ch in changes],
+                    page_idx=page_idx,
+                    db_mode=False,
+                    reason="translation_cells_delete",
+                )
             if db_mode:
                 try:
                     self.data[int(page_idx)] = page
-                    try:
-                        self.commit_current_database_ui_to_layer()
-                    except Exception:
-                        pass
-                    glossary_touched = False
-                    try:
-                        for ch in changes:
-                            di = int(ch.get("data_index", -1))
-                            if 0 <= di < len(rows) and self._is_maker_database_name_row(rows[di]):
-                                glossary_touched = True
-                                break
-                    except Exception:
-                        glossary_touched = False
-                    self._finalize_maker_database_page_change(
-                        page_idx,
-                        changed_ids=changed_ids,
-                        fields=["translated_text"],
-                        reason="translation_cells_delete",
-                        refresh_preview=True,
-                        writeback=True,
-                        glossary_touched=glossary_touched,
-                        show_glossary_log=False,
-                    )
+                    self.commit_current_database_ui_to_layer()
                 except Exception:
-                    try:
-                        self.has_unsaved_changes = True
-                        self.mark_project_structure_dirty("maker_database_page_edit")
-                        self.apply_maker_writeback_to_clone(mark_dirty=False, log_result=False, backup=False, page_indices=[page_idx])
-                        self.schedule_deferred_auto_save_project(700)
-                    except Exception:
-                        pass
+                    pass
+                glossary_touched = any(
+                    0 <= int(ch.get("data_index", -1)) < len(rows)
+                    and self._is_maker_database_name_row(rows[int(ch.get("data_index", -1))])
+                    for ch in changes
+                )
+                self._finalize_maker_database_page_change(
+                    page_idx,
+                    changed_ids=changed_ids,
+                    fields=["translated_text"],
+                    reason="translation_cells_delete",
+                    refresh_preview=False,
+                    writeback=True,
+                    glossary_touched=glossary_touched,
+                    show_glossary_log=False,
+                )
             else:
                 try:
-                    self._apply_maker_live_writeback_now(page_indices=[page_idx], reason="translation_cells_delete", log_result=False)
+                    self.mark_maker_writeback_dirty(page_indices=[page_idx], reason="translation_cells_delete")
                 except Exception:
                     pass
-                try:
-                    ids = [x for x in changed_ids if x is not None]
-                    if ids and not self.refresh_final_text_items_by_ids(ids):
-                        self.schedule_final_text_scene_refresh(40)
-                except Exception:
-                    pass
-                try:
-                    self.finalize_text_change(ids=[x for x in changed_ids if x is not None], fields=["translated_text"], page_idx=page_idx, reason=reason, delay_ms=700)
-                except Exception:
-                    try:
-                        self.mark_active_page_dirty('text')
-                        self.schedule_deferred_auto_save_project(700)
-                    except Exception:
-                        pass
+                self.finalize_maker_text_data_change(
+                    changed_ids,
+                    fields=["translated_text"],
+                    page_idx=page_idx,
+                    reason=reason,
+                )
+            try:
+                self.audit_boundary_event(
+                    "MAKER_TRANSLATION_DELETE_TEXT_ONLY",
+                    page_idx=int(page_idx),
+                    rows_count=len(table_rows),
+                    changed_count=len(changes),
+                    selection_preserved=True,
+                    preview_refresh=False,
+                )
+            except Exception:
+                pass
             try:
                 self.log(f"🧹 번역문 셀 비우기 완료: {len(changes)}개")
             except Exception:
@@ -4776,16 +5761,18 @@ class MainWindowOperationsMixin:
             except Exception:
                 pass
             return False
+        finally:
+            self._end_maker_text_mutation(reason)
 
     def paste_maker_translation_blocks_from_clipboard(self):
-        """Paste clipboard blocks into Maker translated_text cells from current row.
+        """Paste clipboard blocks as translated_text data only.
 
-        This is intentionally one-column only: each blank-line-separated block
-        becomes one translated_text cell.  It is used for external translation
-        review workflows where multi-line dialogues must remain grouped.  DB mode
-        shares the same table layout; only the backing page index/row mapping is
-        switched to the database layer.
+        Selection, preview, dialogue overlay, scene, and cache state are never
+        recommitted by this operation.  The user sees the new preview only after
+        explicitly clicking one dialogue row later.
         """
+        reason = "번역문 문단 붙여넣기"
+        self._begin_maker_text_mutation(reason)
         try:
             table = getattr(self, "tab", None)
             if table is None or not self._is_maker_text_table_mode():
@@ -4797,17 +5784,13 @@ class MainWindowOperationsMixin:
             blocks = self.parse_maker_single_column_clipboard_blocks(clipboard_text)
             if not blocks:
                 return False
-
-            db_mode = bool(hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode())
+            db_mode = bool(hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode())
             page_idx = int((getattr(self, "maker_database_idx", 0) if db_mode else getattr(self, "idx", 0)) or 0)
             page = (getattr(self, "data", {}) or {}).get(page_idx) or {}
             rows = page.get("data") or []
             if not isinstance(rows, list) or not rows:
                 return False
-
-            start_row = int(table.currentRow())
-            if start_row < 1:
-                start_row = 1
+            start_row = max(1, int(table.currentRow()))
             trans_col = self._table_translation_column()
             try:
                 selected_columns = {int(idx.column()) for idx in table.selectedIndexes()}
@@ -4817,30 +5800,28 @@ class MainWindowOperationsMixin:
                 current_col = int(table.currentColumn())
             except Exception:
                 current_col = -1
-            # 붙여넣기는 사용자가 수정하는 번역문 열에서만 허용한다.
-            # 원문/화자/메모 등 다른 열에 포커스가 있을 때 Ctrl+V가 번역문을 덮어쓰면 위험하다.
             if current_col != trans_col and trans_col not in selected_columns:
                 return False
-            status_col = 1
+
             changed_ids = []
             undo_changes = []
             applied = 0
-            old_block = table.blockSignals(True)
+            lazy_table_ui = not db_mode
+            old_bulk = bool(getattr(self, "_maker_bulk_text_editing", False))
+            old_block = table.blockSignals(True) if not lazy_table_ui else False
+            old_updates = bool(table.updatesEnabled())
+            viewport = table.viewport()
             try:
+                self._maker_bulk_text_editing = True
+                if not lazy_table_ui:
+                    table.setUpdatesEnabled(False)
+                    if viewport is not None:
+                        viewport.setUpdatesEnabled(False)
                 for offset, new_text in enumerate(blocks):
                     table_row = start_row + offset
                     if table_row >= table.rowCount():
                         break
-                    data_index = table_row - 1
-                    if db_mode:
-                        try:
-                            id_item = table.item(table_row, 0)
-                            if id_item is not None:
-                                v = id_item.data(Qt.ItemDataRole.UserRole)
-                                if v is not None and str(v).strip() != "":
-                                    data_index = int(v)
-                        except Exception:
-                            data_index = table_row - 1
+                    data_index = self._maker_data_index_for_table_row(table_row, db_mode=db_mode)
                     if data_index < 0 or data_index >= len(rows):
                         continue
                     row_data = rows[data_index]
@@ -4849,8 +5830,13 @@ class MainWindowOperationsMixin:
                     new_text = str(new_text or "")
                     old_text = str(row_data.get("translated_text") or "")
                     old_status = str(row_data.get("maker_status") or "")
+                    old_origin = str(row_data.get("maker_translation_origin") or "")
                     row_data["translated_text"] = new_text
                     row_data["maker_status"] = self.tr_ui("번역완료") if new_text.strip() else self.tr_ui("미번역")
+                    if new_text.strip():
+                        row_data["maker_translation_origin"] = "manual_paste"
+                    else:
+                        row_data.pop("maker_translation_origin", None)
                     undo_changes.append({
                         "table_row": int(table_row),
                         "data_index": int(data_index),
@@ -4858,118 +5844,94 @@ class MainWindowOperationsMixin:
                         "new_text": new_text,
                         "old_status": old_status,
                         "new_status": str(row_data.get("maker_status") or ""),
+                        "old_origin": old_origin,
+                        "new_origin": str(row_data.get("maker_translation_origin") or ""),
                         "id": row_data.get("id"),
                     })
-
-                    item = table.item(table_row, trans_col)
-                    if item is None:
-                        item = QTableWidgetItem("")
-                        table.setItem(table_row, trans_col, item)
-                    item.setText(new_text)
-                    item.setData(Qt.ItemDataRole.UserRole, new_text)
-                    try:
-                        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
-                    except Exception:
-                        pass
-
-                    st_item = table.item(table_row, status_col)
-                    if st_item is None:
-                        st_item = QTableWidgetItem("")
-                        table.setItem(table_row, status_col, st_item)
-                    status_text = str(row_data.get("maker_status") or "")
-                    st_item.setText(status_text)
-                    st_item.setData(Qt.ItemDataRole.UserRole, status_text)
-
-                    target_id = row_data.get("id")
-                    if target_id is not None:
-                        changed_ids.append(target_id)
+                    if not lazy_table_ui:
+                        item = table.item(table_row, trans_col)
+                        if item is None:
+                            item = QTableWidgetItem("")
+                            table.setItem(table_row, trans_col, item)
+                        item.setText(new_text)
+                        item.setData(Qt.ItemDataRole.UserRole, new_text)
+                        st_item = table.item(table_row, 1)
+                        if st_item is None:
+                            st_item = QTableWidgetItem("")
+                            table.setItem(table_row, 1, st_item)
+                        status_text = str(row_data.get("maker_status") or "")
+                        st_item.setText(status_text)
+                        st_item.setData(Qt.ItemDataRole.UserRole, status_text)
+                    if row_data.get("id") is not None:
+                        changed_ids.append(row_data.get("id"))
                     applied += 1
+            finally:
+                if not lazy_table_ui:
                     try:
-                        table.resizeRowToContents(table_row)
+                        if viewport is not None:
+                            viewport.setUpdatesEnabled(True)
                     except Exception:
                         pass
-            finally:
-                table.blockSignals(old_block)
+                    try:
+                        table.setUpdatesEnabled(old_updates)
+                        table.blockSignals(old_block)
+                        table.viewport().update()
+                    except Exception:
+                        pass
+                self._maker_bulk_text_editing = old_bulk
 
             if applied <= 0:
                 return False
-
-            try:
-                self.push_maker_table_edit_undo("번역문 문단 붙여넣기", page_idx, undo_changes, db_mode=db_mode)
-            except Exception:
-                pass
-
-            try:
-                end_row = min(table.rowCount() - 1, start_row + max(0, applied) - 1)
-                self._select_maker_translation_paste_range(start_row, end_row, trans_col)
-            except Exception:
-                end_row = start_row
-
+            self.push_maker_table_edit_undo(reason, page_idx, undo_changes, db_mode=db_mode)
+            if lazy_table_ui:
+                self._mark_maker_table_rows_pending_refresh(
+                    [ch.get("table_row") for ch in undo_changes],
+                    page_idx=page_idx,
+                    db_mode=False,
+                    reason="translation_blocks_paste",
+                )
             if db_mode:
                 try:
                     self.data[int(page_idx)] = page
-                    try:
-                        self.commit_current_database_ui_to_layer()
-                    except Exception:
-                        pass
-                    glossary_touched = False
-                    try:
-                        for ch in undo_changes:
-                            di = int(ch.get("data_index", -1))
-                            if 0 <= di < len(rows) and self._is_maker_database_name_row(rows[di]):
-                                glossary_touched = True
-                                break
-                    except Exception:
-                        glossary_touched = False
-                    self._finalize_maker_database_page_change(
-                        page_idx,
-                        changed_ids=changed_ids,
-                        fields=["translated_text"],
-                        reason="translation_blocks_paste",
-                        refresh_preview=True,
-                        writeback=True,
-                        glossary_touched=glossary_touched,
-                        show_glossary_log=False,
-                    )
-                except Exception:
-                    try:
-                        self.has_unsaved_changes = True
-                        self.mark_project_structure_dirty("maker_database_page_edit")
-                        self.apply_maker_writeback_to_clone(mark_dirty=False, log_result=False, backup=False, page_indices=[page_idx])
-                        self.schedule_deferred_auto_save_project(700)
-                    except Exception:
-                        pass
-            else:
-                try:
-                    self._apply_maker_live_writeback_now(page_indices=[page_idx], reason="translation_blocks_paste", log_result=False)
+                    self.commit_current_database_ui_to_layer()
                 except Exception:
                     pass
+                glossary_touched = any(
+                    0 <= int(ch.get("data_index", -1)) < len(rows)
+                    and self._is_maker_database_name_row(rows[int(ch.get("data_index", -1))])
+                    for ch in undo_changes
+                )
+                self._finalize_maker_database_page_change(
+                    page_idx,
+                    changed_ids=changed_ids,
+                    fields=["translated_text"],
+                    reason="translation_blocks_paste",
+                    refresh_preview=False,
+                    writeback=True,
+                    glossary_touched=glossary_touched,
+                    show_glossary_log=False,
+                )
+            else:
                 try:
-                    if changed_ids:
-                        if not self.refresh_final_text_items_by_ids(changed_ids):
-                            self.schedule_final_text_scene_refresh(60)
-                    else:
-                        self.schedule_final_text_scene_refresh(60)
+                    self.mark_maker_writeback_dirty(page_indices=[page_idx], reason="translation_blocks_paste")
                 except Exception:
-                    try:
-                        self.schedule_final_text_scene_refresh(60)
-                    except Exception:
-                        pass
-                try:
-                    self.finalize_text_change(ids=changed_ids, fields=["translated_text"], reason="번역문 문단 붙여넣기", delay_ms=700)
-                except Exception:
-                    try:
-                        self.mark_active_page_dirty('text')
-                        self.schedule_deferred_auto_save_project(700)
-                    except Exception:
-                        pass
+                    pass
+                self.finalize_maker_text_data_change(
+                    changed_ids,
+                    fields=["translated_text"],
+                    page_idx=page_idx,
+                    reason=reason,
+                )
             try:
-                # Some writeback/preview refresh paths rebuild the table after paste.
-                # Re-select the exact pasted range after those queued updates so the
-                # user can see which cells changed.
-                _sr, _er, _tc = int(start_row), int(end_row), int(trans_col)
-                QTimer.singleShot(0, lambda sr=_sr, er=_er, tc=_tc: self._select_maker_translation_paste_range(sr, er, tc))
-                QTimer.singleShot(80, lambda sr=_sr, er=_er, tc=_tc: self._select_maker_translation_paste_range(sr, er, tc))
+                self.audit_boundary_event(
+                    "MAKER_TRANSLATION_PASTE_TEXT_ONLY",
+                    page_idx=int(page_idx),
+                    changed_count=int(applied),
+                    selection_preserved=True,
+                    preview_refresh=False,
+                    translation_origin="manual_paste",
+                    line_count_review=False,
+                )
             except Exception:
                 pass
             try:
@@ -4987,8 +5949,10 @@ class MainWindowOperationsMixin:
             except Exception:
                 pass
             return False
+        finally:
+            self._end_maker_text_mutation(reason)
 
-    def _finalize_maker_database_page_change(self, page_idx=None, *, changed_ids=None, fields=None, reason="maker_database_page_edit", refresh_preview=True, writeback=True, glossary_touched=False, show_glossary_log=False):
+    def _finalize_maker_database_page_change(self, page_idx=None, *, changed_ids=None, fields=None, reason="maker_database_page_edit", refresh_preview=False, writeback=True, glossary_touched=False, show_glossary_log=False):
         """Persist database page edits to program data and maker_game immediately.
 
         Database pages are normal Maker project pages.  During normal editing the
@@ -5005,6 +5969,19 @@ class MainWindowOperationsMixin:
             page_idx = int(getattr(self, "maker_database_idx", 0) or 0)
         changed_ids = [x for x in (changed_ids or []) if x is not None]
         field_list = list(fields or ["translated_text"])
+        speaker_layer = False
+        try:
+            speaker_page = (getattr(self, "data", {}) or {}).get(page_idx) or {}
+            speaker_layer = bool(hasattr(self, "_maker_page_is_speaker_page") and self._maker_page_is_speaker_page(speaker_page))
+        except Exception:
+            speaker_layer = False
+        if speaker_layer:
+            writeback = False
+            glossary_touched = True
+            try:
+                self.apply_maker_speaker_layer_to_dialogues(page_idx, reason=str(reason or "speaker page edit"))
+            except Exception:
+                pass
         try:
             page = (getattr(self, "data", {}) or {}).get(page_idx)
             if isinstance(page, dict):
@@ -5018,10 +5995,10 @@ class MainWindowOperationsMixin:
             pass
         if writeback:
             try:
-                self.apply_maker_writeback_to_clone(mark_dirty=False, log_result=False, backup=False, page_indices=[page_idx])
+                self.mark_maker_writeback_dirty(page_indices=[page_idx], reason="maker_database_page_edit")
             except Exception as e:
                 try:
-                    self.log(f"⚠️ DB 텍스트 JSON 실시간 반영 실패: {e}")
+                    self.log(f"⚠️ DB 텍스트 JSON 반영 대기 처리 실패: {e}")
                 except Exception:
                     pass
         if glossary_touched:
@@ -5034,14 +6011,11 @@ class MainWindowOperationsMixin:
             # path.  It marks the DB page dirty, saves the project store, and
             # schedules the recovery checkpoint.  update_table/refresh_scene are
             # disabled because DB mode has its own table/preview refresh.
-            self.finalize_text_change(
-                ids=changed_ids,
+            self.finalize_maker_text_data_change(
+                changed_ids,
                 fields=field_list,
                 page_idx=page_idx,
                 reason=str(reason or "데이터베이스 변경"),
-                delay_ms=700,
-                update_table=False,
-                refresh_scene=False,
             )
         except Exception:
             try:
@@ -5085,44 +6059,33 @@ class MainWindowOperationsMixin:
             self.schedule_deferred_auto_save_project(700)
         except Exception:
             pass
-        if refresh_preview:
-            try:
-                self.refresh_maker_database_preview_from_selection()
-            except Exception:
-                pass
         return True
 
     def refresh_maker_database_auto_glossary(self, *, show_log=True):
-        """Collect translated database terms and refresh the automatic glossary block.
-
-        The block is stored in the normal glossary cache, but the translation engine
-        only injects terms that actually appear in the current source chunk.
-        """
+        """Collect translated database and speaker names into the read-only automatic glossary."""
         try:
             project_dir = getattr(self, "project_dir", None)
             if not project_dir:
+                self.app_options[TRANSLATION_AUTO_DB_GLOSSARY_ENTRIES_KEY] = {}
+                self.sync_translation_option_cache_to_config()
                 return 0
             entries = collect_maker_database_glossary(getattr(self, "data", {}) or {})
             save_maker_database_glossary(project_dir, entries)
-            lines = ["# YSB_AUTO_DB_GLOSSARY_BEGIN"]
-            for e in entries:
-                src = str(e.get("source") or "").strip()
-                dst = str(e.get("target") or "").strip()
-                if src and dst:
-                    lines.append(f"{src}\t{dst}")
-            lines.append("# YSB_AUTO_DB_GLOSSARY_END")
-            block = "\n".join(lines)
-            old_text = str(self.app_options.get(TRANSLATION_GLOSSARY_TEXT_KEY, "") or "")
-            old_text = re.sub(r"\n?# YSB_AUTO_DB_GLOSSARY_BEGIN.*?# YSB_AUTO_DB_GLOSSARY_END\n?", "\n", old_text, flags=re.S).strip()
-            self.app_options[TRANSLATION_GLOSSARY_TEXT_KEY] = (old_text + "\n\n" + block).strip() if entries else old_text
+            auto_dict = {}
+            for entry in entries:
+                source = str(entry.get("source") or "").strip()
+                target = str(entry.get("target") or "").strip()
+                if source and target and source != target:
+                    auto_dict[source] = target
+            self.app_options[TRANSLATION_AUTO_DB_GLOSSARY_ENTRIES_KEY] = auto_dict
             self.save_app_options_cache()
             self.sync_translation_option_cache_to_config()
             if show_log:
-                self.log(f"📚 DB 자동 단어장 갱신: {len(entries)}개 / 번역 시 현재 문장 매칭 항목만 사용")
-            return len(entries)
+                self.log(self.tr_ui("📚 자동 단어장 갱신: {count}개 / DB name·화자 name 자동 반영 / 현재 번역 청크에 등장한 항목만 사용").format(count=f"{len(auto_dict):,}"))
+            return len(auto_dict)
         except Exception as e:
             try:
-                self.log(f"⚠️ DB 자동 단어장 갱신 실패: {e}")
+                self.log(self.tr_ui("⚠️ 자동 단어장 갱신 실패: {error}").format(error=e))
             except Exception:
                 pass
             return 0
@@ -5144,24 +6107,22 @@ class MainWindowOperationsMixin:
             return False
 
     def refresh_maker_database_auto_glossary_after_name_change(self, *, show_log=False, reason="db_name_changed"):
-        """Refresh DB name glossary immediately after a database name value changes.
+        """Refresh the automatic name glossary after a database or speaker name changes.
 
-        The program data is the master during normal editing, so whenever a DB
-        name translation is filled/edited by table input, AI translation, paste,
-        or any other UI path, rebuild the automatic glossary block from current
-        self.data instead of relying on a specific batch-finish hook.
+        Database ``name`` fields and the independent speaker layer both feed the
+        same read-only automatic glossary so names remain consistent everywhere.
         """
         try:
             count = self.refresh_maker_database_auto_glossary(show_log=show_log)
             try:
                 if show_log:
-                    self.log(f"📚 DB name 변경 감지 → 자동 단어장 갱신: {count}개 ({reason})")
+                    self.log(f"📚 name 변경 감지 → 자동 단어장 갱신: {count}개 ({reason})")
             except Exception:
                 pass
             return count
         except Exception as e:
             try:
-                self.log(f"⚠️ DB name 자동 단어장 갱신 실패: {e}")
+                self.log(f"⚠️ name 자동 단어장 갱신 실패: {e}")
             except Exception:
                 pass
             return 0
@@ -5174,7 +6135,7 @@ class MainWindowOperationsMixin:
         regenerated layer.
         """
         try:
-            if hasattr(self, "current_tab_page_indices") and hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode():
+            if hasattr(self, "current_tab_page_indices") and hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode():
                 pages = list(self.current_tab_page_indices() or [])
                 if pages:
                     return pages
@@ -5203,9 +6164,14 @@ class MainWindowOperationsMixin:
         return sorted(set(out))
 
     def run_maker_database_batch_translate(self):
+        plugin_mode = bool(hasattr(self, "is_maker_plugin_mode") and self.is_maker_plugin_mode())
+        speaker_mode = bool(hasattr(self, "is_maker_speaker_mode") and self.is_maker_speaker_mode())
+        layer_title = "플러그인 번역" if plugin_mode else ("화자 번역" if speaker_mode else "데이터베이스 번역")
+        layer_item = "플러그인" if plugin_mode else ("화자" if speaker_mode else "데이터베이스")
         pages = self.maker_database_page_indices()
         if not pages:
-            self.show_warn_notice("데이터베이스 번역", "데이터베이스 번역 페이지가 없습니다.")
+            empty_msg = "플러그인 번역 페이지가 없습니다." if plugin_mode else ("화자 번역 페이지가 없습니다." if speaker_mode else "데이터베이스 번역 페이지가 없습니다.")
+            self.show_warn_notice(layer_title, empty_msg)
             return
         if getattr(self, "is_batch_running", False):
             QMessageBox.information(self, self.tr_ui("일괄 작업 중"), self.tr_ui("이미 일괄 작업이 진행 중입니다."))
@@ -5214,9 +6180,25 @@ class MainWindowOperationsMixin:
             return
         if not self.check_translation_api_key_or_alert(self.cb_trans_provider.currentData()):
             return
+        if plugin_mode:
+            confirm_template = "플러그인 페이지 {count}개를 AI 번역할까요?\n번역 완료 후 원래 플러그인 데이터 위치에 바로 반영됩니다."
+        elif speaker_mode:
+            confirm_template = "화자명 {count}개를 AI 번역할까요?\n번역 결과는 연결된 실제 대사의 화자명에 반영됩니다."
+        else:
+            confirm_template = "데이터베이스 페이지 {count}개만 먼저 AI 번역할까요?\n번역 완료 후 클론 게임 JSON에 바로 반영됩니다."
+        confirm_count = len(pages)
+        if speaker_mode:
+            try:
+                confirm_count = sum(
+                    len(self._maker_database_filtered_rows_for_page((getattr(self, "data", {}) or {}).get(int(page_idx), {}) or {}))
+                    for page_idx in pages
+                )
+            except Exception:
+                confirm_count = len(pages)
+        confirm_message = self.tr_ui(confirm_template, count=confirm_count)
         if not self.ask_yes_no_shortcut(
-            "데이터베이스 번역",
-            f"데이터베이스 페이지 {len(pages)}개만 먼저 AI 번역할까요?\n번역 완료 후 클론 게임 JSON에 바로 반영됩니다.",
+            layer_title,
+            confirm_message,
             yes_text="번역 시작", no_text="취소", default_yes=True, icon=QMessageBox.Icon.Question, parent=self,
         ):
             return
@@ -5230,10 +6212,15 @@ class MainWindowOperationsMixin:
         self._long_task_cancel_requested = False
         self._batch_return_page_idx = int(getattr(self, "idx", 0) or 0)
         self._batch_return_mode_idx = int(self.cb_mode.currentIndex()) if hasattr(self, "cb_mode") else 0
-        self.begin_busy_state("데이터베이스 번역")
+        self.begin_busy_state(layer_title)
         self.set_project_action_interlock(True)
-        self.batch_prepare_progress("데이터베이스 번역", pages, "데이터베이스", cancellable=True)
-        self.log(f"🗃️ 데이터베이스 번역 시작: {len(pages)}페이지")
+        self.batch_prepare_progress(layer_title, pages, layer_item, cancellable=True)
+        if plugin_mode:
+            self.log(self.tr_ui("🧩 플러그인 번역 시작: {count}페이지", count=len(pages)))
+        elif speaker_mode:
+            self.log(self.tr_ui("👤 화자 번역 시작: {count}페이지", count=len(pages)))
+        else:
+            self.log(f"🗃️ 데이터베이스 번역 시작: {len(pages)}페이지")
         self.start_universal_batch_worker("translate", pages)
 
     def _text_find_field_options(self):
@@ -5260,7 +6247,7 @@ class MainWindowOperationsMixin:
             except Exception:
                 return list(range(len(getattr(self, "paths", []) or [])))
         try:
-            if hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode():
+            if hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode():
                 return [int(getattr(self, "maker_database_idx", 0) or 0)]
         except Exception:
             pass
@@ -5635,7 +6622,7 @@ class MainWindowOperationsMixin:
 
     def _translation_unify_current_visible_page_index(self):
         try:
-            if hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode():
+            if hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode():
                 return int(getattr(self, "maker_database_idx", 0) or 0)
         except Exception:
             pass
@@ -5691,11 +6678,17 @@ class MainWindowOperationsMixin:
         except Exception:
             visible = False
 
+        if visible and maker:
+            # Maker table cells may intentionally be stale after a bulk data-only
+            # operation.  Direct cell edits already update self.data immediately, so
+            # unification must always read Maker translations from model data.
+            visible = False
+
         if visible:
             try:
                 text_col = self._table_text_column()
                 trans_col = self._table_translation_column()
-                db_mode = bool(hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode())
+                db_mode = bool(hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode())
                 row_count = int(self.tab.rowCount())
                 for table_row in range(1, row_count):
                     try:
@@ -5777,7 +6770,17 @@ class MainWindowOperationsMixin:
                 row["translated_text"] = canon
                 if bool(entry.get("maker")):
                     row["maker_status"] = self.tr_ui("번역완료") if canon.strip() else self.tr_ui("미번역")
-            if bool(entry.get("visible")):
+            if bool(entry.get("maker")) and changed:
+                try:
+                    self._mark_maker_table_rows_pending_refresh(
+                        [int(entry.get("table_row") or (int(entry.get("data_index", -1)) + 1))],
+                        page_idx=int(entry.get("page_idx", getattr(self, "idx", 0)) or 0),
+                        db_mode=False,
+                        reason="unified_translation_memory",
+                    )
+                except Exception:
+                    pass
+            elif bool(entry.get("visible")):
                 try:
                     trans_col = self._table_translation_column()
                     status_col = 1
@@ -5791,12 +6794,11 @@ class MainWindowOperationsMixin:
                         if str(item.text() or "") != canon:
                             item.setText(canon)
                         item.setData(Qt.ItemDataRole.UserRole, canon)
-                        if bool(entry.get("maker")):
-                            status_text = row.get("maker_status") or ""
-                            st_item = self.tab.item(table_row, status_col)
-                            if st_item is not None:
-                                st_item.setText(status_text)
-                                st_item.setData(Qt.ItemDataRole.UserRole, status_text)
+                        status_text = row.get("maker_status") or ""
+                        st_item = self.tab.item(table_row, status_col)
+                        if st_item is not None:
+                            st_item.setText(status_text)
+                            st_item.setData(Qt.ItemDataRole.UserRole, status_text)
                     finally:
                         self.tab.blockSignals(old_block)
                 except Exception:
@@ -5814,10 +6816,11 @@ class MainWindowOperationsMixin:
         같은 원문은 그 기준 번역문으로 교체된다.
         """
         try:
-            # Make the active editor commit first, then still read the visible
-            # table directly for the current page.  This prevents stale self.data
-            # from winning over what the user is seeing.
-            if hasattr(self, "commit_current_page_ui_to_data"):
+            # Maker cell edits update self.data immediately, while bulk operations
+            # intentionally leave visible cells stale until a single-row click.
+            # Never commit a stale Maker table back over the model here.
+            is_maker_page = bool(hasattr(self, "_is_current_maker_page") and self._is_current_maker_page())
+            if (not is_maker_page) and hasattr(self, "commit_current_page_ui_to_data"):
                 self.commit_current_page_ui_to_data(include_mask=False)
         except Exception:
             pass
@@ -5942,7 +6945,7 @@ class MainWindowOperationsMixin:
                 pass
             try:
                 if any(self._is_current_or_page_maker((getattr(self, "data", {}) or {}).get(i) or {}) for i in pages):
-                    self.apply_maker_writeback_to_clone(mark_dirty=False, log_result=False, backup=False, page_indices=sorted(changed_pages or set(pages)))
+                    self.mark_maker_writeback_dirty(page_indices=sorted(changed_pages or set(pages)), reason="translation_memory_apply")
             except Exception:
                 pass
         try:
@@ -6047,19 +7050,45 @@ class MainWindowOperationsMixin:
         except Exception:
             pass
 
-    def refresh_maker_control_code_source_cells(self):
+    def refresh_maker_control_code_source_cells(self, rows=None, resize=True):
         if not hasattr(self, "tab") or not self._is_maker_text_table_mode():
             return
         curr = self.data.get(self.idx) or {}
         data = curr.get("data") or []
+        try:
+            if rows is None:
+                mode = str(getattr(self, "maker_control_code_display_mode", "hidden") or "hidden")
+                if mode == "current":
+                    cur = int(self.tab.currentRow()) if self.tab is not None else -1
+                    prev = int(getattr(self, "_maker_control_previous_current_row", -1) or -1)
+                    rows = [prev, cur]
+                    self._maker_control_previous_current_row = cur
+                else:
+                    rows = list(range(1, len(data) + 1))
+            row_list = []
+            seen = set()
+            for r in rows or []:
+                try:
+                    r = int(r)
+                except Exception:
+                    continue
+                if r <= 0 or r in seen:
+                    continue
+                seen.add(r)
+                row_list.append(r)
+        except Exception:
+            row_list = list(range(1, len(data) + 1))
         old_block = False
         try:
             old_block = self.tab.blockSignals(True)
         except Exception:
             old_block = False
         try:
-            for i, row_data in enumerate(data):
-                row = i + 1
+            for row in row_list:
+                i = row - 1
+                if i < 0 or i >= len(data):
+                    continue
+                row_data = data[i]
                 if row >= self.tab.rowCount() or self.tab.columnCount() <= 5:
                     continue
                 item = self.tab.item(row, 5)
@@ -6087,10 +7116,18 @@ class MainWindowOperationsMixin:
                 self.tab.blockSignals(old_block)
             except Exception:
                 pass
-        try:
-            self.tab.resizeRowsToContents()
-        except Exception:
-            pass
+        if resize:
+            try:
+                if row_list and len(row_list) <= 4:
+                    for row in row_list:
+                        try:
+                            self.tab.resizeRowToContents(int(row))
+                        except Exception:
+                            pass
+                else:
+                    self.tab.resizeRowsToContents()
+            except Exception:
+                pass
 
     def set_maker_control_code_display_mode(self, mode):
         mode = str(mode or "hidden")
@@ -6111,6 +7148,55 @@ class MainWindowOperationsMixin:
 
     def toggle_maker_control_code_current(self, checked=False):
         self.set_maker_control_code_display_mode("current" if checked else "hidden")
+
+    def is_maker_control_code_auto_apply_enabled(self):
+        return bool(getattr(self, "maker_control_code_auto_apply_enabled", True))
+
+    def set_maker_control_code_auto_apply_enabled(self, enabled, *, save=True, show_log=True):
+        enabled = bool(enabled)
+        self.maker_control_code_auto_apply_enabled = enabled
+        try:
+            cb = getattr(self, "cb_maker_control_code_auto_apply", None)
+            if cb is not None:
+                old = cb.blockSignals(True)
+                try:
+                    cb.setChecked(enabled)
+                finally:
+                    cb.blockSignals(old)
+        except Exception:
+            pass
+        try:
+            action = (getattr(self, "actions", {}) or {}).get("work_toggle_maker_control_code_auto_apply")
+            if action is not None:
+                old = action.blockSignals(True)
+                try:
+                    action.setChecked(enabled)
+                finally:
+                    action.blockSignals(old)
+        except Exception:
+            pass
+        if save:
+            try:
+                self.app_options["maker_control_code_auto_apply_enabled"] = enabled
+                self.save_app_options_cache()
+            except Exception:
+                pass
+        if show_log:
+            try:
+                self.log(self.tr_ui("🧩 번역 시 제어코드 자동 반영: ON" if enabled else "🧩 번역 시 제어코드 자동 반영: OFF"))
+            except Exception:
+                pass
+        return enabled
+
+    def on_maker_control_code_auto_apply_toggled(self, checked):
+        return self.set_maker_control_code_auto_apply_enabled(bool(checked), save=True, show_log=True)
+
+    def toggle_maker_control_code_auto_apply(self):
+        return self.set_maker_control_code_auto_apply_enabled(
+            not self.is_maker_control_code_auto_apply_enabled(),
+            save=True,
+            show_log=True,
+        )
 
     def restore_edge_control_codes_current(self):
         if not self._is_maker_text_table_mode():
@@ -6189,21 +7275,15 @@ class MainWindowOperationsMixin:
             except Exception:
                 pass
             return
-        try:
-            self.push_project_undo(reason, full_project=True)
-        except Exception:
-            try:
-                self.undo_push_text_line(reason)
-            except Exception:
-                pass
-        total = {"applied": 0, "already": 0, "manual": 0, "empty": 0, "none": 0}
-        changed_pages = []
+
         progress = None
+        page_plans = {}
+        total = {"applied": 0, "already": 0, "manual": 0, "empty": 0, "none": 0}
         try:
             progress = QProgressDialog(self)
             progress.setWindowTitle(self.tr_ui("일괄 맵 제어코드 복원"))
-            progress.setLabelText(self.tr_ui("맵 제어코드를 복원하는 중입니다..."))
-            progress.setRange(0, len(page_indices))
+            progress.setLabelText(self.tr_ui("복원 대상 대사 수를 계산하는 중입니다..."))
+            progress.setRange(0, max(1, len(page_indices)))
             progress.setValue(0)
             progress.setMinimumDuration(0)
             progress.setAutoClose(False)
@@ -6218,6 +7298,9 @@ class MainWindowOperationsMixin:
             QApplication.processEvents()
         except Exception:
             progress = None
+
+        # 1단계: 실제로 반영될 대사 수를 먼저 계산한다.
+        # 이 단계는 데이터만 훑고 화면/프리뷰는 절대 재구성하지 않는다.
         for order, page_idx in enumerate(page_indices, start=1):
             page = (self.data or {}).get(page_idx) or {}
             data = page.get("data") or []
@@ -6225,26 +7308,120 @@ class MainWindowOperationsMixin:
                 meta = page.get("maker_page") or {}
                 map_name = str(meta.get("map_name") or meta.get("page_title") or f"Map {int(page_idx)+1}")
                 if progress is not None:
-                    progress.setLabelText(self.tr_ui(f"맵 제어코드를 복원하는 중입니다... ({order}/{len(page_indices)})\n{map_name}"))
+                    progress.setLabelText(self.tr_ui(f"복원 대상 대사 수를 계산하는 중입니다... ({order}/{len(page_indices)})\n{map_name}"))
                     progress.setValue(order - 1)
                     QApplication.processEvents()
             except Exception:
                 pass
-            stats, changed = self._restore_edge_control_codes_on_page(page_idx, data, list(range(len(data))))
+            stats, candidates = self._restore_edge_control_codes_scan_candidates(data, range(len(data)))
+            page_plans[int(page_idx)] = candidates
             for key, value in (stats or {}).items():
                 total[key] = int(total.get(key, 0) or 0) + int(value or 0)
-            if changed:
-                changed_pages.append(page_idx)
         try:
             if progress is not None:
                 progress.setValue(len(page_indices))
                 QApplication.processEvents()
-                progress.close()
-                progress.deleteLater()
         except Exception:
             pass
+
+        total_apply = int(total.get("applied", 0) or 0)
+        self._audit_translate_event(
+            "TRANSLATE_CONTROL_CODE_MANUAL_RESTORE_COUNTED",
+            scope="batch_maps",
+            label=str(selected_label),
+            pages=len(page_indices),
+            apply_total=total_apply,
+            already=int(total.get("already", 0)),
+            manual=int(total.get("manual", 0)),
+            empty=int(total.get("empty", 0)),
+            none=int(total.get("none", 0)),
+        )
+        if total_apply <= 0:
+            try:
+                if progress is not None:
+                    progress.close()
+                    progress.deleteLater()
+            except Exception:
+                pass
+            self.log(f"ℹ️ 제어코드 일괄 맵 제어코드 복원({selected_label}): 적용 없음 / 이미 적용 {total['already']}개 / 수동필요 {total['manual']}개 / 빈 번역 {total['empty']}개 / 제어코드 없음 {total['none']}개")
+            return
+
         try:
-            self.ref_tab()
+            if progress is not None:
+                progress.setWindowTitle(self.tr_ui("일괄 맵 제어코드 복원"))
+                progress.setLabelText(self.tr_ui("복원 전 되돌리기 지점을 만드는 중입니다...\n잠시만 기다려 주세요."))
+                progress.setRange(0, 0)
+                QApplication.processEvents()
+        except Exception:
+            pass
+        self._audit_translate_event("TRANSLATE_CONTROL_CODE_MANUAL_RESTORE_UNDO_BEGIN", scope="batch_maps", apply_total=total_apply)
+        try:
+            self.push_project_undo(reason, full_project=True)
+        except Exception:
+            try:
+                self.undo_push_text_line(reason)
+            except Exception:
+                pass
+        self._audit_translate_event("TRANSLATE_CONTROL_CODE_MANUAL_RESTORE_UNDO_DONE", scope="batch_maps", apply_total=total_apply)
+
+        # 2단계: 계산된 적용 후보만 데이터에 반영한다.
+        # 여기서도 ref_tab()/프리뷰 전체 재구성은 금지한다.
+        changed_pages = []
+        changed_by_page = {}
+        changed_ids_by_page = {}
+        counter = {"value": 0}
+        try:
+            current_idx_for_progress = int(getattr(self, "idx", 0) or 0)
+        except Exception:
+            current_idx_for_progress = -1
+        progress_total_units = max(1, total_apply + 2)
+        try:
+            if progress is not None:
+                progress.setWindowTitle(self.tr_ui("일괄 맵 제어코드 복원"))
+                progress.setLabelText(self.tr_ui(f"제어코드 데이터 반영 중입니다... (0/{total_apply})"))
+                progress.setRange(0, progress_total_units)
+                progress.setValue(0)
+                QApplication.processEvents()
+        except Exception:
+            pass
+        for page_idx in page_indices:
+            candidates = list(page_plans.get(int(page_idx)) or [])
+            if not candidates:
+                continue
+            page = (self.data or {}).get(page_idx) or {}
+            data = page.get("data") or []
+            changed_ids, changed_indices = self._restore_edge_control_codes_apply_candidates(
+                int(page_idx),
+                data,
+                candidates,
+                progress=progress,
+                counter=counter,
+                total=total_apply,
+                label=str(selected_label),
+                progress_base=0,
+                progress_total=progress_total_units,
+            )
+            if changed_indices:
+                changed_pages.append(int(page_idx))
+                changed_by_page[int(page_idx)] = list(changed_indices)
+                changed_ids_by_page[int(page_idx)] = list(changed_ids or [])
+        try:
+            if progress is not None:
+                progress.setValue(min(total_apply, progress_total_units))
+                QApplication.processEvents()
+        except Exception:
+            pass
+
+        # 표 셀과 행 높이는 건드리지 않는다. 각 페이지의 변경 행을 지연
+        # 갱신 대상으로 표시하고, 사용자가 해당 행을 단일 클릭할 때만 반영한다.
+        try:
+            for changed_page_idx, data_indices in changed_by_page.items():
+                self._mark_maker_table_rows_pending_refresh(
+                    [int(i) + 1 for i in (data_indices or [])],
+                    page_idx=int(changed_page_idx),
+                    db_mode=False,
+                    reason="control_code_restore_batch_maps",
+                )
         except Exception:
             pass
         try:
@@ -6254,24 +7431,69 @@ class MainWindowOperationsMixin:
         except Exception:
             pass
         try:
+            if progress is not None:
+                progress.setLabelText(self.tr_ui("변경 사항을 작업 데이터에 반영하는 중입니다..."))
+                progress.setValue(max(0, progress_total_units - 1))
+                QApplication.processEvents()
+        except Exception:
+            pass
+        try:
             if changed_pages:
-                self._apply_maker_live_writeback_now(page_indices=changed_pages, reason="control_code_restore_batch_maps", log_result=False)
-                self.schedule_deferred_auto_save_project(800)
+                for changed_page_idx in changed_pages:
+                    self.finalize_maker_text_data_change(
+                        changed_ids_by_page.get(int(changed_page_idx)) or [],
+                        fields=["translated_text"],
+                        page_idx=int(changed_page_idx),
+                        reason="control_code_restore_batch_maps",
+                    )
+                self.mark_maker_writeback_dirty(page_indices=changed_pages, reason="control_code_restore_batch_maps")
+        except Exception:
+            pass
+        try:
+            if progress is not None:
+                progress.setValue(progress_total_units)
+                QApplication.processEvents()
+                progress.close()
+                progress.deleteLater()
         except Exception:
             pass
         self.log(f"🧩 제어코드 일괄 맵 제어코드 복원 완료({selected_label}): 적용 {total['applied']}개 / 이미 적용 {total['already']}개 / 수동필요 {total['manual']}개 / 빈 번역 {total['empty']}개 / 제어코드 없음 {total['none']}개")
+        self._audit_translate_event(
+            "TRANSLATE_CONTROL_CODE_MANUAL_RESTORE_APPLIED",
+            scope="batch_maps",
+            label=str(selected_label),
+            applied=int(total.get('applied', 0)),
+            already=int(total.get('already', 0)),
+            manual=int(total.get('manual', 0)),
+            empty=int(total.get('empty', 0)),
+            none=int(total.get('none', 0)),
+            changed_pages=len(changed_pages),
+        )
 
-    def _restore_edge_control_codes_on_page(self, page_idx, data, indexes):
+    def _restore_edge_control_codes_scan_candidates(self, data, indexes):
         stats = {"applied": 0, "already": 0, "manual": 0, "empty": 0, "none": 0}
-        changed_ids = []
-        targets = [i for i in indexes if 0 <= int(i) < len(data)]
-        for i in targets:
-            item = data[int(i)]
-            new_text, status = apply_maker_edge_control_codes(item.get("translated_text", ""), item.get("text", ""))
+        candidates = []
+        data = data or []
+        for raw_i in list(indexes or []):
+            try:
+                i = int(raw_i)
+            except Exception:
+                continue
+            if i < 0 or i >= len(data):
+                continue
+            item = data[i]
+            if not isinstance(item, dict):
+                continue
+            try:
+                new_text, status = apply_maker_edge_control_codes(item.get("translated_text", ""), item.get("text", ""))
+            except Exception:
+                new_text, status = str(item.get("translated_text", "") or ""), "none"
             if status == "applied":
-                item["translated_text"] = new_text
-                item["maker_status"] = self.tr_ui("번역완료") if str(new_text).strip() else self.tr_ui("미번역")
-                changed_ids.append(item.get("id"))
+                candidates.append({
+                    "data_index": int(i),
+                    "new_text": str(new_text or ""),
+                    "id": item.get("id"),
+                })
                 stats["applied"] += 1
             elif status == "already":
                 stats["already"] += 1
@@ -6281,29 +7503,141 @@ class MainWindowOperationsMixin:
                 stats["empty"] += 1
             else:
                 stats["none"] += 1
-        return stats, changed_ids
+        return stats, candidates
+
+    def _restore_edge_control_codes_apply_candidates(self, page_idx, data, candidates, *, progress=None, counter=None, total=0, label="", progress_base=0, progress_total=None):
+        changed_ids = []
+        changed_indices = []
+        data = data or []
+        total = int(total or len(candidates or []) or 0)
+        progress_base = int(progress_base or 0)
+        progress_total = int(progress_total or total or 1)
+        update_every = 1 if total <= 500 else 10
+        for cand in list(candidates or []):
+            try:
+                i = int(cand.get("data_index"))
+            except Exception:
+                continue
+            if i < 0 or i >= len(data):
+                continue
+            item = data[i]
+            if not isinstance(item, dict):
+                continue
+            new_text = str(cand.get("new_text") or "")
+            if str(item.get("translated_text") or "") == new_text:
+                continue
+            item["translated_text"] = new_text
+            item["maker_status"] = self.tr_ui("번역완료") if new_text.strip() else self.tr_ui("미번역")
+            changed_ids.append(item.get("id"))
+            changed_indices.append(int(i))
+            try:
+                if counter is not None:
+                    counter["value"] = int(counter.get("value", 0) or 0) + 1
+                    current = int(counter.get("value", 0) or 0)
+                else:
+                    current = len(changed_indices)
+                if progress is not None and (current == total or current <= 3 or current % update_every == 0):
+                    progress.setLabelText(self.tr_ui(f"제어코드 데이터 반영 중입니다... ({current}/{total})\n{label}"))
+                    progress.setValue(min(progress_base + current, max(1, progress_total)))
+                    QApplication.processEvents()
+            except Exception:
+                pass
+        return changed_ids, changed_indices
+
+    def _restore_edge_control_codes_on_page(self, page_idx, data, indexes):
+        stats, candidates = self._restore_edge_control_codes_scan_candidates(data, indexes)
+        changed_ids, changed_indices = self._restore_edge_control_codes_apply_candidates(page_idx, data, candidates)
+        return stats, changed_ids, changed_indices
+
+    def _refresh_maker_restored_translation_table_rows(self, data, data_indices, *, progress=None, progress_base=0, progress_total=None, label=""):
+        table = getattr(self, "tab", None)
+        if table is None or not data_indices:
+            return 0
+        try:
+            trans_col = int(self._table_translation_column())
+        except Exception:
+            trans_col = 6
+        changed = 0
+        rows = list(data_indices or [])
+        row_total = len(rows)
+        progress_base = int(progress_base or 0)
+        progress_total = int(progress_total or (progress_base + row_total) or 1)
+        update_every = 1 if row_total <= 500 else 10
+        try:
+            old_block = table.blockSignals(True)
+        except Exception:
+            old_block = False
+        try:
+            try:
+                old_updates = table.updatesEnabled()
+                table.setUpdatesEnabled(False)
+            except Exception:
+                old_updates = True
+            for step, raw_i in enumerate(rows, start=1):
+                try:
+                    data_index = int(raw_i)
+                except Exception:
+                    continue
+                if data_index < 0 or data_index >= len(data or []):
+                    continue
+                table_row = data_index + 1
+                if table_row <= 0 or table_row >= table.rowCount():
+                    continue
+                row_data = data[data_index]
+                if not isinstance(row_data, dict):
+                    continue
+                text = str(row_data.get("translated_text") or "")
+                item = table.item(table_row, trans_col)
+                if item is None:
+                    item = QTableWidgetItem("")
+                    table.setItem(table_row, trans_col, item)
+                if str(item.text() or "") != text:
+                    item.setText(text)
+                item.setData(Qt.ItemDataRole.UserRole, text)
+                try:
+                    status_text = str(row_data.get("maker_status") or "")
+                    st_item = table.item(table_row, 1)
+                    if st_item is not None:
+                        st_item.setText(status_text)
+                        st_item.setData(Qt.ItemDataRole.UserRole, status_text)
+                except Exception:
+                    pass
+                changed += 1
+                try:
+                    if progress is not None and (step == row_total or step <= 3 or step % update_every == 0):
+                        progress.setLabelText(self.tr_ui(f"현재 표 셀 반영 중입니다... ({step}/{row_total})\n{label}"))
+                        progress.setValue(min(progress_base + step, max(1, progress_total)))
+                        QApplication.processEvents()
+                except Exception:
+                    pass
+            try:
+                table.setUpdatesEnabled(old_updates)
+                table.viewport().update()
+            except Exception:
+                pass
+        finally:
+            try:
+                table.blockSignals(old_block)
+            except Exception:
+                pass
+        return changed
 
     def _restore_edge_control_codes_for_indexes(self, indexes, *, reason="제어코드 자동복원", current_only=True, scope_label=None, show_progress=False):
         curr = self.data.get(self.idx) or {}
         data = curr.get("data") or []
         if not data:
             return
-        applied = already = manual = empty = none = 0
-        changed_ids = []
         targets = [i for i in indexes if 0 <= int(i) < len(data)]
         if not targets:
             return
-        try:
-            self.undo_push_text_line(reason)
-        except Exception:
-            pass
+
         progress = None
         if show_progress:
             try:
                 progress = QProgressDialog(self)
                 progress.setWindowTitle(self.tr_ui("현재 맵 복원"))
-                progress.setLabelText(self.tr_ui("현재 맵의 제어코드를 복원하는 중입니다..."))
-                progress.setRange(0, len(targets))
+                progress.setLabelText(self.tr_ui("복원 대상 대사 수를 계산하는 중입니다..."))
+                progress.setRange(0, 1)
                 progress.setValue(0)
                 progress.setMinimumDuration(0)
                 progress.setAutoClose(False)
@@ -6318,59 +7652,143 @@ class MainWindowOperationsMixin:
                 QApplication.processEvents()
             except Exception:
                 progress = None
-        for order, i in enumerate(targets, start=1):
+
+        stats, candidates = self._restore_edge_control_codes_scan_candidates(data, targets)
+        applied = int(stats.get("applied", 0) or 0)
+        already = int(stats.get("already", 0) or 0)
+        manual = int(stats.get("manual", 0) or 0)
+        empty = int(stats.get("empty", 0) or 0)
+        none = int(stats.get("none", 0) or 0)
+        self._audit_translate_event(
+            "TRANSLATE_CONTROL_CODE_MANUAL_RESTORE_COUNTED",
+            scope=str(scope_label or ("선택 대사" if current_only else "현재 맵")),
+            apply_total=applied,
+            already=already,
+            manual=manual,
+            empty=empty,
+            none=none,
+        )
+        if applied <= 0:
             try:
                 if progress is not None:
-                    progress.setLabelText(self.tr_ui(f"현재 맵의 제어코드를 복원하는 중입니다... ({order}/{len(targets)})"))
-                    progress.setValue(order - 1)
-                    QApplication.processEvents()
+                    progress.close()
+                    progress.deleteLater()
             except Exception:
                 pass
-            item = data[int(i)]
-            new_text, status = apply_maker_edge_control_codes(item.get("translated_text", ""), item.get("text", ""))
-            if status == "applied":
-                item["translated_text"] = new_text
-                item["maker_status"] = self.tr_ui("번역완료") if str(new_text).strip() else self.tr_ui("미번역")
-                changed_ids.append(item.get("id"))
-                applied += 1
-            elif status == "already":
-                already += 1
-            elif status == "manual":
-                manual += 1
-            elif status == "empty":
-                empty += 1
-            else:
-                none += 1
+            label = str(scope_label or ("선택 대사" if current_only else "현재 맵"))
+            self.log(f"ℹ️ 제어코드 {label} 복원: 적용 없음 / 이미 적용 {already}개 / 수동필요 {manual}개 / 빈 번역 {empty}개 / 제어코드 없음 {none}개")
+            self._audit_translate_event(
+                "TRANSLATE_CONTROL_CODE_MANUAL_RESTORE_APPLIED",
+                scope=str(label),
+                applied=0,
+                already=already,
+                manual=manual,
+                empty=empty,
+                none=none,
+            )
+            return
+
+        label = str(scope_label or ("선택 대사" if current_only else "현재 맵"))
         try:
             if progress is not None:
-                progress.setValue(len(targets))
+                progress.setWindowTitle(self.tr_ui("현재 맵 복원"))
+                progress.setLabelText(self.tr_ui("복원 전 되돌리기 지점을 만드는 중입니다...\n잠시만 기다려 주세요."))
+                progress.setRange(0, 0)
+                QApplication.processEvents()
+        except Exception:
+            pass
+        self._audit_translate_event("TRANSLATE_CONTROL_CODE_MANUAL_RESTORE_UNDO_BEGIN", scope=str(label), apply_total=applied)
+        try:
+            self.undo_push_text_line(reason)
+        except Exception:
+            pass
+        self._audit_translate_event("TRANSLATE_CONTROL_CODE_MANUAL_RESTORE_UNDO_DONE", scope=str(label), apply_total=applied)
+        progress_total_units = max(1, applied + applied + 2)
+        try:
+            if progress is not None:
+                progress.setWindowTitle(self.tr_ui("현재 맵 복원"))
+                progress.setLabelText(self.tr_ui(f"제어코드 데이터 반영 중입니다... (0/{applied})\n{label}"))
+                progress.setRange(0, progress_total_units)
+                progress.setValue(0)
+                QApplication.processEvents()
+        except Exception:
+            pass
+
+        counter = {"value": 0}
+        changed_ids, changed_indices = self._restore_edge_control_codes_apply_candidates(
+            int(getattr(self, "idx", 0) or 0),
+            data,
+            candidates,
+            progress=progress,
+            counter=counter,
+            total=applied,
+            label=str(label),
+            progress_base=0,
+            progress_total=progress_total_units,
+        )
+        try:
+            if progress is not None:
+                progress.setValue(min(applied, progress_total_units))
+                QApplication.processEvents()
+        except Exception:
+            pass
+
+        # 표 셀/행 높이 갱신은 지연한다. 단일 행을 실제 클릭할 때만
+        # 해당 번역문과 상태를 데이터에서 읽어와 한 행 높이를 다시 계산한다.
+        try:
+            self._mark_maker_table_rows_pending_refresh(
+                [int(i) + 1 for i in (changed_indices or [])],
+                page_idx=int(getattr(self, "idx", 0) or 0),
+                db_mode=False,
+                reason="control_code_restore",
+            )
+        except Exception:
+            pass
+        try:
+            if changed_ids and self.cb_mode.currentIndex() == 4:
+                # 프리뷰 전체 재구성 금지. 현재 선택 행이 바뀐 경우에도 사용자가 행을 다시 누를 때 갱신되도록 둔다.
+                pass
+        except Exception:
+            pass
+        try:
+            if progress is not None:
+                progress.setLabelText(self.tr_ui("변경 사항을 작업 데이터에 반영하는 중입니다..."))
+                progress.setValue(max(0, progress_total_units - 1))
+                QApplication.processEvents()
+        except Exception:
+            pass
+        try:
+            if applied:
+                current_page_idx = int(getattr(self, "idx", 0) or 0)
+                self.finalize_maker_text_data_change(
+                    changed_ids,
+                    fields=["translated_text"],
+                    page_idx=current_page_idx,
+                    reason="control_code_restore",
+                )
+                self.mark_maker_writeback_dirty(page_indices=[current_page_idx], reason="control_code_restore")
+        except Exception:
+            pass
+        try:
+            if progress is not None:
+                progress.setValue(progress_total_units)
                 QApplication.processEvents()
                 progress.close()
                 progress.deleteLater()
         except Exception:
             pass
-        try:
-            self.ref_tab()
-        except Exception:
-            pass
-        try:
-            if changed_ids and self.cb_mode.currentIndex() == 4:
-                if not self.refresh_final_text_items_by_ids([x for x in changed_ids if x is not None]):
-                    self.schedule_final_text_scene_refresh(60)
-        except Exception:
-            pass
-        try:
-            if applied:
-                self.mark_active_page_dirty('text')
-                self._apply_maker_live_writeback_now(page_indices=[int(getattr(self, "idx", 0) or 0)], reason="control_code_restore", log_result=False)
-                self.schedule_deferred_auto_save_project(800)
-        except Exception:
-            pass
-        label = str(scope_label or ("선택 대사" if current_only else "현재 맵"))
-        if applied:
-            self.log(f"🧩 제어코드 {label} 복원 완료: 적용 {applied}개 / 이미 적용 {already}개 / 수동필요 {manual}개 / 빈 번역 {empty}개 / 제어코드 없음 {none}개")
-        else:
-            self.log(f"ℹ️ 제어코드 {label} 복원: 적용 없음 / 이미 적용 {already}개 / 수동필요 {manual}개 / 빈 번역 {empty}개 / 제어코드 없음 {none}개")
+        self.log(f"🧩 제어코드 {label} 복원 완료: 적용 {applied}개 / 이미 적용 {already}개 / 수동필요 {manual}개 / 빈 번역 {empty}개 / 제어코드 없음 {none}개")
+        self._audit_translate_event(
+            "TRANSLATE_CONTROL_CODE_MANUAL_RESTORE_APPLIED",
+            scope=str(label),
+            applied=int(applied),
+            already=int(already),
+            manual=int(manual),
+            empty=int(empty),
+            none=int(none),
+            table_partial_update=0,
+            table_lazy_rows=int(len(changed_indices or [])),
+        )
 
     def _maker_text_type_label(self, text_type):
         raw = str(text_type or "").strip()
@@ -6428,6 +7846,15 @@ class MainWindowOperationsMixin:
         meta = (row or {}).get("maker_text_unit") if isinstance(row, dict) else {}
         if not isinstance(meta, dict):
             meta = {}
+        try:
+            source = str((row or {}).get("maker_speaker_source") or meta.get("speaker_source") or "").strip()
+        except Exception:
+            source = ""
+        # PATCH: event names are context, not speakers.  Do not display an
+        # event-name fallback in the speaker column/namebox.  The event column
+        # already carries that data.
+        if source == "event_name":
+            return ""
         candidates = [
             (row or {}).get("maker_speaker_plain") if isinstance(row, dict) else "",
             meta.get("speaker_plain"),
@@ -6435,7 +7862,6 @@ class MainWindowOperationsMixin:
             (row or {}).get("speaker") if isinstance(row, dict) else "",
             meta.get("speaker"),
             meta.get("face_name"),
-            meta.get("event_name"),
         ]
         for value in candidates:
             try:
@@ -6542,6 +7968,11 @@ class MainWindowOperationsMixin:
                     self.tab.setDragDropOverwriteMode(False)
                     self.tab.setProperty("ysb_excel_like_text_table", True)
                     self.tab.setProperty("ysb_copy_blank_line_between_rows", True)
+                    # Map/event text rows are sized once on load and then only
+                    # the explicitly clicked row is auto-sized.  Keeping the
+                    # header in Interactive mode prevents bulk setText() from
+                    # recalculating every row height.
+                    self.tab.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
                 except Exception:
                     pass
                 if self.tab.columnCount() != 8:
@@ -6626,6 +8057,80 @@ class MainWindowOperationsMixin:
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         item.setData(Qt.ItemDataRole.UserRole, str(user_value if user_value is not None else text or ""))
         return item
+
+    def refresh_maker_translation_summary_header(self):
+        """Refresh the ALL/header row translation counts without rebuilding the table.
+
+        Maker map/DB tables use row 0 as a live summary row.  Individual cell
+        edits update the row status immediately, so the summary must move at the
+        same time.  Do not call ref_tab() here: that would rebuild the whole
+        table and make simple text edits feel heavy again.
+        """
+        tab = getattr(self, "tab", None)
+        if tab is None:
+            return False
+        try:
+            if tab.rowCount() <= 0 or tab.columnCount() < 7:
+                return False
+        except Exception:
+            return False
+
+        try:
+            db_mode = bool(hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode())
+        except Exception:
+            db_mode = False
+
+        rows = []
+        label = self.tr_ui("현재 맵 텍스트")
+        if db_mode:
+            try:
+                actual_idx = int(getattr(self, "maker_database_idx", getattr(self, "idx", 0)) or 0)
+            except Exception:
+                actual_idx = int(getattr(self, "idx", 0) or 0)
+            page = self.data.get(actual_idx) if isinstance(getattr(self, "data", None), dict) else None
+            if not isinstance(page, dict):
+                return False
+            try:
+                filtered = self._maker_database_filtered_rows_for_page(page) if hasattr(self, "_maker_database_filtered_rows_for_page") else list(enumerate(page.get("data") or []))
+                rows = [r for _idx, r in filtered]
+            except Exception:
+                rows = list(page.get("data") or [])
+            label = self.tr_ui("현재 DB 텍스트")
+        else:
+            try:
+                if not self._is_maker_text_table_mode():
+                    return False
+            except Exception:
+                return False
+            page = self.data.get(self.idx) if isinstance(getattr(self, "data", None), dict) else None
+            if not isinstance(page, dict):
+                return False
+            rows = list(page.get("data") or [])
+
+        try:
+            translated = sum(1 for r in rows if str((r or {}).get("translated_text") or "").strip())
+            total = len(rows)
+            summary = f"{self.tr_ui('번역완료')} {translated} / {self.tr_ui('미번역')} {max(0, total - translated)}"
+            left = f"{label} · {total}"
+
+            old_block = tab.blockSignals(True)
+            try:
+                for col, text in ((5, left), (6, summary)):
+                    item = tab.item(0, col)
+                    if item is None:
+                        item = self._make_table_item(text, editable=False)
+                        tab.setItem(0, col, item)
+                    else:
+                        item.setText(text)
+                        item.setData(Qt.ItemDataRole.UserRole, text)
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+            finally:
+                tab.blockSignals(old_block)
+            return True
+        except Exception:
+            return False
 
     def ref_tab(self):
         try:
@@ -6808,6 +8313,9 @@ class MainWindowOperationsMixin:
         self.tab.resizeRowsToContents()
         try:
             if maker_mode:
+                self._clear_maker_table_pending_refresh(
+                    page_idx=int(getattr(self, "idx", 0) or 0), db_mode=False
+                )
                 self._maker_table_current_marker_row = -1
                 self.refresh_maker_table_current_row_marker()
         except Exception:
@@ -7100,6 +8608,66 @@ class MainWindowOperationsMixin:
         self.log("ℹ️ 쯔꾸르붕이에서는 인페인팅 기능을 사용하지 않습니다.")
         return False
 
+    def _lm_studio_models_url_from_base(self, base_url):
+        """LM Studio Base URL에서 /models 점검 주소를 만든다."""
+        base = str(base_url or "").strip().rstrip("/")
+        if not base:
+            return ""
+        if base.lower().endswith("/v1"):
+            return base + "/models"
+        return base + "/v1/models"
+
+    def _check_lm_studio_server_or_alert(self, settings):
+        """LM Studio Local Server가 실제로 켜져 있는지 번역 시작 전에 차단 확인한다."""
+        base_url = str(getattr(settings, "lm_studio_base_url", "") or "").strip().rstrip("/")
+        model_name = str(getattr(settings, "lm_studio_model", "") or "").strip()
+        models_url = self._lm_studio_models_url_from_base(base_url)
+        if not models_url:
+            return True
+        lang_en = bool(getattr(self, "ui_language", "") == LANG_EN)
+        try:
+            req = urllib.request.Request(models_url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=1.5) as resp:
+                status = int(getattr(resp, "status", 200) or 200)
+                body = resp.read(1024 * 256).decode("utf-8", errors="replace")
+            if status < 200 or status >= 300:
+                raise RuntimeError(f"HTTP {status}")
+            try:
+                payload = json.loads(body or "{}")
+            except Exception:
+                payload = {}
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, list) and not data:
+                title = "LM Studio Connection Failed" if lang_en else "LM Studio 연결 실패"
+                msg = (
+                    "The LM Studio server is running, but no model is loaded.\n\n"
+                    "Load a model in LM Studio, then try again.\n\n"
+                    f"Model: {model_name or '-'}\nBase URL: {base_url}"
+                    if lang_en else
+                    "LM Studio 서버는 켜져 있지만 로드된 모델이 없습니다.\n\n"
+                    "LM Studio에서 모델을 로드한 뒤 다시 시도해 주세요.\n\n"
+                    f"모델: {model_name or '-'}\nBase URL: {base_url}"
+                )
+                QMessageBox.critical(self, title, msg)
+                self.log(("❌ LM Studio server has no loaded model." if lang_en else "❌ LM Studio 서버에 로드된 모델이 없습니다."))
+                return False
+            return True
+        except Exception as e:
+            detail = str(e) or e.__class__.__name__
+            title = "LM Studio Connection Failed" if lang_en else "LM Studio 연결 실패"
+            msg = (
+                "Cannot connect to the LM Studio Local Server.\n\n"
+                "Start the server in LM Studio > Developer > Local Server, then try again.\n\n"
+                f"Base URL: {base_url}\nCheck URL: {models_url}\nDetails: {detail}"
+                if lang_en else
+                "LM Studio Local Server에 연결할 수 없습니다.\n\n"
+                "LM Studio > Developer > Local Server에서 서버를 켠 뒤 다시 시도해 주세요.\n\n"
+                f"Base URL: {base_url}\n확인 주소: {models_url}\n상세: {detail}"
+            )
+            QMessageBox.critical(self, title, msg)
+            self.log((f"❌ LM Studio connection failed: {detail}" if lang_en else f"❌ LM Studio 연결 실패: {detail}"))
+            return False
+
     def check_translation_api_key_or_alert(self, provider=None):
         """번역 API 키가 없을 때 원문 반환으로 조용히 넘어가지 않게 UI에서 먼저 막는다."""
         settings = getattr(self, "api_settings", None) or ApiSettingsStore.load()
@@ -7111,7 +8679,9 @@ class MainWindowOperationsMixin:
                 "deepseek": "DeepSeek",
                 "google": "Google Translate",
                 "gemini": "Gemini",
+                "gemini_deferred": "Gemini Flex / Batch",
                 "custom": "Custom / OpenAI-Compatible",
+                "lm_studio": "LM Studio / Local OpenAI-Compatible",
             }
             return mapping.get((code or "").lower(), str(code or "OpenAI"))
 
@@ -7130,6 +8700,19 @@ class MainWindowOperationsMixin:
         elif provider == "gemini":
             if not str(getattr(settings, "gemini_api_key", "") or "").strip():
                 return self._show_api_missing_and_open_settings("translation", provider_name, "Gemini API Key가 비어있습니다.", "Gemini API Key is empty.")
+        elif provider == "gemini_deferred":
+            missing = []
+            if not str(getattr(settings, "gemini_delayed_api_key", "") or "").strip():
+                missing.append("API Key")
+            if not str(getattr(settings, "gemini_delayed_model", "") or "").strip():
+                missing.append("Model")
+            if missing:
+                return self._show_api_missing_and_open_settings(
+                    "translation",
+                    provider_name,
+                    "Gemini Flex / Batch " + ", ".join(missing) + " 설정이 비어있습니다.",
+                    "Gemini Flex / Batch " + ", ".join(missing) + " setting(s) are empty.",
+                )
         elif provider == "custom":
             missing = []
             if not str(getattr(settings, "custom_translation_base_url", "") or "").strip():
@@ -7145,33 +8728,625 @@ class MainWindowOperationsMixin:
                     "Custom 번역 API " + ", ".join(missing) + " 설정이 비어있습니다.",
                     "Custom translation API " + ", ".join(missing) + " setting(s) are empty.",
                 )
+        elif provider == "lm_studio":
+            missing = []
+            if not str(getattr(settings, "lm_studio_base_url", "") or "").strip():
+                missing.append("Base URL")
+            if not str(getattr(settings, "lm_studio_model", "") or "").strip():
+                missing.append("Model")
+            if missing:
+                return self._show_api_missing_and_open_settings(
+                    "translation",
+                    provider_name,
+                    "LM Studio " + ", ".join(missing) + " 설정이 비어있습니다. LM Studio에서 모델을 로드하고 서버를 켠 뒤 입력해 주세요.",
+                    "LM Studio " + ", ".join(missing) + " setting(s) are empty. Load a model and start the server in LM Studio first.",
+                )
+            if not self._check_lm_studio_server_or_alert(settings):
+                return False
         else:
             if not str(getattr(settings, "openai_api_key", "") or "").strip():
                 return self._show_api_missing_and_open_settings("translation", provider_name, "OpenAI API Key가 비어있습니다.", "OpenAI API Key is empty.")
 
         return True
 
-    def trans(self):
+    def _selected_table_cells_for_translation(self, curr=None, *, db_mode=False):
+        """Return translation targets from an explicit Qt table selection only.
+
+        This is intentionally narrower than the visual red-row marker.  The red row
+        is a display aid, but using old marker/background state as a translate
+        trigger can swallow the normal whole-map translation path.  The translate
+        button decides selected-row translation only from the table selection model
+        (selectedIndexes/selectedRanges).
+        """
+        selected_cell_count = 0
+        valid_cell_count = 0
+        targets_by_row = {}
+        try:
+            table = getattr(self, "tab", None)
+            if table is None:
+                return [], 0, 0
+            selected_rows = {}
+            seen_cells = set()
+
+            def add_row_cell(row, col=None, *, counted=True):
+                nonlocal selected_cell_count
+                try:
+                    row = int(row)
+                except Exception:
+                    return
+                if row <= 0:
+                    return
+                if col is None:
+                    try:
+                        cols = range(0, max(1, int(table.columnCount() or 1)))
+                    except Exception:
+                        cols = [0]
+                else:
+                    try:
+                        cols = [int(col)]
+                    except Exception:
+                        cols = [0]
+                for c in cols:
+                    if c < 0:
+                        continue
+                    key = (row, int(c))
+                    if key in seen_cells:
+                        continue
+                    seen_cells.add(key)
+                    selected_rows.setdefault(row, set()).add(int(c))
+                    if counted:
+                        selected_cell_count += 1
+
+            # Explicit live Qt cell selection.
+            for idx in table.selectedIndexes() or []:
+                try:
+                    add_row_cell(idx.row(), idx.column())
+                except Exception:
+                    continue
+
+            # Explicit range selection fallback.
+            try:
+                for rg in table.selectedRanges() or []:
+                    for row in range(int(rg.topRow()), int(rg.bottomRow()) + 1):
+                        if row <= 0:
+                            continue
+                        for col in range(int(rg.leftColumn()), int(rg.rightColumn()) + 1):
+                            add_row_cell(row, col)
+            except Exception:
+                pass
+
+            if selected_cell_count <= 0:
+                return [], 0, 0
+
+            data = list((curr or {}).get("data") or []) if isinstance(curr, dict) else []
+            for row in sorted(selected_rows):
+                data_index = self._maker_data_index_for_table_row(row, db_mode=db_mode)
+                if data_index < 0 or data_index >= len(data):
+                    continue
+                try:
+                    if db_mode and hasattr(self, "_is_maker_database_row_translatable") and not self._is_maker_database_row_translatable(data[data_index]):
+                        continue
+                except Exception:
+                    pass
+                source_text = str((data[data_index] or {}).get("text") or "")
+                if not source_text.strip():
+                    continue
+                cols = set(selected_rows.get(row) or set())
+                valid_cell_count += max(1, len(cols))
+                targets_by_row[row] = {
+                    "row": int(row),
+                    "data_index": int(data_index),
+                    "selected_columns": set(int(c) for c in cols),
+                    "selected_cell_count": int(len(cols) or 1),
+                }
+        except Exception:
+            return [], int(selected_cell_count or 0), int(valid_cell_count or 0)
+
+        targets = []
+        for row in sorted(targets_by_row):
+            target = dict(targets_by_row[row])
+            try:
+                target["selected_columns"] = sorted(int(c) for c in (target.get("selected_columns") or []))
+            except Exception:
+                target["selected_columns"] = []
+            targets.append(target)
+        return targets, int(selected_cell_count or 0), int(valid_cell_count or 0)
+
+    def _selected_table_rows_for_translation(self, curr=None, *, db_mode=False):
+        """Compatibility wrapper: return rows touched by translatable selected cells."""
+        try:
+            targets, _selected_cell_count, _valid_cell_count = self._selected_table_cells_for_translation(curr, db_mode=db_mode)
+            return [int(t.get("row")) for t in targets if isinstance(t, dict)]
+        except Exception:
+            return []
+
+    def _maker_data_index_for_table_row(self, row, *, db_mode=False):
+        try:
+            row = int(row)
+        except Exception:
+            return -1
+        if row <= 0:
+            return -1
+        data_index = row - 1
+        if db_mode:
+            try:
+                id_item = self.tab.item(row, 0)
+                v = id_item.data(Qt.ItemDataRole.UserRole) if id_item is not None else None
+                if v is not None:
+                    data_index = int(v)
+            except Exception:
+                data_index = row - 1
+        return data_index
+
+    def _line_bounds_for_text(self, text):
+        """Return (line_index, start, end_without_newline, end_with_newline) bounds."""
+        src = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        if src == "":
+            return [(0, 0, 0, 0)]
+        bounds = []
+        start = 0
+        parts = src.split("\n")
+        for i, part in enumerate(parts):
+            end = start + len(part)
+            end_with_newline = end + (1 if i < len(parts) - 1 else 0)
+            bounds.append((i, start, end, end_with_newline))
+            start = end_with_newline
+        return bounds
+
+    def _selected_line_range_from_offsets(self, text, start, end):
+        try:
+            start = int(start)
+            end = int(end)
+        except Exception:
+            return None
+        if end < start:
+            start, end = end, start
+        if end <= start:
+            return None
+        text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        bounds = self._line_bounds_for_text(text)
+        # If the selection ends exactly at the start of a following line because the
+        # newline was included, keep that following line out of the target range.
+        effective_end = max(start, end - 1)
+        selected = []
+        for line_idx, line_start, line_end, line_end_with_newline in bounds:
+            if start <= line_end_with_newline and effective_end >= line_start:
+                # Ignore pure newline-only overlap with an empty trailing area.
+                if effective_end < line_start or start > line_end_with_newline:
+                    continue
+                selected.append(line_idx)
+        if not selected:
+            return None
+        return min(selected), max(selected)
+
+    def _line_text_slice(self, text, line_start, line_end):
+        lines = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if not lines:
+            lines = [""]
+        try:
+            line_start = max(0, int(line_start))
+            line_end = max(line_start, int(line_end))
+        except Exception:
+            return ""
+        if line_start >= len(lines):
+            return ""
+        line_end = min(line_end, len(lines) - 1)
+        return "\n".join(lines[line_start:line_end + 1])
+
+    def _selected_text_segments_for_translation(self, curr=None, *, db_mode=False):
+        """Return selected in-cell line segments for Maker selected-line translation.
+
+        This catches the QTextEdit delegate selection that can disappear visually when
+        the translate button is clicked.  The delegate stores the last explicit text
+        selection on the main window, and this function validates it against the
+        current table/data before using it.
+        """
+        cache = getattr(self, "_ysb_table_text_selection_for_translation", None)
+        if not isinstance(cache, dict):
+            return []
+        try:
+            # Keep the selection short-lived to avoid stale accidental partial
+            # translation after the user moves on to another row.
+            if time.time() - float(cache.get("timestamp") or 0.0) > 30.0:
+                return []
+        except Exception:
+            return []
+        try:
+            row = int(cache.get("row"))
+            col = int(cache.get("col"))
+        except Exception:
+            return []
+        if row <= 0:
+            return []
+        try:
+            valid_cols = {int(self._table_text_column()), int(self._table_translation_column())}
+            if col not in valid_cols:
+                return []
+        except Exception:
+            pass
+        data = list((curr or {}).get("data") or []) if isinstance(curr, dict) else []
+        data_index = self._maker_data_index_for_table_row(row, db_mode=db_mode)
+        if data_index < 0 or data_index >= len(data):
+            return []
+        try:
+            if db_mode and hasattr(self, "_is_maker_database_row_translatable") and not self._is_maker_database_row_translatable(data[data_index]):
+                return []
+        except Exception:
+            pass
+        full_text = str(cache.get("full_text") or "")
+        rng = self._selected_line_range_from_offsets(full_text, cache.get("selection_start"), cache.get("selection_end"))
+        if rng is None:
+            return []
+        line_start, line_end = rng
+        # Translation source must come from the original/source text, not from the
+        # edited display cache.  Line numbers are mapped against the source text.
+        source_text = str(data[data_index].get("text") or "")
+        source_piece = self._line_text_slice(source_text, line_start, line_end)
+        if not source_piece.strip():
+            return []
+        return [{
+            "row": row,
+            "data_index": data_index,
+            "line_start": line_start,
+            "line_end": line_end,
+            "source_text": source_piece,
+            "source_full_text": source_text,
+        }]
+
+    def _format_ui_text(self, template, **kwargs):
+        """Translate a UI text and safely apply format placeholders.
+
+        MainWindow.tr_ui() does not accept **kwargs, so confirmation dialogs must
+        translate first and then format.  Passing kwargs directly to self.tr_ui()
+        raises TypeError and made selected-translation confirmation return False
+        before the dialog was shown.
+        """
+        try:
+            text = self.tr_ui(template)
+        except Exception:
+            text = str(template or "")
+        try:
+            return str(text).format(**kwargs)
+        except Exception:
+            return str(text)
+
+    def _exec_translate_confirm_dialog(self, title, text, **fields):
+        """Show a real modal confirmation dialog for selected translation."""
+        try:
+            self._audit_translate_event("TRANSLATE_CONFIRM_DIALOG_SHOW", title=str(title or ""), **fields)
+        except Exception:
+            pass
+        try:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Question)
+            msg.setWindowTitle(str(title or ""))
+            msg.setText(str(text or ""))
+            msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            msg.setDefaultButton(QMessageBox.StandardButton.Yes)
+            msg.setEscapeButton(QMessageBox.StandardButton.No)
+            try:
+                msg.setWindowModality(Qt.WindowModality.ApplicationModal)
+            except Exception:
+                pass
+            try:
+                msg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+            except Exception:
+                pass
+            try:
+                apply_message_box_palette(msg, False)
+            except Exception:
+                pass
+            try:
+                QTimer.singleShot(0, msg.raise_)
+                QTimer.singleShot(0, msg.activateWindow)
+            except Exception:
+                pass
+            result = msg.exec()
+            clicked = msg.clickedButton()
+            accepted = False
+            try:
+                accepted = msg.standardButton(clicked) == QMessageBox.StandardButton.Yes
+            except Exception:
+                accepted = False
+            try:
+                if not accepted and int(result) == int(QMessageBox.StandardButton.Yes):
+                    accepted = True
+            except Exception:
+                pass
+            try:
+                self._audit_translate_event(
+                    "TRANSLATE_CONFIRM_DIALOG_RESULT",
+                    accepted=bool(accepted),
+                    result=int(result) if result is not None else -1,
+                    clicked_text=clicked.text() if clicked is not None and hasattr(clicked, "text") else "",
+                    **fields,
+                )
+            except Exception:
+                pass
+            return bool(accepted)
+        except Exception as e:
+            try:
+                self._audit_translate_event("TRANSLATE_CONFIRM_DIALOG_ERROR", error=f"{type(e).__name__}: {e}", **fields)
+            except Exception:
+                pass
+            try:
+                self.log(f"⚠️ 선택 번역 확인창 표시 실패: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            return False
+
+    def _confirm_translate_selected_targets(self, count, *, partial=False):
+        """Ask before translating only selected rows/segments."""
+        try:
+            count = int(count or 0)
+        except Exception:
+            count = 0
+        if count <= 0:
+            return False
+        title = self.tr_ui("선택한 줄만 번역")
+        if partial:
+            text = self._format_ui_text(
+                "현재 오른쪽 텍스트 칸에서 일부 줄이 선택되어 있습니다. 전체 대사가 아니라 선택한 줄만 번역합니다.\n\n대상: {count}줄\n\n진행할까요?",
+                count=count,
+            )
+        else:
+            text = self._format_ui_text(
+                "현재 오른쪽 텍스트 표에서 줄이 선택되어 있습니다. 전체 대상이 아니라 선택한 줄만 번역합니다.\n\n대상: {count}줄\n\n진행할까요?",
+                count=count,
+            )
+        return self._exec_translate_confirm_dialog(title, text, target_count=count, partial=bool(partial))
+
+    def _replace_lines_in_text(self, base_text, line_start, line_end, replacement):
+        lines = str(base_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if not lines:
+            lines = [""]
+        try:
+            line_start = max(0, int(line_start))
+            line_end = max(line_start, int(line_end))
+        except Exception:
+            return str(replacement or "")
+        while len(lines) <= line_end:
+            lines.append("")
+        repl_lines = str(replacement or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        lines[line_start:line_end + 1] = repl_lines
+        return "\n".join(lines)
+
+    def _start_translation_job(self):
+        job_id = uuid.uuid4().hex
+        self._active_translation_job_id = job_id
+        try:
+            canceled = getattr(self, "_canceled_translation_job_ids", None)
+            if not isinstance(canceled, set):
+                canceled = set()
+            self._canceled_translation_job_ids = canceled
+        except Exception:
+            self._canceled_translation_job_ids = set()
+        return job_id
+
+    def _is_active_translation_job(self, job_id):
+        if not job_id:
+            return True
+        try:
+            if job_id in (getattr(self, "_canceled_translation_job_ids", set()) or set()):
+                return False
+        except Exception:
+            pass
+        return str(getattr(self, "_active_translation_job_id", "") or "") == str(job_id)
+
+    def _clear_translation_runtime_state(self):
+        self._translation_target_rows = []
+        self._translation_target_texts = []
+        self._translation_maker_token_maps = []
+        self._translation_maker_contexts = None
+        self._translation_target_segments = []
+        self._chunked_translation_apply_state = None
+        self._translation_database_mode = False
+        self._translation_speaker_mode = False
+        self._translation_database_idx = None
+
+    def _cancel_active_translation_job(self, reason="user_cancel"):
+        job_id = str(getattr(self, "_active_translation_job_id", "") or "")
+        if job_id:
+            try:
+                canceled = getattr(self, "_canceled_translation_job_ids", None)
+                if not isinstance(canceled, set):
+                    canceled = set()
+                canceled.add(job_id)
+                self._canceled_translation_job_ids = canceled
+            except Exception:
+                pass
+        self._active_translation_job_id = None
+        self._long_task_cancel_requested = True
+        try:
+            worker = getattr(self, "translation_worker", None)
+            if worker is not None and hasattr(worker, "stop"):
+                worker.stop()
+        except Exception:
+            pass
+        self._clear_translation_runtime_state()
+        try:
+            self.handle_long_task_message(
+                self.tr_ui("번역 취소됨. 완료된 청크는 유지하고, 현재 응답과 이후 청크는 반영하지 않습니다.")
+            )
+        except Exception:
+            pass
+        try:
+            self.hide_task_progress_overlay()
+        except Exception:
+            pass
+        try:
+            self.end_busy_state("번역")
+        except Exception:
+            pass
+        try:
+            self.log(self.tr_ui("⏹️ 번역 취소: 완료된 청크는 유지하고 현재 응답과 이후 청크는 버립니다."))
+        except Exception:
+            pass
+
+    def _confirm_translate_selected_table_cells(self, targets, *, selected_cell_count=0, valid_cell_count=0):
+        """Ask before translating only the selected table cells/rows."""
+        try:
+            target_count = len(targets or [])
+        except Exception:
+            target_count = 0
+        try:
+            selected_cell_count = int(selected_cell_count or 0)
+        except Exception:
+            selected_cell_count = 0
+        try:
+            valid_cell_count = int(valid_cell_count or 0)
+        except Exception:
+            valid_cell_count = 0
+        if target_count <= 0:
+            return False
+        title = self.tr_ui("선택한 셀만 번역")
+        cell_count = selected_cell_count or valid_cell_count or target_count
+        text = self._format_ui_text(
+            "현재 오른쪽 텍스트 표에서 셀이 선택되어 있습니다. 전체 대상이 아니라 선택한 셀에 해당하는 줄만 번역합니다.\n\n선택 셀: {cell_count}개 / 번역 대상: {target_count}줄\n\n진행할까요?",
+            cell_count=cell_count,
+            target_count=target_count,
+        )
+        return self._exec_translate_confirm_dialog(
+            title,
+            text,
+            target_count=target_count,
+            selected_cell_count=selected_cell_count,
+            valid_cell_count=valid_cell_count,
+        )
+
+    def _confirm_translate_selected_table_rows(self, rows):
+        """Ask before translating only selected table rows."""
+        return self._confirm_translate_selected_targets(len(rows or []), partial=False)
+
+    def _audit_translate_event(self, event_name, **fields):
+        """Write high-signal translate decision logs to engine_boundary."""
+        try:
+            if hasattr(self, "audit_boundary_event"):
+                self.audit_boundary_event(str(event_name), **fields)
+        except Exception:
+            pass
+
+    def on_translate_button_clicked(self, *args, **kwargs):
+        """Translate button/action entry point.
+
+        This method is intentionally separate from trans().  It decides whether the
+        current Maker table selection means "selected rows only" or "whole current
+        map/page".  trans() itself must stay the execution body and must not inspect
+        red rows / selectedIndexes() again, otherwise the normal whole-map route can
+        be swallowed by stale table selection state.
+        """
+        self._audit_translate_event("TRANSLATE_BUTTON_CLICK")
+        try:
+            db_mode = bool(hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode())
+        except Exception:
+            db_mode = False
+        try:
+            maker_mode = True if db_mode else bool(self._is_maker_text_table_mode())
+        except Exception:
+            maker_mode = False
+
+        curr = None
+        try:
+            if db_mode:
+                db_idx = int(getattr(self, "maker_database_idx", 0) or 0)
+                curr = self.data.get(db_idx) if isinstance(getattr(self, "data", None), dict) else None
+            else:
+                curr = self.data.get(self.idx) if isinstance(getattr(self, "data", None), dict) else None
+        except Exception:
+            curr = None
+
+        selected_targets = []
+        selected_cell_count = 0
+        valid_cell_count = 0
+        if maker_mode and isinstance(curr, dict) and curr.get("data"):
+            try:
+                selected_targets, selected_cell_count, valid_cell_count = self._selected_table_cells_for_translation(curr, db_mode=db_mode)
+            except Exception as e:
+                selected_targets, selected_cell_count, valid_cell_count = [], 0, 0
+                self._audit_translate_event("TRANSLATE_DECISION_SELECTION_ERROR", error=f"{type(e).__name__}: {e}")
+            self._audit_translate_event(
+                "TRANSLATE_DECISION_SELECTION_SCAN",
+                targets_count=len(selected_targets or []),
+                selected_cell_count=int(selected_cell_count or 0),
+                valid_cell_count=int(valid_cell_count or 0),
+                explicit_only=True,
+            )
+
+        if selected_targets:
+            rows = []
+            for t in selected_targets:
+                try:
+                    row = int(t.get("row")) if isinstance(t, dict) else -1
+                except Exception:
+                    row = -1
+                if row > 0 and row not in rows:
+                    rows.append(row)
+            self._audit_translate_event(
+                "TRANSLATE_DECISION_SELECTED_ROWS",
+                rows_count=len(rows),
+                selected_cell_count=int(selected_cell_count or 0),
+                valid_cell_count=int(valid_cell_count or 0),
+                rows=",".join(str(x) for x in rows[:80]),
+            )
+            if rows:
+                if not self._confirm_translate_selected_table_cells(
+                    selected_targets,
+                    selected_cell_count=selected_cell_count,
+                    valid_cell_count=valid_cell_count,
+                ):
+                    self._audit_translate_event("TRANSLATE_DECISION_SELECTED_CANCEL", rows_count=len(rows))
+                    try:
+                        self.log("⏹️ 선택 셀 번역을 취소했습니다.")
+                    except Exception:
+                        pass
+                    return
+                self._audit_translate_event("TRANSLATE_DECISION_SELECTED_CONFIRMED", rows_count=len(rows), rows=",".join(str(x) for x in rows[:80]))
+                return self.trans(selected_rows=rows, translate_origin="button_selected")
+
+        if selected_cell_count > 0:
+            self._audit_translate_event(
+                "TRANSLATE_DECISION_SELECTION_NO_VALID_TARGETS_FALLBACK_FULL",
+                selected_cell_count=int(selected_cell_count or 0),
+                valid_cell_count=int(valid_cell_count or 0),
+            )
+            try:
+                self.log("ℹ️ 선택 표시가 있지만 번역 가능한 선택 행이 없어 현재 맵/페이지 전체 번역으로 진행합니다.")
+            except Exception:
+                pass
+        self._audit_translate_event("TRANSLATE_DECISION_FULL_MAP")
+        return self.trans(selected_rows=None, translate_origin="button_full")
+
+    def trans(self, selected_rows=None, *, translate_origin="direct", selected_segments=None):
+        if isinstance(selected_rows, bool):
+            # Defensive: old Qt signal paths may pass the clicked(bool) payload.
+            selected_rows = None
         if not self.ensure_engine_ready():
+            self._audit_translate_event("TRANSLATE_CORE_ABORT_ENGINE_NOT_READY", origin=str(translate_origin or ""))
             return
-        db_mode = bool(hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode())
+        db_mode = bool(hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode())
+        speaker_mode = bool(hasattr(self, "is_maker_speaker_mode") and self.is_maker_speaker_mode())
         self._translation_database_mode = bool(db_mode)
+        self._translation_speaker_mode = bool(speaker_mode)
         self._translation_database_idx = int(getattr(self, "maker_database_idx", 0) or 0) if db_mode else None
         if db_mode:
             db_idx = int(getattr(self, "maker_database_idx", 0) or 0)
             curr = self.data.get(db_idx) if isinstance(getattr(self, "data", None), dict) else None
             if not isinstance(curr, dict):
+                self._audit_translate_event("TRANSLATE_CORE_ABORT_NO_DB_TAB", origin=str(translate_origin or ""))
                 self.log("⚠️ 번역할 데이터베이스 탭이 없습니다.")
                 return
         else:
             if not self.paths:
+                self._audit_translate_event("TRANSLATE_CORE_ABORT_NO_IMAGE", origin=str(translate_origin or ""))
                 self.log("⚠️ 이미지가 없습니다. 먼저 프로젝트에 이미지를 불러와 주세요.")
                 return
             if self.idx not in self.data:
+                self._audit_translate_event("TRANSLATE_CORE_ABORT_NO_DATA", origin=str(translate_origin or ""), page_idx=getattr(self, "idx", None))
                 self.log("⚠️ 번역할 데이터가 없습니다.")
                 return
             curr = self.data.get(self.idx)
         if not curr or not curr.get('data'):
+            self._audit_translate_event("TRANSLATE_CORE_ABORT_NO_TEXT_BOX", origin=str(translate_origin or ""))
             self.log("⚠️ 텍스트 박스가 없어서 번역할 게 없습니다.")
             return
 
@@ -7183,6 +9358,11 @@ class MainWindowOperationsMixin:
             maker_mode = True if db_mode else self._is_maker_text_table_mode()
             maker_prompts = None
             maker_translation_settings = None
+            control_code_auto_enabled = bool(
+                maker_mode
+                and not db_mode
+                and getattr(self, "maker_control_code_auto_apply_enabled", True)
+            )
             if maker_mode:
                 try:
                     maker_prompts = load_maker_character_prompts(getattr(self, "project_dir", None))
@@ -7193,43 +9373,91 @@ class MainWindowOperationsMixin:
                 except Exception:
                     maker_translation_settings = None
             source_col = self._table_text_column()
-            for row in range(1, self.tab.rowCount()):
-                data_index = row - 1
-                if db_mode:
-                    try:
-                        id_item = self.tab.item(row, 0)
-                        v = id_item.data(Qt.ItemDataRole.UserRole) if id_item is not None else None
-                        if v is not None:
-                            data_index = int(v)
-                    except Exception:
-                        data_index = row - 1
-                if data_index < 0 or data_index >= len(curr['data']):
-                    continue
-                try:
-                    if db_mode and hasattr(self, "_is_maker_database_row_translatable") and not self._is_maker_database_row_translatable(curr['data'][data_index]):
+            selected_translate_rows = []
+            try:
+                if selected_rows:
+                    seen = set()
+                    for row in selected_rows:
+                        try:
+                            row_i = int(row)
+                        except Exception:
+                            continue
+                        if row_i > 0 and row_i not in seen:
+                            selected_translate_rows.append(row_i)
+                            seen.add(row_i)
+            except Exception:
+                selected_translate_rows = []
+            selected_translate_segments = list(selected_segments or [])
+            self._audit_translate_event(
+                "TRANSLATE_CORE_ENTER",
+                origin=str(translate_origin or ""),
+                maker_mode=bool(maker_mode),
+                db_mode=bool(db_mode),
+                selected_rows_count=len(selected_translate_rows),
+                selected_segments_count=len(selected_translate_segments),
+                table_rows=int(self.tab.rowCount() or 0) if hasattr(self, "tab") else -1,
+            )
+            if selected_translate_segments:
+                for seg in selected_translate_segments:
+                    row = int(seg.get("row"))
+                    data_index = int(seg.get("data_index"))
+                    if data_index < 0 or data_index >= len(curr['data']):
                         continue
-                except Exception:
-                    pass
-                is_checked = True if maker_mode else self.get_table_check_state(row)
-                curr['data'][data_index]['use_inpaint'] = is_checked
-                if not is_checked:
-                    continue
-                if maker_mode:
-                    payload = prepare_maker_translation_payload(curr['data'][data_index], maker_prompts, maker_translation_settings)
+                    item_copy = dict(curr['data'][data_index] or {})
+                    item_copy['text'] = str(seg.get("source_text") or "")
+                    payload = prepare_maker_translation_payload(
+                        item_copy,
+                        maker_prompts,
+                        maker_translation_settings,
+                        auto_restore_control_codes=control_code_auto_enabled,
+                    )
                     texts.append(payload.get("text", ""))
                     maker_contexts.append(payload.get("context", ""))
                     maker_token_maps.append(payload.get("control_map", []))
-                else:
-                    item = self.tab.item(row, source_col)
-                    texts.append(item.text() if item else "")
-                target_rows.append(row)
+                    target_rows.append(row)
+            else:
+                row_iter = selected_translate_rows if selected_translate_rows else range(1, self.tab.rowCount())
+                for row in row_iter:
+                    data_index = self._maker_data_index_for_table_row(row, db_mode=db_mode)
+                    if data_index < 0 or data_index >= len(curr['data']):
+                        continue
+                    try:
+                        if db_mode and hasattr(self, "_is_maker_database_row_translatable") and not self._is_maker_database_row_translatable(curr['data'][data_index]):
+                            continue
+                    except Exception:
+                        pass
+                    is_checked = True if maker_mode else self.get_table_check_state(row)
+                    curr['data'][data_index]['use_inpaint'] = is_checked
+                    if not is_checked:
+                        continue
+                    if maker_mode:
+                        payload = prepare_maker_translation_payload(
+                            curr['data'][data_index],
+                            maker_prompts,
+                            maker_translation_settings,
+                            auto_restore_control_codes=control_code_auto_enabled,
+                        )
+                        texts.append(payload.get("text", ""))
+                        maker_contexts.append(payload.get("context", ""))
+                        maker_token_maps.append(payload.get("control_map", []))
+                    else:
+                        item = self.tab.item(row, source_col)
+                        texts.append(item.text() if item else "")
+                    target_rows.append(row)
 
             if not texts:
+                self._audit_translate_event(
+                    "TRANSLATE_NO_TARGETS",
+                    origin=str(translate_origin or ""),
+                    selected_rows_count=len(selected_translate_rows),
+                    selected_segments_count=len(selected_translate_segments),
+                )
                 self.log("⚠️ 체크된 번역 대상이 없습니다.")
                 return
 
             provider = self.cb_trans_provider.currentData()
             if not self.check_translation_api_key_or_alert(provider):
+                self._audit_translate_event("TRANSLATE_CORE_ABORT_API_CHECK", origin=str(translate_origin or ""), provider=str(provider or ""), targets=len(texts))
                 return
             chunk_size = self.get_current_translation_chunk_size()
             self.log(
@@ -7237,12 +9465,61 @@ class MainWindowOperationsMixin:
                 f"대상 {len(texts)}개 / 묶음 {chunk_size}개"
             )
             if maker_mode:
-                self.log("🎮 쯔꾸르 AI 번역: 캐릭터/시스템 프롬프트, 제어문자 제거, 치환 코드 유지, 원문 줄내림 정규화를 적용합니다.")
-            self._translation_target_rows = list(target_rows)
-            self._translation_target_texts = list(texts)
-            self._translation_maker_token_maps = list(maker_token_maps) if maker_mode else []
-            self._translation_maker_contexts = list(maker_contexts) if maker_mode else None
+                if control_code_auto_enabled:
+                    self.log("🎮 쯔꾸르 AI 번역: 제어코드를 안전 토큰으로 분리하고 번역 의미에 맞춰 자동 반영합니다.")
+                else:
+                    self.log("🎮 쯔꾸르 AI 번역: 캐릭터/시스템 프롬프트, 제어문자 제거, 치환 코드 유지, 원문 줄내림 정규화를 적용합니다.")
+            # The active translation locks project editing.  Reuse these lists
+            # instead of cloning the full job several times; only per-chunk
+            # slices are created when a result is actually applied.
+            self._translation_target_rows = target_rows
+            self._translation_target_texts = texts
+            self._translation_maker_token_maps = maker_token_maps if maker_mode else []
+            self._translation_maker_contexts = maker_contexts if maker_mode else None
+            self._translation_control_code_auto_enabled = bool(control_code_auto_enabled)
+            self._translation_target_segments = selected_translate_segments or []
             self._long_task_cancel_requested = False
+            self._active_long_task_kind = "translation"
+            translation_job_id = self._start_translation_job()
+            self._audit_translate_event(
+                "TRANSLATE_WORKER_START",
+                origin=str(translate_origin or ""),
+                job_id=str(translation_job_id or ""),
+                provider=str(provider or ""),
+                targets=len(texts),
+                selected_rows_count=len(selected_translate_rows),
+                full_map=not bool(selected_translate_rows or selected_translate_segments),
+                chunk_size=int(chunk_size or 0),
+            )
+            if str(provider or "") == "gemini_deferred":
+                self._audit_translate_event(
+                    "TRANSLATE_GEMINI_DELAYED_DIALOG_START",
+                    origin=str(translate_origin or ""),
+                    job_id=str(translation_job_id or ""),
+                    targets=len(texts),
+                    chunk_size=int(chunk_size or 0),
+                    delayed_mode=str(getattr(self.api_settings, "gemini_delayed_mode", "flex") or "flex"),
+                )
+                self._run_gemini_delayed_translation(
+                    texts=texts,
+                    contexts=(maker_contexts if maker_mode else None),
+                    chunk_size=chunk_size,
+                    job_id=translation_job_id,
+                    translate_origin=translate_origin,
+                )
+                return
+
+            self._chunked_translation_apply_state = {
+                "affected_ids": set(),
+                "pending_rows": set(),
+                "db_pages": set(),
+                "db_name_glossary_touched": False,
+                "maker_mode": bool(maker_mode),
+                "db_mode": bool(getattr(self, "_translation_database_mode", False)),
+                "speaker_mode": bool(getattr(self, "_translation_speaker_mode", False)),
+                "session_kind": "standard",
+            }
+
             self.prepare_task_progress_overlay(
                 "번역",
                 f"번역 준비 중... 대상 {len(texts)}개 / 묶음 {chunk_size}개",
@@ -7256,9 +9533,15 @@ class MainWindowOperationsMixin:
                 provider=provider,
                 chunk_size=chunk_size,
                 contexts=(maker_contexts if maker_mode else None),
+                apply_error_message=self.tr_ui("번역 청크 결과 적용에 실패했습니다."),
             )
+            try:
+                self.translation_worker._ysb_job_id = translation_job_id
+            except Exception:
+                pass
             self._active_task_worker = self.translation_worker
             self.translation_worker.progress.connect(self.on_translation_worker_progress)
+            self.translation_worker.chunk_ready.connect(self.on_translation_worker_chunk_ready)
             self.translation_worker.finished.connect(self.on_translation_worker_finished)
             self.translation_worker.canceled.connect(self.on_translation_worker_canceled)
             self.translation_worker.error.connect(self.on_translation_worker_error)
@@ -7268,6 +9551,7 @@ class MainWindowOperationsMixin:
         except Exception as e:
             import traceback
             traceback.print_exc()
+            self._audit_translate_event("TRANSLATE_CORE_EXCEPTION", origin=str(translate_origin or ""), error=f"{type(e).__name__}: {e}")
             self.log(f"❌ 번역 중 에러 발생: {e}")
             msg_text = self.tr_ui("에러가 발생했습니다:")
             QMessageBox.critical(self, self.tr_ui("번역 오류"), f"{msg_text}\n{e}")
@@ -7280,11 +9564,384 @@ class MainWindowOperationsMixin:
                 self.end_busy_state("번역")
 
 
+    def _run_gemini_delayed_translation(self, *, texts, contexts, chunk_size, job_id, translate_origin="direct"):
+        settings = getattr(self, "api_settings", None) or ApiSettingsStore.load()
+        mode = str(getattr(settings, "gemini_delayed_mode", "flex") or "flex").strip().lower()
+        mode = "batch" if mode == "batch" else "flex"
+        api_key = str(getattr(settings, "gemini_delayed_api_key", "") or "").strip()
+        model = str(getattr(settings, "gemini_delayed_model", "gemini-2.5-flash-lite") or "gemini-2.5-flash-lite").strip()
+        chunk_size = max(1, min(int(chunk_size or 50), 100))
+
+        chunks = []
+        for start in range(0, len(texts), chunk_size):
+            end = min(len(texts), start + chunk_size)
+            chunks.append({
+                "start": start,
+                "end": end,
+            })
+
+        self._chunked_translation_apply_state = {
+            "affected_ids": set(),
+            "pending_rows": set(),
+            "db_pages": set(),
+            "db_name_glossary_touched": False,
+            "maker_mode": bool(getattr(self, "_translation_maker_token_maps", None)),
+            "db_mode": bool(getattr(self, "_translation_database_mode", False)),
+            "speaker_mode": bool(getattr(self, "_translation_speaker_mode", False)),
+            "session_kind": "gemini_delayed",
+        }
+        self._gemini_delayed_translation_active = True
+        self._active_long_task_kind = "gemini_delayed_translation"
+
+        controller = GeminiDelayedTranslationController(
+            self.engine,
+            chunks,
+            mode=mode,
+            api_key=api_key,
+            model=model,
+            source_texts=texts,
+            source_contexts=contexts,
+            language=getattr(self, "ui_language", LANG_KO),
+            parent=self,
+        )
+        self._gemini_delayed_controller = controller
+
+        def apply_chunk(row_index, results):
+            if not self._is_active_translation_job(job_id):
+                return False
+            if not (0 <= int(row_index) < len(controller.rows)):
+                return False
+            chunk = controller.rows[int(row_index)]
+            start = int(chunk.get("start", 0) or 0)
+            end = int(chunk.get("end", start) or start)
+            # Slice only the active chunk.  Wrapping the full job in list(...)
+            # here would duplicate every target on each completed chunk and can
+            # explode memory on very large translation runs.
+            rows = (getattr(self, "_translation_target_rows", []) or [])[start:end]
+            source_texts = (getattr(self, "_translation_target_texts", []) or [])[start:end]
+            segments = (getattr(self, "_translation_target_segments", []) or [])[start:end]
+            token_maps = (getattr(self, "_translation_maker_token_maps", []) or [])[start:end]
+            ok = self._apply_translation_results_to_current_page(
+                results or [],
+                target_rows_override=rows,
+                texts_override=source_texts,
+                target_segments_override=segments,
+                token_maps_override=token_maps,
+                partial_chunk=True,
+            )
+            if ok:
+                try:
+                    self.log(
+                        self.tr_ui("✅ 지연 번역 청크 {chunk} 완료 및 즉시 반영").format(chunk=int(row_index) + 1)
+                    )
+                except Exception:
+                    pass
+            return bool(ok)
+
+        dialog = GeminiDelayedTranslationDialog(
+            controller,
+            apply_chunk=apply_chunk,
+            language=getattr(self, "ui_language", LANG_KO),
+            parent=self,
+        )
+        self._gemini_delayed_dialog = dialog
+        result = QDialog.DialogCode.Rejected
+        try:
+            result = dialog.exec()
+        finally:
+            if result != QDialog.DialogCode.Accepted:
+                try:
+                    canceled = getattr(self, "_canceled_translation_job_ids", None)
+                    if not isinstance(canceled, set):
+                        canceled = set()
+                    canceled.add(job_id)
+                    self._canceled_translation_job_ids = canceled
+                except Exception:
+                    pass
+            try:
+                self._finalize_chunked_translation_session()
+            except Exception as exc:
+                try:
+                    self.log(self.tr_ui("⚠️ 지연 번역 마무리 처리 실패: {error}").format(error=exc))
+                except Exception:
+                    pass
+            completed = sum(1 for row in controller.rows if row.get("status") == "completed")
+            failed = sum(1 for row in controller.rows if row.get("status") == "failed")
+            total = len(controller.rows)
+            try:
+                if result == QDialog.DialogCode.Accepted:
+                    self.log(self.tr_ui("✅ Gemini 지연 번역 완료: 전체 {total}개 청크").format(total=total))
+                else:
+                    self.log(
+                        self.tr_ui("⏹️ Gemini 지연 번역 취소: 완료 {completed}개 / 실패 {failed}개 / 전체 {total}개").format(
+                            completed=completed,
+                            failed=failed,
+                            total=total,
+                        )
+                    )
+            except Exception:
+                pass
+            self._audit_translate_event(
+                "TRANSLATE_GEMINI_DELAYED_DIALOG_END",
+                origin=str(translate_origin or ""),
+                job_id=str(job_id or ""),
+                accepted=bool(result == QDialog.DialogCode.Accepted),
+                completed=int(completed),
+                failed=int(failed),
+                total=int(total),
+                delayed_mode=mode,
+            )
+            self._gemini_delayed_translation_active = False
+            self._gemini_delayed_controller = None
+            self._gemini_delayed_dialog = None
+            self._chunked_translation_apply_state = None
+            self._active_translation_job_id = None
+            self._active_long_task_kind = ""
+            self._clear_translation_runtime_state()
+            try:
+                controller.deleteLater()
+                dialog.deleteLater()
+            except Exception:
+                pass
+            self.macro_mark_current_step_done("work_translate")
+
+    def _finalize_chunked_translation_session(self):
+        state = getattr(self, "_chunked_translation_apply_state", None)
+        if not isinstance(state, dict):
+            return False
+        affected_ids = list(state.get("affected_ids") or [])
+        if not affected_ids:
+            return False
+        maker_mode = bool(state.get("maker_mode"))
+        db_mode = bool(state.get("db_mode"))
+        speaker_mode = bool(state.get("speaker_mode"))
+        pending_rows = sorted(int(x) for x in (state.get("pending_rows") or set()))
+        db_pages = sorted(int(x) for x in (state.get("db_pages") or set()))
+        session_kind = str(state.get("session_kind") or "standard")
+        is_delayed = session_kind == "gemini_delayed"
+        reason_prefix = "gemini_delayed" if is_delayed else "translation_stream"
+        human_reason = "Gemini 지연 번역 결과 반영" if is_delayed else "번역 결과 반영"
+
+        try:
+            if maker_mode:
+                if db_mode:
+                    pages = db_pages or [int(getattr(self, "_translation_database_idx", getattr(self, "maker_database_idx", 0)) or 0)]
+                    changed_unified = self.apply_unified_translation_memory(
+                        scope="selected",
+                        show_message=False,
+                        auto=True,
+                        page_indices=pages,
+                        page_label="화자" if speaker_mode else "데이터베이스",
+                    )
+                else:
+                    changed_unified = self.apply_unified_translation_memory(scope="all", show_message=False, auto=True)
+                if changed_unified:
+                    self.log(f"🧩 통일 번역 자동 적용: 동일 원문 {changed_unified}개 정리")
+        except Exception:
+            pass
+
+        if maker_mode and db_mode:
+            pages = db_pages or [int(getattr(self, "_translation_database_idx", getattr(self, "maker_database_idx", 0)) or 0)]
+            if speaker_mode:
+                try:
+                    self.apply_maker_speaker_layer_to_dialogues(pages[0], reason=f"{reason_prefix}_speaker_translation_finished")
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.mark_maker_writeback_dirty(page_indices=pages, reason=f"{reason_prefix}_database_translation_finished")
+                except Exception:
+                    pass
+                if bool(state.get("db_name_glossary_touched")):
+                    try:
+                        self.refresh_maker_database_auto_glossary_after_name_change(show_log=True, reason="gemini_delayed_db_translation_result")
+                    except Exception:
+                        pass
+            try:
+                self._finalize_maker_database_page_change(
+                    pages[0],
+                    changed_ids=affected_ids,
+                    fields=["translated_text"],
+                    reason=f"{reason_prefix}_speaker_translation_result" if speaker_mode else f"{reason_prefix}_db_translation_result",
+                    refresh_preview=False,
+                    writeback=False,
+                    glossary_touched=False,
+                    show_glossary_log=False,
+                )
+            except Exception:
+                try:
+                    store = getattr(self, "project_store", None)
+                    if store is not None:
+                        self.save_project_store(store, force_full=False)
+                except Exception:
+                    pass
+            try:
+                self.refresh_maker_database_view()
+            except Exception:
+                pass
+        elif maker_mode:
+            page_idx = int(getattr(self, "idx", 0) or 0)
+            try:
+                self.mark_maker_writeback_dirty(page_indices=[page_idx], reason=f"{reason_prefix}_translation_finished")
+            except Exception:
+                pass
+            try:
+                self._mark_maker_table_rows_pending_refresh(
+                    pending_rows,
+                    page_idx=page_idx,
+                    db_mode=False,
+                    reason=f"{reason_prefix}_translation_finished",
+                )
+            except Exception:
+                pass
+            try:
+                self.finalize_maker_text_data_change(
+                    affected_ids,
+                    fields=["translated_text"],
+                    page_idx=page_idx,
+                    reason=human_reason,
+                )
+            except Exception:
+                try:
+                    if hasattr(self, "text_engine") and self.text_engine is not None:
+                        self.text_engine.mark_dirty(page_idx, affected_ids, ["translated_text"])
+                    self.mark_active_page_dirty("text")
+                    self.schedule_deferred_auto_save_project(1200)
+                except Exception:
+                    pass
+        else:
+            # The inherited editor can also run outside Maker mode. Keep the
+            # delayed provider safe there instead of touching Maker-only APIs.
+            page_idx = int(getattr(self, "idx", 0) or 0)
+            try:
+                if hasattr(self, "text_engine") and self.text_engine is not None:
+                    self.text_engine.mark_dirty(page_idx, affected_ids, ["translated_text"])
+            except Exception:
+                pass
+            try:
+                self.mark_active_page_dirty("text")
+            except Exception:
+                pass
+            try:
+                self.schedule_deferred_auto_save_project(1200)
+            except Exception:
+                pass
+            try:
+                self.ref_tab()
+            except Exception:
+                pass
+        self.undo_break_boundary("translation")
+        return True
+
     def on_translation_worker_progress(self, detail, current, total):
+        sender = self.sender()
+        job_id = getattr(sender, "_ysb_job_id", None)
+        if not self._is_active_translation_job(job_id):
+            return
         self.handle_long_task_message(str(detail), current=current, total=total)
 
-    def _apply_translation_results_to_current_page(self, res):
+    def _maker_prefer_split_positions(self, text, targets):
+        """Choose stable split positions near target character offsets."""
+        import re
+        s = str(text or "")
+        if not s:
+            return []
+        candidates = set()
+        # After natural sentence/quote boundaries.
+        for m in re.finditer(r"[」』\]\)）〉》〕】\"'.!?。！？…]+", s):
+            pos = int(m.end())
+            if 0 < pos < len(s):
+                candidates.add(pos)
+        # Before Korean quote-reporting tails such as "라고" when they follow a quote.
+        for m in re.finditer(r"(?<=[」』\"'])\s*(?=라고|라며|라 쓰|라 적|라고 쓰|라고 적)", s):
+            pos = int(m.start())
+            if 0 < pos < len(s):
+                candidates.add(pos)
+        # Whitespace boundaries are safe in Latin/Korean mixed text.
+        for m in re.finditer(r"\s+", s):
+            pos = int(m.end())
+            if 0 < pos < len(s):
+                candidates.add(pos)
+        out = []
+        last = 0
+        for target in targets:
+            target = max(last + 1, min(len(s) - 1, int(target)))
+            valid = [p for p in candidates if last < p < len(s) and p not in out]
+            if valid:
+                pos = min(valid, key=lambda p: (abs(p - target), p))
+            else:
+                pos = target
+            if pos <= last:
+                pos = min(len(s) - 1, last + 1)
+            out.append(pos)
+            last = pos
+        return out
+
+    def _maker_force_translation_line_count(self, translated_text, raw_text):
+        """Keep translated Maker text visually line-compatible with the source.
+
+        The prompt asks the model to keep the same line count, but local models can
+        still merge lines into a single natural Korean sentence.  RPG Maker lines
+        are restoration/display units, so when the count differs we do a minimal
+        deterministic split/join instead of leaving the row visually mismatched.
+        """
+        try:
+            translated = str(translated_text or "").replace("\r\n", "\n").replace("\r", "\n")
+            raw = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
+            info = analyze_maker_control_codes(raw)
+            plain = str(info.get("plain_text") or strip_maker_control_codes(raw) or raw).replace("\r\n", "\n").replace("\r", "\n")
+            src_lines = plain.split("\n")
+            if len(src_lines) <= 1:
+                return translated
+            dst_lines = translated.split("\n")
+            if len(dst_lines) == len(src_lines):
+                return translated
+            # Too many lines: preserve early lines and merge the surplus into the
+            # last visual source line.  This keeps the required line count.
+            if len(dst_lines) > len(src_lines):
+                head = dst_lines[:len(src_lines) - 1]
+                tail = " ".join(x.strip() for x in dst_lines[len(src_lines) - 1:] if str(x).strip())
+                return "\n".join(head + [tail])
+            # Too few lines, especially one merged sentence: split near source
+            # proportions but prefer punctuation/quote boundaries.
+            compact = " ".join(x.strip() for x in dst_lines if str(x).strip())
+            if not compact:
+                return translated
+            weights = [max(1, len(x.strip())) for x in src_lines]
+            total = float(sum(weights) or len(src_lines))
+            targets = []
+            acc = 0.0
+            for w in weights[:-1]:
+                acc += float(w)
+                targets.append(round(len(compact) * acc / total))
+            splits = self._maker_prefer_split_positions(compact, targets)
+            if not splits:
+                return translated
+            out = []
+            start = 0
+            for pos in splits:
+                out.append(compact[start:pos].strip())
+                start = pos
+            out.append(compact[start:].strip())
+            # Pad defensively if pathological input produced too few segments.
+            while len(out) < len(src_lines):
+                out.append("")
+            return "\n".join(out[:len(src_lines)])
+        except Exception:
+            return str(translated_text or "")
+
+    def _apply_translation_results_to_current_page(
+        self,
+        res,
+        *,
+        target_rows_override=None,
+        texts_override=None,
+        target_segments_override=None,
+        token_maps_override=None,
+        partial_chunk=False,
+    ):
         db_mode = bool(getattr(self, "_translation_database_mode", False))
+        speaker_mode = bool(getattr(self, "_translation_speaker_mode", False))
         if db_mode:
             try:
                 db_idx = int(getattr(self, "_translation_database_idx", getattr(self, "maker_database_idx", 0)) or 0)
@@ -7295,8 +9952,9 @@ class MainWindowOperationsMixin:
             curr = self.data.get(self.idx)
         if not curr or not curr.get('data'):
             return False
-        target_rows = list(getattr(self, "_translation_target_rows", []) or [])
-        texts = list(getattr(self, "_translation_target_texts", []) or [])
+        target_rows = list(target_rows_override if target_rows_override is not None else (getattr(self, "_translation_target_rows", []) or []))
+        texts = list(texts_override if texts_override is not None else (getattr(self, "_translation_target_texts", []) or []))
+        target_segments = list(target_segments_override if target_segments_override is not None else (getattr(self, "_translation_target_segments", []) or []))
         if len(res) != len(target_rows):
             QMessageBox.warning(
                 self,
@@ -7308,6 +9966,13 @@ class MainWindowOperationsMixin:
         affected_ids = []
         db_name_glossary_touched = False
         db_touched_page_indices = set()
+        control_code_auto_restore_skipped = 0
+        control_code_auto_stats = {
+            "applied": 0,
+            "applied_raw": 0,
+            "fallback_edge": 0,
+            "failed_plain": 0,
+        }
         # 번역 결과 반영은 분석/인페인팅과 같은 확정 작업 경계다.
         # 이전 편집 상태로 Ctrl+Z 되는 것을 막기 위해 별도 Undo 기록을 만들지 않는다.
         maker_mode = True if db_mode else self._is_maker_text_table_mode()
@@ -7317,29 +9982,72 @@ class MainWindowOperationsMixin:
         # column, and the later DB UI commit could overwrite self.data with the old
         # translation column value.  Always ask the table layout helper instead.
         trans_col = self._table_translation_column()
+        pending_translation_rows = []
         self.tab.blockSignals(True)
         try:
-            token_maps = list(getattr(self, "_translation_maker_token_maps", []) or [])
+            token_maps = list(token_maps_override if token_maps_override is not None else (getattr(self, "_translation_maker_token_maps", []) or []))
             for result_index, (row, t) in enumerate(zip(target_rows, res)):
-                data_index = row - 1
-                if db_mode:
+                seg = target_segments[result_index] if result_index < len(target_segments) else None
+                if isinstance(seg, dict):
                     try:
-                        id_item = self.tab.item(row, 0)
-                        v = id_item.data(Qt.ItemDataRole.UserRole) if id_item is not None else None
-                        if v is not None:
-                            data_index = int(v)
+                        row = int(seg.get("row", row))
+                        data_index = int(seg.get("data_index", row - 1))
                     except Exception:
-                        data_index = row - 1
+                        data_index = self._maker_data_index_for_table_row(row, db_mode=db_mode)
+                else:
+                    data_index = self._maker_data_index_for_table_row(row, db_mode=db_mode)
                 if data_index < 0 or data_index >= len(curr['data']):
                     continue
                 safe_text = str(t) if t is not None else ""
                 if maker_mode:
                     token_map = token_maps[result_index] if result_index < len(token_maps) else []
-                    safe_text = restore_maker_translation_text(safe_text, token_map)
-                    if db_mode:
-                        safe_text = normalize_maker_database_translation_result(safe_text, curr['data'][data_index].get('text', ''))
+                    raw_for_restore = str(seg.get("source_text") or "") if isinstance(seg, dict) else str(curr['data'][data_index].get('text', ''))
+                    has_auto_spec = bool(token_map)
+                    if has_auto_spec:
+                        safe_text, control_status, _control_detail = restore_maker_translation_text_checked(
+                            safe_text,
+                            token_map,
+                            raw_for_restore,
+                        )
+                        if control_status in control_code_auto_stats:
+                            control_code_auto_stats[control_status] += 1
+                        curr['data'][data_index]['maker_control_code_auto_status'] = control_status
+                        if control_status == "failed_plain":
+                            # 토큰이 누락되거나 순서가 바뀌면 잘못된 코드를 억지로
+                            # 붙이지 않는다. 순수 번역문의 물리 줄 수만 안전하게 맞춘다.
+                            try:
+                                safe_text = self._maker_force_translation_line_count(safe_text, raw_for_restore)
+                            except Exception:
+                                pass
+                    else:
+                        safe_text = restore_maker_translation_text(safe_text, token_map)
+                        curr['data'][data_index].pop('maker_control_code_auto_status', None)
+                        try:
+                            safe_text = self._maker_force_translation_line_count(safe_text, raw_for_restore)
+                        except Exception:
+                            pass
+                        # 자동 반영 OFF에서는 기존처럼 순수 번역문을 유지하고
+                        # [현재 맵 복원] / [일괄 맵 복원]을 수동 후처리로 사용한다.
+                        try:
+                            info_for_restore = analyze_maker_control_codes(raw_for_restore)
+                            if isinstance(info_for_restore, dict) and info_for_restore.get("has_control_codes"):
+                                control_code_auto_restore_skipped += 1
+                        except Exception:
+                            pass
+                    if db_mode and not speaker_mode:
+                        safe_text = normalize_maker_database_translation_result(safe_text, raw_for_restore)
                 old_translated_text = str(curr['data'][data_index].get('translated_text') or '')
+                if isinstance(seg, dict):
+                    try:
+                        base_text = old_translated_text if old_translated_text else str(curr['data'][data_index].get('text') or '')
+                        safe_text = self._replace_lines_in_text(base_text, seg.get("line_start", 0), seg.get("line_end", 0), safe_text)
+                    except Exception:
+                        pass
                 curr['data'][data_index]['translated_text'] = safe_text
+                if safe_text.strip():
+                    curr['data'][data_index]['maker_translation_origin'] = "api_translation"
+                else:
+                    curr['data'][data_index].pop('maker_translation_origin', None)
                 if db_mode:
                     try:
                         db_touched_page_indices.add(int(getattr(self, "_translation_database_idx", getattr(self, "maker_database_idx", 0)) or 0))
@@ -7353,21 +10061,104 @@ class MainWindowOperationsMixin:
                 if maker_mode:
                     curr['data'][data_index]['maker_status'] = self.tr_ui("번역완료") if safe_text.strip() else self.tr_ui("미번역")
                 affected_ids.append(curr['data'][data_index].get('id'))
-                table_item = QTableWidgetItem(safe_text)
-                table_item.setData(Qt.ItemDataRole.UserRole, safe_text)
-                self.tab.setItem(row, trans_col, table_item)
-                if maker_mode:
+                pending_translation_rows.append(int(row))
+                if db_mode:
+                    table_item = QTableWidgetItem(safe_text)
+                    table_item.setData(Qt.ItemDataRole.UserRole, safe_text)
+                    self.tab.setItem(row, trans_col, table_item)
                     status_item = QTableWidgetItem(curr['data'][data_index].get('maker_status', ''))
                     status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     status_item.setData(Qt.ItemDataRole.UserRole, status_item.text())
                     self.tab.setItem(row, 1, status_item)
-                    try:
-                        self.set_table_row_visual(row, True)
-                    except Exception:
-                        pass
-            self.paint_all_row_header()
+            if db_mode:
+                self.paint_all_row_header()
+            if control_code_auto_restore_skipped:
+                self._audit_translate_event(
+                    "TRANSLATE_CONTROL_CODE_AUTO_RESTORE_SKIPPED",
+                    count=int(control_code_auto_restore_skipped),
+                    reason="manual_restore_button_required",
+                )
+            if any(control_code_auto_stats.values()):
+                self._audit_translate_event(
+                    "TRANSLATE_CONTROL_CODE_AUTO_APPLY",
+                    **{key: int(value) for key, value in control_code_auto_stats.items()},
+                )
+                if control_code_auto_stats["failed_plain"]:
+                    self.log(
+                        self.tr_ui(
+                            "⚠️ 제어코드 자동 반영에 실패한 {count}개 대사는 안전을 위해 순수 번역문으로 유지했습니다."
+                        ).format(count=int(control_code_auto_stats["failed_plain"]))
+                    )
+                if control_code_auto_stats["fallback_edge"]:
+                    self.log(
+                        self.tr_ui(
+                            "ℹ️ AI 토큰 검증에 실패한 {count}개 대사는 안전한 앞/뒤 제어코드만 자동 복원했습니다."
+                        ).format(count=int(control_code_auto_stats["fallback_edge"]))
+                    )
         finally:
             self.tab.blockSignals(False)
+
+        if partial_chunk:
+            try:
+                state = getattr(self, "_chunked_translation_apply_state", None)
+                if not isinstance(state, dict):
+                    state = {
+                        "affected_ids": set(),
+                        "pending_rows": set(),
+                        "db_pages": set(),
+                        "db_name_glossary_touched": False,
+                        "maker_mode": bool(maker_mode),
+                        "db_mode": bool(db_mode),
+                        "speaker_mode": bool(speaker_mode),
+                    }
+                    self._chunked_translation_apply_state = state
+                state.setdefault("affected_ids", set()).update(x for x in affected_ids if x is not None)
+                state.setdefault("pending_rows", set()).update(int(x) for x in pending_translation_rows)
+                state.setdefault("db_pages", set()).update(int(x) for x in db_touched_page_indices)
+                state["db_name_glossary_touched"] = bool(state.get("db_name_glossary_touched")) or bool(db_name_glossary_touched)
+                state["maker_mode"] = bool(maker_mode)
+                state["db_mode"] = bool(db_mode)
+                state["speaker_mode"] = bool(speaker_mode)
+                state.setdefault("session_kind", "standard")
+            except Exception:
+                pass
+
+            try:
+                self.has_unsaved_changes = True
+                self.update_window_title()
+            except Exception:
+                pass
+            try:
+                session_kind = str((getattr(self, "_chunked_translation_apply_state", None) or {}).get("session_kind") or "standard")
+                reason_prefix = "gemini_delayed" if session_kind == "gemini_delayed" else "translation_stream"
+                if maker_mode and not db_mode:
+                    page_idx = int(getattr(self, "idx", 0) or 0)
+                    self.mark_maker_writeback_dirty(page_indices=[page_idx], reason=f"{reason_prefix}_chunk_applied")
+                    self._mark_maker_table_rows_pending_refresh(
+                        pending_translation_rows,
+                        page_idx=page_idx,
+                        db_mode=False,
+                        reason=f"{reason_prefix}_chunk_applied",
+                    )
+                elif db_mode:
+                    pages = sorted(int(x) for x in db_touched_page_indices) if db_touched_page_indices else [int(getattr(self, "_translation_database_idx", getattr(self, "maker_database_idx", 0)) or 0)]
+                    if speaker_mode:
+                        self.apply_maker_speaker_layer_to_dialogues(pages[0], reason=f"{reason_prefix}_speaker_chunk_applied")
+                    else:
+                        self.mark_maker_writeback_dirty(page_indices=pages, reason=f"{reason_prefix}_database_chunk_applied")
+                    for row in pending_translation_rows:
+                        self.tab.resizeRowToContents(int(row))
+            except Exception:
+                pass
+            try:
+                page_idx = int(getattr(self, "_translation_database_idx", getattr(self, "idx", 0)) or 0) if db_mode else int(getattr(self, "idx", 0) or 0)
+                if hasattr(self, "text_engine") and self.text_engine is not None:
+                    self.text_engine.mark_dirty(page_idx, affected_ids, ["translated_text"])
+                self.mark_active_page_dirty("text")
+                self.schedule_deferred_auto_save_project(1200)
+            except Exception:
+                pass
+            return True
 
         try:
             if maker_mode:
@@ -7381,7 +10172,7 @@ class MainWindowOperationsMixin:
                         show_message=False,
                         auto=True,
                         page_indices=auto_unify_pages,
-                        page_label="데이터베이스",
+                        page_label="화자" if speaker_mode else "데이터베이스",
                     )
                 else:
                     changed_unified = self.apply_unified_translation_memory(scope="all", show_message=False, auto=True)
@@ -7392,20 +10183,28 @@ class MainWindowOperationsMixin:
 
         try:
             if maker_mode and not db_mode:
-                self._apply_maker_live_writeback_now(page_indices=[int(getattr(self, "idx", 0) or 0)], reason="translation_finished", log_result=False)
+                self.mark_maker_writeback_dirty(page_indices=[int(getattr(self, "idx", 0) or 0)], reason="translation_finished")
         except Exception:
             pass
 
-        # 번역 결과도 현재 페이지 텍스트 데이터만 바뀌는 작업이다.
-        # 최종결과 탭 전체 mode_chg 대신 해당 텍스트만 갱신한다.
-        try:
-            for row in target_rows:
-                self.tab.resizeRowToContents(row)
-        except Exception:
-            self.tab.resizeRowsToContents()
-        if (not db_mode) and self.cb_mode.currentIndex() == 4:
-            if not self.refresh_final_text_items_by_ids(affected_ids):
-                self.schedule_final_text_scene_refresh(80)
+        # 맵 번역 결과는 데이터만 반영한다. 표 셀과 자동 행 높이는
+        # 각 행을 단일 클릭했을 때 한 행씩 최신화한다.
+        if maker_mode and not db_mode:
+            try:
+                self._mark_maker_table_rows_pending_refresh(
+                    pending_translation_rows,
+                    page_idx=int(getattr(self, "idx", 0) or 0),
+                    db_mode=False,
+                    reason="translation_finished",
+                )
+            except Exception:
+                pass
+        elif db_mode:
+            try:
+                for row in pending_translation_rows:
+                    self.tab.resizeRowToContents(int(row))
+            except Exception:
+                pass
         try:
             if db_mode:
                 try:
@@ -7413,33 +10212,30 @@ class MainWindowOperationsMixin:
                 except Exception:
                     pass
                 pages = sorted(int(x) for x in db_touched_page_indices) if db_touched_page_indices else [int(getattr(self, "_translation_database_idx", getattr(self, "maker_database_idx", 0)) or 0)]
-                try:
-                    self.apply_maker_writeback_to_clone(mark_dirty=False, log_result=False, backup=False, page_indices=pages)
-                except Exception as e:
+                if speaker_mode:
                     try:
-                        self.log(f"⚠️ DB 번역 결과 JSON 실시간 반영 실패: {e}")
+                        self.apply_maker_speaker_layer_to_dialogues(pages[0], reason="speaker translation finished")
                     except Exception:
                         pass
-                if db_name_glossary_touched:
+                else:
+                    try:
+                        self.mark_maker_writeback_dirty(page_indices=pages, reason="database_translation_finished")
+                    except Exception as e:
+                        try:
+                            self.log(f"⚠️ DB 번역 결과 JSON 반영 대기 처리 실패: {e}")
+                        except Exception:
+                            pass
+                if db_name_glossary_touched and not speaker_mode:
                     try:
                         self.refresh_maker_database_auto_glossary_after_name_change(show_log=True, reason="db_translation_result")
                     except Exception:
                         pass
                 try:
-                    actor_sync_changed = self._apply_maker_actor_name_master_to_speakers(refresh=False, write_cache=False)
-                    if actor_sync_changed:
-                        try:
-                            self.log(f"👤 Actors DB 이름 번역 동기화: {actor_sync_changed}개 화자 갱신")
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                try:
                     self._finalize_maker_database_page_change(
                         pages[0] if pages else getattr(self, "_translation_database_idx", getattr(self, "maker_database_idx", 0)),
                         changed_ids=affected_ids,
                         fields=["translated_text"],
-                        reason="db_translation_result",
+                        reason="speaker_translation_result" if speaker_mode else "db_translation_result",
                         refresh_preview=False,
                         writeback=False,
                         glossary_touched=False,
@@ -7457,7 +10253,7 @@ class MainWindowOperationsMixin:
                 except Exception:
                     pass
                 return True
-            self.finalize_text_change(ids=affected_ids, fields=['translated_text'], reason='번역 결과 반영', delay_ms=1800)
+            self.finalize_maker_text_data_change(affected_ids, fields=['translated_text'], page_idx=int(getattr(self, 'idx', 0) or 0), reason='번역 결과 반영')
         except Exception:
             try:
                 if hasattr(self, 'text_engine') and self.text_engine is not None:
@@ -7469,9 +10265,70 @@ class MainWindowOperationsMixin:
         self.undo_break_boundary("translation")
         return True
 
-    def on_translation_worker_finished(self, res):
+    def on_translation_worker_chunk_ready(self, start, res):
+        """Apply exactly one normal-translation chunk, then release the worker."""
+        sender = self.sender()
+        job_id = getattr(sender, "_ysb_job_id", None)
+        if not self._is_active_translation_job(job_id):
+            try:
+                sender.mark_chunk_applied(start, False, self.tr_ui("취소된 번역 작업입니다."))
+            except Exception:
+                pass
+            return
+
+        ok = False
+        error = ""
         try:
-            if self._apply_translation_results_to_current_page(list(res or [])):
+            start = max(0, int(start or 0))
+            results = res if isinstance(res, list) else list(res or [])
+            end = start + len(results)
+            target_rows = (getattr(self, "_translation_target_rows", []) or [])[start:end]
+            source_texts = (getattr(self, "_translation_target_texts", []) or [])[start:end]
+            target_segments = (getattr(self, "_translation_target_segments", []) or [])[start:end]
+            token_maps = (getattr(self, "_translation_maker_token_maps", []) or [])[start:end]
+            ok = bool(
+                self._apply_translation_results_to_current_page(
+                    results,
+                    target_rows_override=target_rows,
+                    texts_override=source_texts,
+                    target_segments_override=target_segments,
+                    token_maps_override=token_maps,
+                    partial_chunk=True,
+                )
+            )
+            if not ok:
+                error = self.tr_ui("번역 청크 결과를 프로젝트에 적용하지 못했습니다.")
+        except Exception as exc:
+            error = str(exc)
+            ok = False
+        finally:
+            try:
+                sender.mark_chunk_applied(start, ok, error)
+            except Exception:
+                pass
+
+    def on_translation_worker_finished(self, res):
+        sender = self.sender()
+        job_id = getattr(sender, "_ysb_job_id", None)
+        if not self._is_active_translation_job(job_id):
+            try:
+                self.log("🗑️ 취소된 번역 응답 폐기: 결과를 반영하지 않았습니다.")
+            except Exception:
+                pass
+            if sender is getattr(self, "translation_worker", None):
+                self._active_task_worker = None
+                self.translation_worker = None
+            return
+        try:
+            if isinstance(res, dict) and res.get("streamed"):
+                self._finalize_chunked_translation_session()
+                self.log(
+                    self.tr_ui("✅ 번역 완료: {applied}개 항목을 청크 순서대로 반영했습니다.").format(
+                        applied=int(res.get("applied", 0) or 0)
+                    )
+                )
+            elif self._apply_translation_results_to_current_page(list(res or [])):
+                # Backward-compatible fallback for an older worker object.
                 self.log("✅ 번역 완료")
         except Exception as e:
             import traceback
@@ -7481,30 +10338,58 @@ class MainWindowOperationsMixin:
         finally:
             self._active_task_worker = None
             self.translation_worker = None
-            self._translation_maker_token_maps = []
-            self._translation_maker_contexts = None
+            self._clear_translation_runtime_state()
+            self._active_translation_job_id = None
+            self._active_long_task_kind = ""
             self.end_busy_state("번역")
             self.macro_mark_current_step_done("work_translate")
 
     def on_translation_worker_canceled(self, partial):
+        sender = self.sender()
+        job_id = getattr(sender, "_ysb_job_id", None)
+        if not self._is_active_translation_job(job_id):
+            if sender is getattr(self, "translation_worker", None):
+                self._active_task_worker = None
+                self.translation_worker = None
+            return
         try:
-            self.log(f"⏹️ 번역 취소됨: 받은 결과 {len(partial or [])}개는 반영하지 않았습니다.")
+            self._finalize_chunked_translation_session()
+            applied = int((partial or {}).get("applied", 0) or 0) if isinstance(partial, dict) else 0
+            self.log(
+                self.tr_ui("⏹️ 번역 취소됨: 이미 반영된 {applied}개 결과는 유지하고 이후 청크는 중단했습니다.").format(
+                    applied=applied
+                )
+            )
         finally:
             self._active_task_worker = None
             self.translation_worker = None
-            self._translation_maker_token_maps = []
-            self._translation_maker_contexts = None
+            self._clear_translation_runtime_state()
+            self._active_translation_job_id = None
+            self._active_long_task_kind = ""
             self.end_busy_state("번역")
 
     def on_translation_worker_error(self, message):
+        sender = self.sender()
+        job_id = getattr(sender, "_ysb_job_id", None)
+        if not self._is_active_translation_job(job_id):
+            try:
+                self.log("🗑️ 취소된 번역 오류 응답 폐기")
+            except Exception:
+                pass
+            if sender is getattr(self, "translation_worker", None):
+                self._active_task_worker = None
+                self.translation_worker = None
+            return
         try:
             msg = f"❌ 번역 중 에러 발생: {message}"
             self.handle_long_task_message(msg)
+            self._finalize_chunked_translation_session()
         finally:
             self._active_task_worker = None
             self.translation_worker = None
-            self._translation_maker_token_maps = []
-            self._translation_maker_contexts = None
+            self._clear_translation_runtime_state()
+            self._active_translation_job_id = None
+            self._active_long_task_kind = ""
             self.end_busy_state("번역")
 
     def clip_mask_to_checked_text_boxes(self, mask, data):
@@ -8330,11 +11215,9 @@ class MainWindowOperationsMixin:
             self._suppress_mode_undo = old_suppress
 
     def on_table_item_changed(self, item):
-        try:
-            self.tab.resizeRowToContents(item.row())
-        except Exception:
-            pass
-        if hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode():
+        # 쯔꾸르붕이 표 편집은 텍스트 값만 바꾸는 작업이다.
+        # 셀 수정마다 행 높이를 다시 계산하면 긴 대사/델리게이트 때문에 체감 렉이 커진다.
+        if hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode():
             try:
                 row = int(item.row()); col = int(item.column())
                 # DB 표는 ID/상태/화자/타입/이벤트/원문/번역문/메모 = 0..7 구조다.
@@ -8385,6 +11268,10 @@ class MainWindowOperationsMixin:
                     elif key == "translated_text":
                         status_text = self.tr_ui("번역완료") if str(new_text or "").strip() else self.tr_ui("미번역")
                         row_data["maker_status"] = status_text
+                        if str(new_text or "").strip():
+                            row_data["maker_translation_origin"] = "manual_edit"
+                        else:
+                            row_data.pop("maker_translation_origin", None)
                         try:
                             status_item = self.tab.item(row, 1)
                             if status_item is not None:
@@ -8414,7 +11301,7 @@ class MainWindowOperationsMixin:
                             changed_ids=[row_data.get("id")],
                             fields=[key],
                             reason="table_edit",
-                            refresh_preview=True,
+                            refresh_preview=False,
                             writeback=key in ("text", "translated_text", "maker_speaker"),
                             glossary_touched=glossary_touched,
                             show_glossary_log=False,
@@ -8424,17 +11311,13 @@ class MainWindowOperationsMixin:
                             self.has_unsaved_changes = True
                             self.mark_project_structure_dirty("maker_database_page_edit")
                             if key in ("text", "translated_text", "maker_speaker"):
-                                self.apply_maker_writeback_to_clone(mark_dirty=False, log_result=False, backup=False, page_indices=[idx])
+                                self.mark_maker_writeback_dirty(page_indices=[idx], reason="maker_database_table_edit")
                             if glossary_touched:
                                 self.refresh_maker_database_auto_glossary_after_name_change(show_log=False, reason="table_edit")
-                            self.refresh_maker_database_preview_from_selection()
                         except Exception:
                             pass
                 elif isinstance(row_data, dict):
-                    try:
-                        self.refresh_maker_database_preview_from_selection()
-                    except Exception:
-                        pass
+                    pass
             except Exception:
                 pass
             return
@@ -8522,26 +11405,55 @@ class MainWindowOperationsMixin:
                     if key == 'translated_text':
                         try:
                             if maker_mode:
+                                if new_text.strip():
+                                    curr_data['data'][data_index]['maker_translation_origin'] = "manual_edit"
+                                else:
+                                    curr_data['data'][data_index].pop('maker_translation_origin', None)
+                                # 번역문 유무와 상태/상단 요약은 1대1로 즉시 움직여야 한다.
+                                # 기존에는 현재 상태가 미번역일 때만 상태 셀을 바꿔서,
+                                # 번역문을 지우거나 다시 채울 때 ALL 헤더 카운트가 stale로 남았다.
+                                status_text = self.tr_ui("번역완료") if new_text.strip() else self.tr_ui("미번역")
+                                curr_data['data'][data_index]['maker_status'] = status_text
                                 status_col = self.tab.item(row, 1)
-                                if status_col is not None and str(status_col.text() or "").strip() in (self.tr_ui("미번역"), "Untranslated", ""):
-                                    status_text = self.tr_ui("번역완료") if new_text.strip() else self.tr_ui("미번역")
-                                    old_block = self.tab.blockSignals(True)
-                                    try:
+                                old_block = self.tab.blockSignals(True)
+                                try:
+                                    if status_col is None:
+                                        status_col = self._make_table_item(status_text, editable=True, center=True)
+                                        self.tab.setItem(row, 1, status_col)
+                                    else:
                                         status_col.setText(status_text)
                                         status_col.setData(Qt.ItemDataRole.UserRole, status_text)
-                                    finally:
-                                        self.tab.blockSignals(old_block)
-                                    curr_data['data'][data_index]['maker_status'] = status_text
+                                finally:
+                                    self.tab.blockSignals(old_block)
+                                try:
+                                    self.refresh_maker_translation_summary_header()
+                                except Exception:
+                                    pass
                             else:
                                 self.shrink_text_rect_to_content(curr_data['data'][data_index])
                         except Exception:
                             pass
                     try:
-                        if maker_mode and key == 'translated_text':
-                            self._apply_maker_live_writeback_now(page_indices=[int(getattr(self, 'idx', 0) or 0)], reason='manual_translation_edit', log_result=False)
+                        if maker_mode:
+                            self.append_maker_recovery_event({
+                                "type": "edit_cell",
+                                "row": int(row),
+                                "data_index": int(data_index),
+                                "key": str(key),
+                                "old": str(old_text),
+                                "new": str(new_text),
+                                "text_id": target_id,
+                            })
                     except Exception:
                         pass
-                    if self.cb_mode.currentIndex() == 4:
+                    try:
+                        if maker_mode and key in ('translated_text', 'maker_speaker', 'maker_memo', 'maker_status'):
+                            # 수정 중에는 게임 JSON을 쓰지 않는다. Ctrl+S / 프로젝트 저장 때만
+                            # project.json과 작업용 게임 JSON을 함께 저장한다.
+                            self.mark_maker_writeback_dirty(page_indices=[int(getattr(self, 'idx', 0) or 0)], reason='manual_table_edit')
+                    except Exception:
+                        pass
+                    if (not maker_mode) and self.cb_mode.currentIndex() == 4:
                         try:
                             if target_id is not None:
                                 if not self.refresh_final_text_items_by_ids([target_id]):
@@ -8551,7 +11463,7 @@ class MainWindowOperationsMixin:
                         except Exception:
                             self.schedule_final_text_scene_refresh(60)
                     try:
-                        self.finalize_text_change(ids=[target_id], fields=[key], reason='표 텍스트 수정', delay_ms=1800)
+                        self.finalize_maker_text_data_change([target_id], fields=[key], page_idx=int(getattr(self, 'idx', 0) or 0), reason='표 텍스트 수정')
                     except Exception:
                         try:
                             if hasattr(self, 'text_engine') and self.text_engine is not None:
@@ -8560,11 +11472,6 @@ class MainWindowOperationsMixin:
                             self.schedule_deferred_auto_save_project(1800)
                         except Exception:
                             pass
-                    try:
-                        if hasattr(self, 'update_maker_preview_selection_from_table') and self._is_current_maker_page():
-                            self.update_maker_preview_selection_from_table()
-                    except Exception:
-                        pass
             return
 
         if col != 1:
@@ -10872,12 +13779,14 @@ class MainWindowOperationsMixin:
         try:
             db_select_mode = (
                 str(mode or "") in {"translate", "unify_translations"}
-                and hasattr(self, "is_maker_database_mode")
-                and bool(self.is_maker_database_mode())
+                and hasattr(self, "is_maker_special_table_mode")
+                and bool(self.is_maker_special_table_mode())
             )
         except Exception:
             db_select_mode = False
         if db_select_mode:
+            plugin_select_mode = bool(hasattr(self, "is_maker_plugin_mode") and self.is_maker_plugin_mode())
+            speaker_select_mode = bool(hasattr(self, "is_maker_speaker_mode") and self.is_maker_speaker_mode())
             try:
                 visible_indices = list(self.current_tab_page_indices() or []) if hasattr(self, "current_tab_page_indices") else []
             except Exception:
@@ -10889,11 +13798,24 @@ class MainWindowOperationsMixin:
                     visible_indices = []
             visible_indices = [int(x) for x in visible_indices if 0 <= int(x) < len(self.paths)]
             total_pages = len(visible_indices)
-            item_word = self.tr_ui("DB 페이지")
-            all_label_text = self.tr_ui("전체 DB 페이지")
-            selected_label_text = self.tr_ui("DB 페이지 선택")
-            desc_text = self.tr_ui("작업할 DB 페이지 범위를 선택하세요.")
-            note_text = self.tr_ui("쉼표와 범위를 섞어서 입력할 수 있습니다. 번호는 현재 DB 탭 순서 기준입니다.")
+            if plugin_select_mode:
+                item_word = self.tr_ui("플러그인 페이지")
+                all_label_text = self.tr_ui("전체 플러그인 페이지")
+                selected_label_text = self.tr_ui("플러그인 페이지 선택")
+                desc_text = self.tr_ui("작업할 플러그인 페이지 범위를 선택하세요.")
+                note_text = self.tr_ui("쉼표와 범위를 섞어서 입력할 수 있습니다. 번호는 현재 플러그인 탭 순서 기준입니다.")
+            elif speaker_select_mode:
+                item_word = self.tr_ui("화자 페이지")
+                all_label_text = self.tr_ui("전체 화자 페이지")
+                selected_label_text = self.tr_ui("화자 페이지 선택")
+                desc_text = self.tr_ui("작업할 화자 페이지 범위를 선택하세요.")
+                note_text = self.tr_ui("쉼표와 범위를 섞어서 입력할 수 있습니다. 번호는 현재 화자 탭 순서 기준입니다.")
+            else:
+                item_word = self.tr_ui("DB 페이지")
+                all_label_text = self.tr_ui("전체 DB 페이지")
+                selected_label_text = self.tr_ui("DB 페이지 선택")
+                desc_text = self.tr_ui("작업할 DB 페이지 범위를 선택하세요.")
+                note_text = self.tr_ui("쉼표와 범위를 섞어서 입력할 수 있습니다. 번호는 현재 DB 탭 순서 기준입니다.")
             placeholder_text = self.tr_ui("예: 1-3, 1~3, 1,2,3")
         else:
             visible_indices = list(range(len(self.paths)))
@@ -11059,7 +13981,7 @@ class MainWindowOperationsMixin:
         selected_page_label = self.tr_ui("전체 맵")
         maker_db_batch = False
         try:
-            maker_db_batch = bool(mode == "translate" and hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode())
+            maker_db_batch = bool(mode == "translate" and hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode())
         except Exception:
             maker_db_batch = False
         if mode in ("analyze", "reanalyze", "translate", "inpaint", "export", "refresh"):
@@ -11068,7 +13990,15 @@ class MainWindowOperationsMixin:
                 self.log(f"↩️ {title} 취소")
                 return
             if mode == "translate" and maker_db_batch and not selected_page_indices:
-                self.show_warn_notice("일괄 번역", "데이터베이스 모드에서 번역할 DB 페이지가 없습니다.")
+                plugin_mode = bool(hasattr(self, "is_maker_plugin_mode") and self.is_maker_plugin_mode())
+                speaker_mode = bool(hasattr(self, "is_maker_speaker_mode") and self.is_maker_speaker_mode())
+                if plugin_mode:
+                    empty_message = "플러그인 번역 모드에서 번역할 플러그인 페이지가 없습니다."
+                elif speaker_mode:
+                    empty_message = "화자 번역 모드에서 번역할 화자 페이지가 없습니다."
+                else:
+                    empty_message = "데이터베이스 모드에서 번역할 DB 페이지가 없습니다."
+                self.show_warn_notice("일괄 번역", empty_message)
                 return
             if mode == "analyze":
                 analyze_ctx = self.macro_batch_preflight_context_for_mode(mode) if hasattr(self, "macro_batch_preflight_context_for_mode") else {}
@@ -11157,14 +14087,101 @@ class MainWindowOperationsMixin:
             return
         self.start_universal_batch_worker(mode, selected_page_indices)
 
+    def _start_batch_job(self, mode=""):
+        job_id = uuid.uuid4().hex
+        self._active_batch_job_id = job_id
+        self._active_batch_mode = str(mode or "")
+        try:
+            canceled = getattr(self, "_canceled_batch_job_ids", None)
+            if not isinstance(canceled, set):
+                canceled = set()
+            self._canceled_batch_job_ids = canceled
+        except Exception:
+            self._canceled_batch_job_ids = set()
+        return job_id
+
+    def _is_active_batch_job(self, job_id):
+        if not job_id:
+            return True
+        # 취소된 현재 batch도 finished_all은 UI 정리를 위해 받아야 한다.
+        # 따라서 여기서는 "현재 batch id와 같은가"만 본다.  취소 여부에
+        # 따른 payload 폐기는 on_batch_item_finished의 cancel guard가 맡고,
+        # 새 batch가 시작된 뒤 늦게 도착한 이전 신호만 여기서 차단한다.
+        return str(getattr(self, "_active_batch_job_id", "") or "") == str(job_id)
+
+    def _cancel_active_batch_job(self, reason="user_cancel"):
+        job_id = str(getattr(self, "_active_batch_job_id", "") or "")
+        if job_id:
+            try:
+                canceled = getattr(self, "_canceled_batch_job_ids", None)
+                if not isinstance(canceled, set):
+                    canceled = set()
+                canceled.add(job_id)
+                self._canceled_batch_job_ids = canceled
+            except Exception:
+                pass
+        try:
+            worker = getattr(self, "bw", None)
+            if worker is not None and hasattr(worker, "stop"):
+                worker.stop()
+        except Exception:
+            pass
+        try:
+            append_log(getattr(getattr(self, "bw", None), "batch_log_path", None), "UI BATCH JOB CANCELED", job_id=job_id, reason=str(reason or ""), memory=memory_text())
+        except Exception:
+            pass
+
+    def _handle_batch_progress_for_job(self, job_id, msg):
+        if not self._is_active_batch_job(job_id):
+            return
+        self.handle_long_task_message(msg)
+
+    def _on_batch_item_started_for_job(self, job_id, i, mode=None):
+        if not self._is_active_batch_job(job_id):
+            try:
+                append_log(getattr(getattr(self, "bw", None), "batch_log_path", None), "STALE BATCH ITEM START IGNORED", job_id=str(job_id or ""), index=i, mode=mode, memory=memory_text())
+            except Exception:
+                pass
+            return
+        return self.on_batch_item_started(i, mode)
+
+    def _on_batch_item_finished_for_job(self, job_id, i, payload=None):
+        if not self._is_active_batch_job(job_id):
+            try:
+                append_log(getattr(getattr(self, "bw", None), "batch_log_path", None), "STALE BATCH ITEM FINISH IGNORED", job_id=str(job_id or ""), index=i, memory=memory_text())
+            except Exception:
+                pass
+            try:
+                sender = self.sender()
+                if sender is not None and hasattr(sender, "mark_item_applied"):
+                    sender.mark_item_applied(i)
+            except Exception:
+                pass
+            return
+        return self.on_batch_item_finished(i, payload)
+
+    def _on_batch_finished_for_job(self, job_id, mode):
+        if not self._is_active_batch_job(job_id):
+            try:
+                append_log(getattr(getattr(self, "bw", None), "batch_log_path", None), "STALE BATCH FINISH IGNORED", job_id=str(job_id or ""), mode=mode, memory=memory_text())
+            except Exception:
+                pass
+            return
+        return self.on_batch_finished(mode)
+
     def start_universal_batch_worker(self, mode, selected_page_indices):
+        batch_job_id = self._start_batch_job(mode)
         self.bw = UniversalBatchWorker(self, mode, page_indices=selected_page_indices)
+        try:
+            self.bw._ysb_batch_job_id = batch_job_id
+        except Exception:
+            pass
         self._active_task_worker = self.bw
-        self.bw.progress.connect(lambda msg: self.handle_long_task_message(msg))
+        self.bw.progress.connect(lambda msg, job_id=batch_job_id: self._handle_batch_progress_for_job(job_id, msg))
         if hasattr(self.bw, "active_item"):
-            self.bw.active_item.connect(self.on_batch_item_started)
-        self.bw.finished_item.connect(self.on_batch_item_finished)
-        self.bw.finished_all.connect(lambda m=mode: self.on_batch_finished(m))
+            self.bw.active_item.connect(lambda i, m, job_id=batch_job_id: self._on_batch_item_started_for_job(job_id, i, m))
+        self.bw.finished_item.connect(lambda i, payload, job_id=batch_job_id: self._on_batch_item_finished_for_job(job_id, i, payload))
+        self.bw.finished_all.connect(lambda job_id=batch_job_id, m=mode: self._on_batch_finished_for_job(job_id, m))
         self.bw.start()
 
     def batch_visual_mode_for(self, mode):
@@ -11361,6 +14378,26 @@ class MainWindowOperationsMixin:
         except Exception:
             payload_status = "done"
             payload_message = ""
+        # 취소 확인 후 현재 맵의 API 응답이 늦게 돌아온 경우에는 UI/data에 반영하지 않는다.
+        # 이미 이 함수에서 처리 완료되어 _batch_result.done에 기록된 이전 맵만 유지한다.
+        try:
+            if (
+                str(getattr(self, "current_batch_mode", "") or "") == "translate"
+                and bool(getattr(self, "_long_task_cancel_requested", False))
+            ):
+                try:
+                    self.log(f"🗑️ 취소된 일괄 번역 응답 폐기: {self.batch_page_display_label(i)}")
+                except Exception:
+                    pass
+                try:
+                    if hasattr(getattr(self, "bw", None), "mark_item_applied"):
+                        self.bw.mark_item_applied(i)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
         # workers.py가 payload를 넘기는 새 구조와, main.data를 직접 갱신하는 구 구조를 모두 지원한다.
         # 일괄 중에는 self.load()를 호출하지 않는다. 화면에 남은 마스크가 다른 페이지에 저장될 수 있기 때문.
         if i < 0 or i >= len(self.paths):
@@ -11674,7 +14711,7 @@ class MainWindowOperationsMixin:
                 return_idx = int(getattr(self, "_batch_return_page_idx", self.idx) or 0)
             except Exception:
                 return_idx = self.idx
-            db_batch_finish = bool(mode == "translate" and getattr(self, "_maker_database_batch_translate_active", False) and hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode())
+            db_batch_finish = bool(mode == "translate" and getattr(self, "_maker_database_batch_translate_active", False) and hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode())
             if db_batch_finish:
                 try:
                     db_return_idx = int(getattr(self, "_batch_return_database_idx", getattr(self, "maker_database_idx", return_idx)) or getattr(self, "maker_database_idx", return_idx))
@@ -11715,16 +14752,8 @@ class MainWindowOperationsMixin:
 
         if mode == "translate" and bool(getattr(self, "_maker_database_batch_translate_active", False)):
             try:
-                self.refresh_maker_database_auto_glossary(show_log=True)
-                try:
-                    actor_sync_changed = self._apply_maker_actor_name_master_to_speakers(refresh=True, write_cache=True)
-                    if actor_sync_changed:
-                        self.log(f"👤 Actors DB 이름 번역 동기화: {actor_sync_changed}개 화자 갱신")
-                except Exception as e:
-                    try:
-                        self.log(f"⚠️ Actors DB 이름 번역 동기화 실패: {e}")
-                    except Exception:
-                        pass
+                if hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode():
+                    self.refresh_maker_database_auto_glossary(show_log=True)
             finally:
                 self._maker_database_batch_translate_active = False
 
@@ -11742,6 +14771,10 @@ class MainWindowOperationsMixin:
         append_log(getattr(getattr(self, "bw", None), "batch_log_path", None), "UI BATCH FINISHED DONE", mode=mode, memory=memory_text())
         self.current_batch_mode = None
         self._active_task_worker = None
+        try:
+            self._active_batch_job_id = None
+        except Exception:
+            pass
         # 완료된 UniversalBatchWorker 객체가 self.bw에 남아 있으면
         # macro_batch_is_busy()가 이전 worker 상태를 보고 다음 매크로 일괄 단계로
         # 넘어가지 못할 수 있다. 완료 콜백에서 UI 반영을 끝낸 뒤 참조를 비운다.

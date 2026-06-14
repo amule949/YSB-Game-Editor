@@ -1189,7 +1189,9 @@ class MainWindowHistoryMixin:
             "deepseek": "deepseek_chunk_size",
             "google": "google_translate_chunk_size",
             "gemini": "gemini_chunk_size",
+            "gemini_deferred": "gemini_delayed_chunk_size",
             "custom": "custom_translation_chunk_size",
+            "lm_studio": "lm_studio_chunk_size",
         }.get(str(provider or "openai"), "openai_chunk_size")
 
     def on_translation_provider_changed(self, save=True):
@@ -2050,6 +2052,15 @@ class MainWindowHistoryMixin:
                     self.act_final_paint_above_text.blockSignals(False)
             if isinstance(ui_state.get("view_states"), dict):
                 self.project_ui_view_states = copy.deepcopy(ui_state.get("view_states") or {})
+            try:
+                pending = ui_state.get("maker_pending_writeback_pages", [])
+                self._maker_game_writeback_dirty_pages = {int(x) for x in list(pending or [])}
+                reasons = ui_state.get("maker_pending_writeback_reasons", [])
+                self._maker_game_writeback_dirty_reasons = {str(x) for x in list(reasons or [])}
+                if hasattr(self, "sync_maker_writeback_ui_state"):
+                    self.sync_maker_writeback_ui_state()
+            except Exception:
+                pass
             if refresh and hasattr(self, "cb_mode") and self.cb_mode.currentIndex() == 4:
                 old_suppress = getattr(self, "_suppress_mode_undo", False)
                 self._suppress_mode_undo = True
@@ -2072,6 +2083,8 @@ class MainWindowHistoryMixin:
             "view_states": copy.deepcopy(getattr(self, "project_ui_view_states", {}) or {}),
             "show_final_text": bool(self.cb_show_final_text.isChecked()) if hasattr(self, "cb_show_final_text") else True,
             "final_paint_above_text": bool(getattr(self, "final_paint_above_text", False)),
+            "maker_pending_writeback_pages": sorted(int(x) for x in (getattr(self, "_maker_game_writeback_dirty_pages", set()) or set())),
+            "maker_pending_writeback_reasons": sorted(str(x) for x in (getattr(self, "_maker_game_writeback_dirty_reasons", set()) or set())),
         }
         # Preserve Maker-project metadata that was loaded from project.json.
         # current_project_ui_state() is called on normal saves; without this,

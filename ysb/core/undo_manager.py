@@ -1377,7 +1377,7 @@ class YSBUndoManager:
         alias = raw
         if lower.startswith("batch_"):
             alias = "batch_inpaint" if "inpaint" in lower else "batch"
-        elif lower in ("analysis", "reanalyze", "translation", "inpaint", "clean_import", "clean_import_recovered", "restore_original_source", "use_background_as_source", "macro", "project_open"):
+        elif lower in ("analysis", "reanalyze", "translation", "translation_import", "inpaint", "clean_import", "clean_import_recovered", "restore_original_source", "use_background_as_source", "macro", "project_open"):
             alias = raw
         try:
             return self._policy_for_reason(alias)

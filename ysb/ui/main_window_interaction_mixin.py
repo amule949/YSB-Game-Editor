@@ -38,6 +38,7 @@ class MainWindowInteractionMixin:
             "work_text_replace", "work_unify_translations", "work_extract_text", "work_import_translation",
             "work_clear_translation", "work_page_prev", "work_page_next", "work_page_list", "work_page_full_name",
             "work_restore_edge_control_codes_current",
+            "work_toggle_maker_control_code_auto_apply",
             "batch_restore_edge_control_codes",
             "batch_translate", "batch_extract_text", "batch_clear_translation", "edit_undo", "edit_redo",
         }
@@ -48,7 +49,7 @@ class MainWindowInteractionMixin:
         canonical = {
             "work_translate", "batch_translate", "work_text_find", "work_text_replace",
             "work_unify_translations", "work_extract_text", "work_import_translation", "work_clear_translation",
-            "work_restore_edge_control_codes_current", "batch_restore_edge_control_codes", "batch_extract_text", "project_save",
+            "work_restore_edge_control_codes_current", "work_toggle_maker_control_code_auto_apply", "batch_restore_edge_control_codes", "batch_extract_text", "project_save",
         }
         return self._maker_expand_action_keys(canonical)
 
@@ -121,8 +122,8 @@ class MainWindowInteractionMixin:
         make_action("project_open_json", "프로젝트 열기", self.open_project_json)
         make_action("project_show_launcher", "홈화면으로 가기", self.show_launcher)
         make_action("project_exit", "프로젝트 나가기", self.show_launcher)
-        make_action("project_save", "내보내기", self.save_project)
-        make_action("project_save_as", "다른 이름으로 내보내기(호환)", self.save_project_as)
+        make_action("project_save", "프로젝트 저장", self.save_project)
+        make_action("project_save_as", "YSBG 내보내기", self.save_project_as)
         make_action("project_recover_last_work", "복구하기", self.recover_last_work_project)
 
         # 개별 작업
@@ -137,6 +138,7 @@ class MainWindowInteractionMixin:
         make_action("work_open_current_project_folder", "현재 프로젝트의 작업 폴더로 이동하기", self.open_current_project_work_folder)
         make_action("work_scan_maker_game", "게임 분석", self.scan_maker_game_action)
         alias_action("work_analyze", "work_scan_maker_game")
+        make_action("work_apply_maker_game_json", "프로젝트 저장(구버전)", self.apply_maker_writeback_to_game_action)
         make_action("paint_reanalyze", "재분석", self.reanalyze_mask)
         try:
             _reanalyze_tip = "현재 텍스트 마스크를 기준으로 OCR 분석 영역을 다시 만들고, 기존 마스크는 재사용합니다."
@@ -165,12 +167,25 @@ class MainWindowInteractionMixin:
         except Exception:
             pass
         make_action("work_text_number_width", "텍스트 넘버 크기 변경", self.open_text_number_width_dialog)
-        make_action("work_translate", "번역", self.trans)
+        make_action("work_translate", "번역", self.on_translate_button_clicked)
         make_action("work_restore_edge_control_codes_current", "맵 제어코드 복원", self.restore_edge_control_codes_current)
+        act_control_auto = make_action(
+            "work_toggle_maker_control_code_auto_apply",
+            "번역 시 제어코드 자동 반영",
+            self.toggle_maker_control_code_auto_apply,
+        )
+        try:
+            act_control_auto.setCheckable(True)
+            act_control_auto.setChecked(bool(getattr(self, "maker_control_code_auto_apply_enabled", True)))
+        except Exception:
+            pass
         try:
             tips = {
                 "work_translate": "현재 맵의 텍스트를 번역합니다",
+                "project_save": "현재 작업 폴더와 작업용 게임 JSON을 저장합니다. 단축키: Ctrl+S",
+                "work_apply_maker_game_json": "프로젝트 저장 기능으로 통합되었습니다.",
                 "work_restore_edge_control_codes_current": "현재 맵의 텍스트의 맨앞과 맨 뒤에 있는 제어코드를 자동복원 합니다.",
+                "work_toggle_maker_control_code_auto_apply": "번역 시 자동으로 제어코드를 원문과 유사하게 복원합니다.",
                 "batch_restore_edge_control_codes": "전체 맵의 텍스트의 맨앞과 맨 뒤에 있는 제어코드를 자동복원합니다.",
             }
             for _key, _tip in tips.items():
@@ -249,7 +264,13 @@ class MainWindowInteractionMixin:
             pass
         make_action("setting_file_path_visibility", "파일 경로 표시", self.open_file_path_visibility_dialog)
         make_action("option_api_settings", "API 관리", self.open_api_settings_dialog)
-        make_action("option_translation_prompt", "공통 번역 프롬프트", self.open_translation_prompt_dialog)
+        # Legacy action remains as a hidden alias so old shortcut/macro caches
+        # open the same single Game Prompt Manager instead of a second dialog.
+        legacy_prompt_action = make_action("option_translation_prompt", "게임 프롬프트 관리", self.open_maker_character_prompts_dialog)
+        try:
+            legacy_prompt_action.setVisible(False)
+        except Exception:
+            pass
         make_action("option_maker_character_prompts", "게임 프롬프트 관리", self.open_maker_character_prompts_dialog)
         make_action("option_maker_translation_settings", "줄내림 옵션", self.open_maker_translation_settings_dialog)
         make_action("option_maker_refresh_runtime_profile", "쯔꾸르 표시 환경 갱신", self.refresh_maker_display_environment_action)
@@ -265,8 +286,18 @@ class MainWindowInteractionMixin:
             act_db_mode.setChecked(False)
         except Exception:
             pass
-        make_action("db_maker_character_name_translation", "화자 번역", self.open_maker_character_name_translation_dialog)
-        make_action("db_maker_plugin_translation", "플러그인 번역", self.open_maker_plugin_translation_dialog)
+        act_speaker_mode = make_action("db_maker_character_name_translation", "화자 번역 모드", self.open_maker_character_name_translation_dialog)
+        try:
+            act_speaker_mode.setCheckable(True)
+            act_speaker_mode.setChecked(False)
+        except Exception:
+            pass
+        act_plugin_mode = make_action("db_maker_plugin_translation", "플러그인 번역 모드", self.open_maker_plugin_translation_dialog)
+        try:
+            act_plugin_mode.setCheckable(True)
+            act_plugin_mode.setChecked(False)
+        except Exception:
+            pass
         make_action("debug_maker_database_scan", "DB 스캔 진단", self.diagnose_maker_database_scan_action)
         make_action("debug_maker_database_layer_rebuild", "DB 페이지 확인", self.rebuild_maker_database_layer_manual_action)
         make_action("debug_maker_tile_preview_diagnose", "타일 프리뷰 진단", self.diagnose_maker_tile_preview_action)
@@ -483,7 +514,7 @@ class MainWindowInteractionMixin:
                 self.btn_page_tab_menu.setToolTip(self.native_tooltip_html("맵 목록", seq))
             if hasattr(self, "btn_page_add"):
                 seq = self.shortcut_settings.seq("project_import_maker_game").toString(QKeySequence.SequenceFormat.NativeText)
-                self.btn_page_add.setToolTip(self.native_tooltip_html("게임 가져오기", seq, "현재 프로젝트에 RPG Maker MV/MZ 게임 폴더를 클론하고 맵 페이지를 재구성합니다."))
+                self.btn_page_add.setToolTip(self.native_tooltip_html("게임 가져오기", seq, "현재 프로젝트에 RPG Maker MV/MZ JSON 게임 폴더를 클론하고 맵 페이지를 재구성합니다. www/resources/app.nw/macOS .app 구조도 감지합니다."))
         except Exception:
             pass
 
@@ -1852,7 +1883,7 @@ class MainWindowInteractionMixin:
         # DB 프리뷰는 일반 맵 프리뷰처럼 렌더된 이미지로 다룬다.
         # Ctrl+휠은 DB 캔버스 확대/축소, 리사이즈는 맞춤 표시 갱신에 사용한다.
         try:
-            if hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode():
+            if hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode():
                 lbl = getattr(self, "lbl_maker_database_preview_canvas", None)
                 scroll = getattr(self, "maker_database_preview_scroll", None)
                 scroll_vp = None
@@ -1898,7 +1929,7 @@ class MainWindowInteractionMixin:
                     except Exception:
                         fw = None
                     table = getattr(self, "tab", None)
-                    db_table_mode = bool(table is not None and hasattr(self, "is_maker_database_mode") and self.is_maker_database_mode())
+                    db_table_mode = bool(table is not None and hasattr(self, "is_maker_special_table_mode") and self.is_maker_special_table_mode())
                     maker_table_mode = bool(table is not None and (self._is_maker_text_table_mode() or db_table_mode))
                     try:
                         input_focused = bool(fw is not None and self.is_text_input_widget(fw))
@@ -1949,7 +1980,6 @@ class MainWindowInteractionMixin:
                         if db_table_mode:
                             try:
                                 self.commit_current_database_ui_to_layer()
-                                self.refresh_maker_database_preview_from_selection()
                                 event.accept()
                                 return True
                             except Exception:
@@ -2517,10 +2547,14 @@ class MainWindowInteractionMixin:
         if hasattr(self, "btn_translate"):
             tooltip_pos(self.btn_translate, "below")
             self.register_delayed_tooltip(self.btn_translate, "번역", seq_text("work_translate"), "현재 맵의 텍스트를 번역합니다.")
+            if hasattr(self, "btn_maker_apply_game"):
+                self.register_delayed_tooltip(self.btn_maker_apply_game, "프로젝트 저장", seq_text("work_apply_maker_game_json"), "프로젝트 저장 기능으로 통합되었습니다.")
             if hasattr(self, "btn_maker_ctrl_restore_current"):
                 self.register_delayed_tooltip(self.btn_maker_ctrl_restore_current, "현재 맵 복원", seq_text("work_restore_edge_control_codes_current"), "현재 맵의 텍스트의 맨앞과 맨 뒤에 있는 제어코드를 자동복원 합니다.")
             if hasattr(self, "btn_maker_ctrl_restore_all"):
                 self.register_delayed_tooltip(self.btn_maker_ctrl_restore_all, "일괄 맵 복원", seq_text("batch_restore_edge_control_codes"), "전체 맵의 텍스트의 맨앞과 맨 뒤에 있는 제어코드를 자동복원합니다.")
+            if hasattr(self, "cb_maker_control_code_auto_apply"):
+                self.register_delayed_tooltip(self.cb_maker_control_code_auto_apply, "번역 시 자동 반영", seq_text("work_toggle_maker_control_code_auto_apply"), "번역 시 자동으로 제어코드를 원문과 유사하게 복원합니다.")
         if hasattr(self, "btn_maker_preview_refresh"):
             tooltip_pos(self.btn_maker_preview_refresh, "above")
             self.register_delayed_tooltip(self.btn_maker_preview_refresh, "프리뷰 갱신", seq_text("work_refresh_maker_preview"), "현재 맵의 프리뷰 이미지를 상태/캐시와 무관하게 다시 만듭니다.")
@@ -2578,7 +2612,7 @@ class MainWindowInteractionMixin:
             self.register_delayed_tooltip(self.btn_page_scroll_right, "페이지 탭 오른쪽 이동", "")
         if hasattr(self, "btn_page_add"):
             tooltip_pos(self.btn_page_add, "above")
-            self.register_delayed_tooltip(self.btn_page_add, "게임 가져오기", seq_text("project_import_maker_game"), "현재 프로젝트에 RPG Maker MV/MZ 게임 폴더를 클론하고 맵 페이지를 재구성합니다.")
+            self.register_delayed_tooltip(self.btn_page_add, "게임 가져오기", seq_text("project_import_maker_game"), "현재 프로젝트에 RPG Maker MV/MZ JSON 게임 폴더를 클론하고 맵 페이지를 재구성합니다. www/resources/app.nw/macOS .app 구조도 감지합니다.")
         if hasattr(self, "btn_project_exit"):
             tooltip_pos(self.btn_project_exit, "below_low", y=10)
             self.register_delayed_tooltip(self.btn_project_exit, "프로젝트 나가기", seq_text("project_exit"), "현재 프로젝트를 닫고 시작 화면으로 돌아갑니다.")
@@ -2812,6 +2846,20 @@ class MainWindowInteractionMixin:
         except Exception:
             pass
 
+        try:
+            self.clear_maker_writeback_dirty(save_state=False)
+        except Exception:
+            pass
+
+        # Release the current project's runtime preview objects while its path and
+        # scope are still available for diagnostics.  Persistent blueprint/asset
+        # cache files remain in maker_meta and are reused on the next open.
+        try:
+            if hasattr(self, "_clear_maker_preview_display_state"):
+                self._clear_maker_preview_display_state(reason="project_close")
+        except Exception:
+            pass
+
         self.paths = []
         self.data = {}
         self.idx = 0
@@ -2834,15 +2882,6 @@ class MainWindowInteractionMixin:
         self.text_clipboard = []
         self.text_clipboard_is_plain = False
         self.text_paste_pending = False
-        # 쯔꾸르 DB/프리뷰 모드 상태도 프로젝트 생명주기에 묶어 초기화한다.
-        # 프로젝트를 나가면 프리뷰는 반드시 비워져야 하며, 새 프로젝트 열기/생성 때만
-        # 그 프로젝트 기준으로 다시 그린다.
-        try:
-            if hasattr(self, "_clear_maker_preview_display_state"):
-                self._clear_maker_preview_display_state(reason="project_close")
-        except Exception:
-            pass
-
         try:
             if hasattr(self, "tab") and self.tab is not None:
                 self.tab.blockSignals(True)
@@ -2887,6 +2926,25 @@ class MainWindowInteractionMixin:
             except Exception as e:
                 try:
                     self.log(f"⚠️ 홈화면 이동 전 현재 화면 반영 실패: {e}")
+                except Exception:
+                    pass
+
+            try:
+                if hasattr(self, "has_maker_writeback_dirty") and self.has_maker_writeback_dirty():
+                    choice = self.prompt_maker_writeback_before_leave(self.tr_ui("프로젝트 나가기"))
+                    if choice == "cancel":
+                        self.log("↩️ 홈화면 이동 취소")
+                        return
+                    if choice == "apply":
+                        self.save_project()
+                        if hasattr(self, "has_maker_writeback_dirty") and self.has_maker_writeback_dirty():
+                            self.log("↩️ 프로젝트 저장이 완료되지 않아 홈화면 이동을 취소했습니다.")
+                            return
+                    if choice == "discard":
+                        self.clear_maker_writeback_dirty(save_state=False)
+            except Exception as e:
+                try:
+                    self.log(f"⚠️ 프로젝트 저장 확인 실패: {e}")
                 except Exception:
                     pass
 

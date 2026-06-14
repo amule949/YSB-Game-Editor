@@ -37,6 +37,19 @@ from PyQt6.QtCore import *
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 from ysb.engine.manga_engine import MangaProcessEngine, Config
+from ysb.settings.translation_prompt_presets import (
+    BUILTIN_PROMPT_PRESET_NAME,
+    PROMPT_BLOCK_BEGIN,
+    PROMPT_BLOCK_END,
+    PROMPT_FIELD_SPECS,
+    builtin_prompt_preset,
+    normalize_prompt_options,
+    normalize_prompt_preset,
+    normalize_prompt_preset_store,
+    prompt_field_spec,
+    get_runtime_prompt_templates,
+    set_runtime_prompt_templates,
+)
 from ysb.core.project_store import ProjectStore, PROJECT_FILENAME, YSB_EXTENSION, package_project, append_project_json_to_package, extract_ysb_package, read_ysb_manifest, safe_project_name, clean_workspace_name, unique_dir, unique_dir_with_code_suffix
 from ysb.settings.api_settings import ApiSettingsStore, ApiSettingsDialog, apply_settings_to_config
 
@@ -60,7 +73,7 @@ from ysb.settings.shortcut_settings import ShortcutSettingsStore, ShortcutSettin
 from ysb.ui.viewer import MuleImageViewer
 from ysb.engine.graphics_items import TypesettingItem, build_typesetting_text_path
 from ysb.ui.delegates import MultilineDelegate
-from ysb.services.workers import UniversalBatchWorker, AnalysisWorker, InpaintWorker, TranslationWorker, QuickOCRWorker
+from ysb.services.workers import UniversalBatchWorker, AnalysisWorker, InpaintWorker, TranslationWorker, QuickOCRWorker, MakerWritebackWorker
 from ysb.core.cache_utils import get_cache_dir, get_cache_file
 from ysb.editions.current import get_current_edition
 from ysb.ui.launcher import LauncherWidget, RecentProjectStore
@@ -147,8 +160,13 @@ APP_OPTIONS_FILE_NAME = "app_options.json"
 def app_options_file():
     return get_cache_file(APP_OPTIONS_FILE_NAME)
 TRANSLATION_PROMPT_KEY = "translation_prompt"
-TRANSLATION_GLOSSARY_TEXT_KEY = "translation_glossary_text"
-TRANSLATION_GLOSSARY_PATH_KEY = "translation_glossary_path"
+TRANSLATION_PROMPT_PRESETS_KEY = "translation_prompt_presets_v1"
+TRANSLATION_PROMPT_ACTIVE_PRESET_KEY = "translation_prompt_active_preset"
+TRANSLATION_GLOSSARY_TEXT_KEY = "translation_glossary_text"  # legacy/free-form notes compatibility
+TRANSLATION_GLOSSARY_PATH_KEY = "translation_glossary_path"  # legacy import path compatibility
+TRANSLATION_AUTO_DB_GLOSSARY_ENTRIES_KEY = "translation_auto_db_glossary_entries"
+TRANSLATION_USER_GLOSSARY_ENTRIES_KEY = "translation_user_glossary_entries"
+TRANSLATION_USER_GLOSSARY_NOTES_KEY = "translation_user_glossary_notes"
 UI_THEME_KEY = "ui_theme"
 THEME_DARK = "dark"
 THEME_LIGHT = "light"
@@ -337,12 +355,26 @@ def current_ui_language():
     return normalize_ui_language(load_app_options().get(UI_LANGUAGE_KEY, LANG_KO))
 
 
-def translate_ui_text(text, lang=None):
+def translate_ui_text(text, lang=None, **kwargs):
+    """Translate fixed UI text and safely apply named placeholders.
+
+    Central UI callers frequently pass values such as ``current``, ``total`` or
+    ``line_count``.  The old compatibility wrapper accepted only ``text`` and
+    ``lang``; one such formatted message could therefore abort an unrelated
+    preview build and force the blue fallback window.
+    """
     lang = normalize_ui_language(lang or current_ui_language())
     text = str(text)
     if lang == LANG_EN:
-        return UI_KO_EN.get(text, text)
-    return UI_EN_KO.get(text, text)
+        out = UI_KO_EN.get(text, text)
+    else:
+        out = UI_EN_KO.get(text, text)
+    if kwargs:
+        try:
+            return str(out).format(**kwargs)
+        except Exception:
+            return str(out)
+    return str(out)
 
 
 def translate_ui_dynamic_text(text, lang=None):
@@ -2907,6 +2939,16 @@ class TextTableWidget(QTableWidget):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         try:
+            # _ysb_current_marker_active tracks the visible current-cell/focus rectangle
+            # (the red outline in Maker text tables) separately from Qt selection.
+            # Qt can clear selectedIndexes() while leaving currentIndex() visible, so
+            # selected-line translation must not treat selection and focus rect as the same state.
+            self._ysb_current_marker_active = False
+            self._ysb_suppress_current_marker = False
+            # Maker row markers are a viewport-only visual state.  Never write
+            # selection colors into thousands of QTableWidgetItem objects.
+            self._ysb_selected_marker_rows = set()
+            self._ysb_drag_moved = False
             self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
             self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
             self.setDragEnabled(False)
@@ -2923,6 +2965,62 @@ class TextTableWidget(QTableWidget):
             # subclass could turn it into a selection range.  Install a viewport
             # filter so the selection rule runs before item-view drag/edit logic.
             self.viewport().installEventFilter(self)
+        except Exception:
+            pass
+
+    def _ysb_notify_window_selection_changed(self):
+        """Publish one finalized selection update to the main window.
+
+        Custom drag selection blocks Qt's intermediate clear/set signals so one
+        mouse move produces one lightweight selection update instead of two full
+        selectionChanged passes.
+        """
+        try:
+            win = self.window()
+            if win is not None and hasattr(win, "on_table_selection_changed"):
+                win.on_table_selection_changed()
+        except Exception:
+            pass
+
+    def paintEvent(self, event):
+        """Paint full-row Maker selection markers without mutating cell data.
+
+        Qt keeps the real cell/range selection.  This translucent overlay only
+        makes every touched row read as one dialogue object.  Because it is drawn
+        directly on the viewport, selecting or clearing hundreds of rows does not
+        call setBackground()/setStyleSheet() on every cell and widget.
+        """
+        super().paintEvent(event)
+        try:
+            if not bool(self.property("ysb_excel_like_text_table")):
+                return
+            rows = set(getattr(self, "_ysb_selected_marker_rows", set()) or set())
+            if not rows:
+                return
+            win = self.window()
+            light = bool(win.is_light_theme()) if win is not None and hasattr(win, "is_light_theme") else False
+            fill = QColor(166, 84, 94, 62 if light else 82)
+            edge = QColor(166, 84, 94, 170 if light else 205)
+            painter = QPainter(self.viewport())
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            width = max(0, int(self.viewport().width()))
+            painter.setPen(QPen(edge, 1))
+            for row in sorted(rows):
+                try:
+                    row = int(row)
+                    if row <= 0 or row >= self.rowCount() or self.isRowHidden(row):
+                        continue
+                    y = int(self.rowViewportPosition(row))
+                    h = int(self.rowHeight(row))
+                    if h <= 0 or y + h < 0 or y > self.viewport().height():
+                        continue
+                    rect = QRect(0, y, width, h)
+                    painter.fillRect(rect, fill)
+                    painter.drawLine(0, y, width, y)
+                    painter.drawLine(0, y + h - 1, width, y + h - 1)
+                except Exception:
+                    continue
+            painter.end()
         except Exception:
             pass
 
@@ -2944,13 +3042,19 @@ class TextTableWidget(QTableWidget):
             if not idx.isValid():
                 return False
             self._ysb_drag_select_origin = (int(idx.row()), int(idx.column()))
-            self.clearSelection()
-            self.setRangeSelected(QTableWidgetSelectionRange(idx.row(), idx.column(), idx.row(), idx.column()), True)
-            self.setCurrentCell(int(idx.row()), int(idx.column()))
+            self._ysb_drag_moved = False
+            blocker = QSignalBlocker(self)
+            try:
+                self.clearSelection()
+                self.setRangeSelected(QTableWidgetSelectionRange(idx.row(), idx.column(), idx.row(), idx.column()), True)
+                self.setCurrentCell(int(idx.row()), int(idx.column()))
+            finally:
+                del blocker
             try:
                 self.setFocus(Qt.FocusReason.MouseFocusReason)
             except Exception:
                 pass
+            self._ysb_notify_window_selection_changed()
             return True
         except Exception:
             self._ysb_drag_select_origin = None
@@ -2970,9 +3074,21 @@ class TextTableWidget(QTableWidget):
             r1, c1 = int(idx.row()), int(idx.column())
             top, bottom = sorted((r0, r1))
             left, right = sorted((c0, c1))
-            self.clearSelection()
-            self.setRangeSelected(QTableWidgetSelectionRange(top, left, bottom, right), True)
-            self.setCurrentCell(r1, c1)
+            old_range = getattr(self, "_ysb_last_drag_range", None)
+            new_range = (top, left, bottom, right)
+            if old_range == new_range:
+                return True
+            self._ysb_last_drag_range = new_range
+            if new_range != (int(r0), int(c0), int(r0), int(c0)):
+                self._ysb_drag_moved = True
+            blocker = QSignalBlocker(self)
+            try:
+                self.clearSelection()
+                self.setRangeSelected(QTableWidgetSelectionRange(top, left, bottom, right), True)
+                self.setCurrentCell(r1, c1)
+            finally:
+                del blocker
+            self._ysb_notify_window_selection_changed()
             return True
         except Exception:
             return False
@@ -2980,6 +3096,7 @@ class TextTableWidget(QTableWidget):
     def _end_cell_range_drag(self):
         try:
             self._ysb_drag_select_origin = None
+            self._ysb_last_drag_range = None
         except Exception:
             pass
 
@@ -3000,6 +3117,96 @@ class TextTableWidget(QTableWidget):
             return super().eventFilter(obj, event)
         except Exception:
             return False
+
+    def _ysb_has_current_cell_marker(self) -> bool:
+        """Return True when the visible current-cell marker should mean one-row translation.
+
+        QTableWidget keeps currentIndex() and selectedIndexes() as separate states.
+        The user-visible red outline is the current index/focus marker, so Maker
+        translation uses this marker as the explicit single-row target.
+        """
+        try:
+            if not bool(getattr(self, "_ysb_current_marker_active", False)):
+                return False
+            idx = self.currentIndex()
+            if idx is None or not idx.isValid():
+                return False
+            return int(idx.row()) > 0
+        except Exception:
+            return False
+
+    def _ysb_clear_current_cell_marker(self):
+        """Clear both Qt selection and the current-cell/focus marker used by Maker translation."""
+        try:
+            self._ysb_current_marker_active = False
+            self._ysb_suppress_current_marker = True
+        except Exception:
+            pass
+        try:
+            self._ysb_drag_select_origin = None
+        except Exception:
+            pass
+        try:
+            self.clearSelection()
+        except Exception:
+            pass
+        try:
+            sm = self.selectionModel()
+            if sm is not None:
+                try:
+                    sm.clearSelection()
+                except Exception:
+                    pass
+                try:
+                    sm.clearCurrentIndex()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            self.setCurrentIndex(QModelIndex())
+        except Exception:
+            pass
+        try:
+            win = self.window()
+            if win is not None:
+                try:
+                    win._ysb_table_text_selection_for_translation = None
+                except Exception:
+                    pass
+                try:
+                    win._translation_target_segments = []
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            win = self.window()
+            if win is not None and hasattr(win, "refresh_maker_table_current_row_marker"):
+                win.refresh_maker_table_current_row_marker()
+        except Exception:
+            pass
+        try:
+            self.viewport().update()
+        except Exception:
+            pass
+        try:
+            self._ysb_suppress_current_marker = False
+        except Exception:
+            pass
+
+    def currentChanged(self, current, previous):
+        try:
+            super().currentChanged(current, previous)
+        except Exception:
+            pass
+        try:
+            if bool(getattr(self, "_ysb_suppress_current_marker", False)):
+                return
+            if current is not None and current.isValid() and int(current.row()) > 0:
+                self._ysb_current_marker_active = True
+        except Exception:
+            pass
 
     def dropEvent(self, event):
         # For the Maker text table, drag must mean "select cells" only.
@@ -3059,48 +3266,141 @@ class TextTableWidget(QTableWidget):
         except Exception:
             return False
 
+    def _ysb_refresh_marker_after_selection(self):
+        try:
+            self._ysb_current_marker_active = bool(self.selectedIndexes())
+        except Exception:
+            pass
+        try:
+            win = self.window()
+            if win is not None and hasattr(win, "refresh_maker_table_current_row_marker"):
+                win.refresh_maker_table_current_row_marker()
+        except Exception:
+            pass
+
     def mousePressEvent(self, event):
+        excel_like_mode = False
+        try:
+            excel_like_mode = bool(self.property("ysb_excel_like_text_table"))
+        except Exception:
+            excel_like_mode = False
+        if not excel_like_mode:
+            return super().mousePressEvent(event)
         try:
             if event.button() == Qt.MouseButton.LeftButton:
-                idx = self.indexAt(event.position().toPoint() if hasattr(event, "position") else event.pos())
-                if idx.isValid():
-                    self._ysb_drag_select_origin = (int(idx.row()), int(idx.column()))
-        except Exception:
-            self._ysb_drag_select_origin = None
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        # QTableWidget can sometimes treat mouse movement as item dragging instead
-        # of range selection depending on delegate/editor state.  Force the Maker
-        # text table to behave like a simple spreadsheet selection grid.
-        try:
-            if event.buttons() & Qt.MouseButton.LeftButton:
-                origin = getattr(self, "_ysb_drag_select_origin", None)
-                idx = self.indexAt(event.position().toPoint() if hasattr(event, "position") else event.pos())
-                if origin is not None and idx.isValid():
-                    r0, c0 = origin
-                    r1, c1 = int(idx.row()), int(idx.column())
-                    top, bottom = sorted((r0, r1))
-                    left, right = sorted((c0, c1))
-                    self.clearSelection()
-                    self.setRangeSelected(QTableWidgetSelectionRange(top, left, bottom, right), True)
-                    self.setCurrentCell(r1, c1)
+                idx = self._event_pos_to_index(event)
+                mods = event.modifiers()
+                if not idx.isValid():
+                    # Plain empty-area click clears the visible row marker.  Modifier
+                    # clicks outside the grid are left to Qt so extended selections do
+                    # not get unexpectedly destroyed.
+                    if not (mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)):
+                        self._ysb_clear_current_cell_marker()
+                        event.accept()
+                        return
+                    return super().mousePressEvent(event)
+                if mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
+                    # Ctrl/Shift selection must behave like a normal spreadsheet:
+                    # add/toggle/extend the cell selection.  Do not start the custom
+                    # drag origin here, otherwise every modifier click clears the old
+                    # range and multi-row selection becomes impossible.
+                    try:
+                        self._ysb_drag_select_origin = None
+                    except Exception:
+                        pass
+                    super().mousePressEvent(event)
+                    return
+                if self._begin_cell_range_drag(event):
+                    self._ysb_current_marker_active = int(idx.row()) > 0
                     event.accept()
                     return
+        except Exception:
+            self._ysb_drag_select_origin = None
+        return super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        excel_like_mode = False
+        try:
+            excel_like_mode = bool(self.property("ysb_excel_like_text_table"))
+        except Exception:
+            excel_like_mode = False
+        if not excel_like_mode:
+            return super().mouseMoveEvent(event)
+        # Excel-like mode keeps the real Qt selection at cell/range level.
+        # Maker rows are painted separately by the main window, so dragging never
+        # converts the selected cells into full-row Qt selection.  Modifier drags
+        # are delegated to Qt so Ctrl/Shift range extension keeps working.
+        try:
+            mods = event.modifiers()
+            if mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
+                super().mouseMoveEvent(event)
+                return
+        except Exception:
+            pass
+        try:
+            if self._update_cell_range_drag(event):
+                event.accept()
+                return
         except Exception:
             pass
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         try:
-            self._ysb_drag_select_origin = None
+            was_drag = bool(getattr(self, "_ysb_drag_moved", False))
+            mods = event.modifiers()
+            plain_left = event.button() == Qt.MouseButton.LeftButton and not (mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.AltModifier))
+        except Exception:
+            was_drag = True
+            plain_left = False
+        self._end_cell_range_drag()
+        try:
+            self._ysb_drag_moved = False
         except Exception:
             pass
         super().mouseReleaseEvent(event)
+        try:
+            if plain_left and not was_drag and bool(self.property("ysb_excel_like_text_table")):
+                win = self.window()
+                if win is not None and hasattr(win, "schedule_maker_table_selection_commit"):
+                    win.schedule_maker_table_selection_commit(source="mouse_single")
+        except Exception:
+            pass
 
     def keyPressEvent(self, event):
+        keyboard_single_activation = False
         try:
             mods = event.modifiers()
+            plain_modifiers = not (mods & (
+                Qt.KeyboardModifier.ControlModifier
+                | Qt.KeyboardModifier.AltModifier
+                | Qt.KeyboardModifier.ShiftModifier
+            ))
+            keyboard_single_activation = bool(
+                plain_modifiers
+                and event.key() in (
+                    Qt.Key.Key_Space,
+                    Qt.Key.Key_Return,
+                    Qt.Key.Key_Enter,
+                    Qt.Key.Key_Up,
+                    Qt.Key.Key_Down,
+                    Qt.Key.Key_Left,
+                    Qt.Key.Key_Right,
+                )
+            )
+            if event.key() == Qt.Key.Key_Escape and plain_modifiers:
+                try:
+                    had_marker = bool(self._ysb_has_current_cell_marker())
+                except Exception:
+                    had_marker = False
+                try:
+                    had_selection = bool(self.selectedIndexes())
+                except Exception:
+                    had_selection = False
+                if had_marker or had_selection:
+                    self._ysb_clear_current_cell_marker()
+                    event.accept()
+                    return
             if event.key() == Qt.Key.Key_Delete and not (mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.ShiftModifier)):
                 win = self.window()
                 if hasattr(win, "clear_maker_translation_cells_for_selection"):
@@ -3124,6 +3424,18 @@ class TextTableWidget(QTableWidget):
         except Exception:
             pass
         super().keyPressEvent(event)
+        # Keyboard navigation/activation is treated like a plain single-row click
+        # only after Qt has updated the real table selection.  The queued commit
+        # itself still requires exactly one marked row, so Space toggling a row off
+        # or any multi-row selection never refreshes the preview.
+        if keyboard_single_activation:
+            try:
+                if bool(self.property("ysb_excel_like_text_table")):
+                    win = self.window()
+                    if win is not None and hasattr(win, "schedule_maker_table_selection_commit"):
+                        win.schedule_maker_table_selection_commit(source="keyboard_single")
+            except Exception:
+                pass
 
 
 
@@ -3533,56 +3845,332 @@ class TextAdvancedEffectDialog(QDialog):
 
 
 class TranslationPromptDialog(QDialog):
-    """AI 번역 프롬프트 입력/수정 창."""
+    """All AI translation prompts and prompt presets in one editable editor.
 
-    def __init__(self, prompt_text="", parent=None):
+    ``embedded=True`` turns the dialog into a child widget so the exact same
+    preset/editor implementation can live inside Game Prompt Manager.
+    """
+
+    def __init__(self, presets=None, active_preset="", parent=None, *, embedded=False):
         super().__init__(parent)
         self._ui_language = getattr(parent, "ui_language", LANG_KO) if parent is not None else LANG_KO
-        self.setWindowTitle(translate_ui_text("번역 프롬프트 입력", self._ui_language))
-        self.resize(760, 520)
-        try:
-            if parent is not None and hasattr(parent, "settings_dialog_style"):
-                self.setStyleSheet(parent.settings_dialog_style())
-        except Exception:
-            pass
+        self._presets, self._active_preset = normalize_prompt_options(presets, active_preset, "")
+        self._current_field_key = ""
+        self._loading = False
+        self._embedded = bool(embedded)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
-
-        if self._ui_language == LANG_EN:
-            prompt_help_text = (
-                "Enter the prompt to send together with the AI translation API.\n"
-                "OK saves it to the options cache. Cancel closes without saving."
-            )
+        if self._embedded:
+            self.setWindowFlags(Qt.WindowType.Widget)
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         else:
-            prompt_help_text = (
-                "AI 번역 API에 함께 전달할 프롬프트를 입력합니다.\n"
-                "확인을 누르면 옵션 캐시에 저장되고, 닫기를 누르면 저장하지 않고 나갑니다."
-            )
-        title = QLabel(translate_ui_text("번역 프롬프트 입력", self._ui_language))
-        title.setObjectName("SettingsDialogTitle")
-        layout.addWidget(title)
+            self.setWindowTitle(translate_ui_text("게임 프롬프트 관리", self._ui_language))
+            self.resize(1080, 720)
+            try:
+                if parent is not None and hasattr(parent, "settings_dialog_style"):
+                    self.setStyleSheet(parent.settings_dialog_style())
+            except Exception:
+                pass
 
-        info = QLabel(prompt_help_text)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0 if self._embedded else 16, 0 if self._embedded else 16, 0 if self._embedded else 16, 0 if self._embedded else 16)
+        root.setSpacing(10)
+
+        if not self._embedded:
+            title = QLabel(translate_ui_text("게임 프롬프트 관리", self._ui_language))
+            title.setObjectName("SettingsDialogTitle")
+            root.addWidget(title)
+
+        help_text = translate_ui_text(
+            "AI 번역에 전달되는 모든 자연어 프롬프트를 직접 수정합니다. Default Set에는 프로그램 기본값이 들어 있습니다. 확인을 눌러야 저장됩니다.",
+            self._ui_language,
+        )
+        info = QLabel(help_text)
         info.setObjectName("SettingsDescription")
         info.setWordWrap(True)
-        layout.addWidget(info)
+        root.addWidget(info)
 
-        self.text_edit = QTextEdit()
-        self.text_edit.setPlainText(str(prompt_text or ""))
-        self.text_edit.setPlaceholderText(translate_ui_text("예: 일본어를 한국어로 자연스럽게 번역해줘. 캐릭터 말투와 줄바꿈을 유지해줘.", self._ui_language))
-        layout.addWidget(self.text_edit, 1)
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(8)
+        preset_row.addWidget(QLabel(translate_ui_text("프리셋", self._ui_language), self))
+        self.cb_preset = QComboBox(self)
+        self.cb_preset.setMinimumWidth(240)
+        preset_row.addWidget(self.cb_preset, 1)
+        self.btn_new_preset = QPushButton(translate_ui_text("새 프리셋", self._ui_language), self)
+        self.btn_rename_preset = QPushButton(translate_ui_text("이름 변경", self._ui_language), self)
+        self.btn_delete_preset = QPushButton(translate_ui_text("삭제", self._ui_language), self)
+        self.btn_restore_builtin = QPushButton(
+            translate_ui_text("Default Set 원본 복원", self._ui_language),
+            self,
+        )
+        preset_row.addWidget(self.btn_new_preset)
+        preset_row.addWidget(self.btn_rename_preset)
+        preset_row.addWidget(self.btn_delete_preset)
+        preset_row.addWidget(self.btn_restore_builtin)
+        root.addLayout(preset_row)
 
-        buttons = QDialogButtonBox()
-        buttons.addButton(translate_ui_text("확인", self._ui_language), QDialogButtonBox.ButtonRole.AcceptRole)
-        buttons.addButton(translate_ui_text("닫기", self._ui_language), QDialogButtonBox.ButtonRole.RejectRole)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.field_list = QListWidget(splitter)
+        self.field_list.setMinimumWidth(290)
+        self.field_list.setMaximumWidth(390)
+        self.field_list.setAlternatingRowColors(True)
+
+        editor_panel = QWidget(splitter)
+        editor_layout = QVBoxLayout(editor_panel)
+        editor_layout.setContentsMargins(10, 0, 0, 0)
+        editor_layout.setSpacing(8)
+        self.field_title = QLabel("", editor_panel)
+        self.field_title.setObjectName("SettingsSectionTitle")
+        editor_layout.addWidget(self.field_title)
+        self.field_desc = QLabel("", editor_panel)
+        self.field_desc.setObjectName("SettingsDescription")
+        self.field_desc.setWordWrap(True)
+        editor_layout.addWidget(self.field_desc)
+        self.placeholder_label = QLabel("", editor_panel)
+        self.placeholder_label.setObjectName("SettingsDescription")
+        self.placeholder_label.setWordWrap(True)
+        editor_layout.addWidget(self.placeholder_label)
+        self.text_edit = QPlainTextEdit(editor_panel)
+        self.text_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        editor_layout.addWidget(self.text_edit, 1)
+
+        splitter.addWidget(self.field_list)
+        splitter.addWidget(editor_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        root.addWidget(splitter, 1)
+
+        warning = QLabel(
+            translate_ui_text(
+                "필수 변수를 지워도 저장할 수 있지만, 해당 데이터가 AI에 전달되지 않을 수 있습니다. 프로그램은 숨겨진 프롬프트를 몰래 다시 붙이지 않습니다.",
+                self._ui_language,
+            ),
+            self,
+        )
+        warning.setObjectName("SettingsDescription")
+        warning.setWordWrap(True)
+        root.addWidget(warning)
+
+        if not self._embedded:
+            buttons = QDialogButtonBox(self)
+            buttons.addButton(translate_ui_text("확인", self._ui_language), QDialogButtonBox.ButtonRole.AcceptRole)
+            buttons.addButton(translate_ui_text("닫기", self._ui_language), QDialogButtonBox.ButtonRole.RejectRole)
+            buttons.accepted.connect(self._accept_with_current_state)
+            buttons.rejected.connect(self.reject)
+            root.addWidget(buttons)
+
+        self._populate_fields()
+        self._populate_presets(self._active_preset)
+
+        self.cb_preset.currentIndexChanged.connect(self._on_preset_changed)
+        self.field_list.currentRowChanged.connect(self._on_field_changed)
+        self.btn_new_preset.clicked.connect(self._new_preset)
+        self.btn_rename_preset.clicked.connect(self._rename_preset)
+        self.btn_delete_preset.clicked.connect(self._delete_preset)
+        self.btn_restore_builtin.clicked.connect(self._restore_builtin)
+
+        if self.field_list.count() > 0:
+            self.field_list.setCurrentRow(0)
+
+    def _populate_fields(self):
+        self.field_list.clear()
+        for spec in PROMPT_FIELD_SPECS:
+            label = translate_ui_text(str(spec.get("label") or spec.get("key") or ""), self._ui_language)
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, str(spec.get("key") or ""))
+            self.field_list.addItem(item)
+
+    def _populate_presets(self, selected=""):
+        self._loading = True
+        try:
+            self.cb_preset.clear()
+            for name in self._presets.keys():
+                self.cb_preset.addItem(translate_ui_text(str(name), self._ui_language), str(name))
+            target = str(selected or self._active_preset or BUILTIN_PROMPT_PRESET_NAME)
+            idx = self.cb_preset.findData(target)
+            self.cb_preset.setCurrentIndex(idx if idx >= 0 else 0)
+            self._active_preset = str(self.cb_preset.currentData() or BUILTIN_PROMPT_PRESET_NAME)
+        finally:
+            self._loading = False
+        self._load_current_field()
+        self._update_buttons()
+
+    def _save_current_field(self):
+        if self._loading or not self._current_field_key:
+            return
+        preset = self._presets.setdefault(self._active_preset, builtin_prompt_preset())
+        preset[self._current_field_key] = self.text_edit.toPlainText()
+
+    def _load_current_field(self):
+        if not self._active_preset or not self._current_field_key:
+            return
+        spec = prompt_field_spec(self._current_field_key)
+        self._loading = True
+        try:
+            self.field_title.setText(translate_ui_text(str(spec.get("label") or self._current_field_key), self._ui_language))
+            self.field_desc.setText(translate_ui_text(str(spec.get("description") or ""), self._ui_language))
+            placeholders = str(spec.get("placeholders") or "").strip()
+            if placeholders:
+                prefix = translate_ui_text("사용 가능한 변수: ", self._ui_language)
+                self.placeholder_label.setText(prefix + placeholders)
+                self.placeholder_label.show()
+            else:
+                self.placeholder_label.clear()
+                self.placeholder_label.hide()
+            preset = self._presets.get(self._active_preset) or builtin_prompt_preset()
+            self.text_edit.setPlainText(str(preset.get(self._current_field_key) or ""))
+        finally:
+            self._loading = False
+
+    def _on_field_changed(self, row):
+        self._save_current_field()
+        item = self.field_list.item(int(row)) if int(row) >= 0 else None
+        self._current_field_key = str(item.data(Qt.ItemDataRole.UserRole) or "") if item is not None else ""
+        self._load_current_field()
+
+    def _on_preset_changed(self, *_args):
+        if self._loading:
+            return
+        self._save_current_field()
+        name = str(self.cb_preset.currentData() or "").strip()
+        if name in self._presets:
+            self._active_preset = name
+        self._load_current_field()
+        self._update_buttons()
+
+    def _unique_name(self, base):
+        base = str(base or translate_ui_text("새 프리셋", self._ui_language)).strip()
+        if base not in self._presets:
+            return base
+        idx = 2
+        while f"{base} {idx}" in self._presets:
+            idx += 1
+        return f"{base} {idx}"
+
+    def _ask_name(self, title, initial=""):
+        text, ok = QInputDialog.getText(self, title, translate_ui_text("이름", self._ui_language), text=str(initial or ""))
+        return str(text or "").strip() if ok else ""
+
+    def _new_preset(self):
+        self._save_current_field()
+        default_name = self._unique_name(translate_ui_text("새 프리셋", self._ui_language))
+        name = self._ask_name(translate_ui_text("새 프리셋", self._ui_language), default_name)
+        if not name:
+            return
+        if name in self._presets:
+            QMessageBox.warning(self, translate_ui_text("이름 중복", self._ui_language), translate_ui_text("같은 이름의 프리셋이 이미 있습니다.", self._ui_language))
+            return
+        self._presets[name] = normalize_prompt_preset(self._presets.get(self._active_preset))
+        self._active_preset = name
+        self._populate_presets(name)
+
+    def _rename_preset(self):
+        self._save_current_field()
+        old = str(self._active_preset or "")
+        if not old:
+            return
+        if old == BUILTIN_PROMPT_PRESET_NAME:
+            QMessageBox.information(
+                self,
+                translate_ui_text("이름 변경", self._ui_language),
+                translate_ui_text("Default Set은 기본 복구 이름을 유지합니다. 내용은 전부 수정할 수 있습니다.", self._ui_language),
+            )
+            return
+        name = self._ask_name(translate_ui_text("이름 변경", self._ui_language), old)
+        if not name or name == old:
+            return
+        if name in self._presets:
+            QMessageBox.warning(self, translate_ui_text("이름 중복", self._ui_language), translate_ui_text("같은 이름의 프리셋이 이미 있습니다.", self._ui_language))
+            return
+        value = self._presets.pop(old)
+        rebuilt = OrderedDict()
+        for key, preset in self._presets.items():
+            rebuilt[key] = preset
+        rebuilt[name] = value
+        self._presets = dict(rebuilt)
+        self._active_preset = name
+        self._populate_presets(name)
+
+    def _delete_preset(self):
+        self._save_current_field()
+        name = str(self._active_preset or "")
+        if name == BUILTIN_PROMPT_PRESET_NAME:
+            QMessageBox.information(
+                self,
+                translate_ui_text("삭제할 수 없음", self._ui_language),
+                translate_ui_text("Default Set은 기본 복구용이라 삭제할 수 없습니다. 내용은 수정하거나 원본으로 복원할 수 있습니다.", self._ui_language),
+            )
+            return
+        if name not in self._presets:
+            return
+        answer = QMessageBox.question(
+            self,
+            translate_ui_text("프리셋 삭제", self._ui_language),
+            translate_ui_text("'{name}' 프리셋을 삭제할까요?", self._ui_language, name=name),
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._presets.pop(name, None)
+        self._active_preset = BUILTIN_PROMPT_PRESET_NAME
+        self._populate_presets(self._active_preset)
+
+    def _restore_builtin(self):
+        self._save_current_field()
+        self._presets[BUILTIN_PROMPT_PRESET_NAME] = builtin_prompt_preset()
+        self._active_preset = BUILTIN_PROMPT_PRESET_NAME
+        self._populate_presets(self._active_preset)
+
+    def _update_buttons(self):
+        self.btn_delete_preset.setEnabled(bool(self._active_preset and self._active_preset != BUILTIN_PROMPT_PRESET_NAME))
+
+    def _missing_placeholders(self):
+        self._save_current_field()
+        preset = self._presets.get(self._active_preset) or {}
+        missing = []
+        for spec in PROMPT_FIELD_SPECS:
+            key = str(spec.get("key") or "")
+            expected = [token for token in str(spec.get("placeholders") or "").split() if token]
+            if not expected:
+                continue
+            text = str(preset.get(key) or "")
+            absent = [token for token in expected if token not in text]
+            if absent:
+                label = translate_ui_text(str(spec.get("label") or key), self._ui_language)
+                missing.append((label, absent))
+        return missing
+
+    def validate_before_save(self, parent=None):
+        self._save_current_field()
+        missing = self._missing_placeholders()
+        if not missing:
+            return True
+        details = "\n".join(f"- {label}: {', '.join(tokens)}" for label, tokens in missing[:12])
+        if len(missing) > 12:
+            details += "\n..."
+        message = (
+            translate_ui_text("일부 프롬프트에서 변수가 빠져 있습니다. 해당 데이터가 AI에 전달되지 않을 수 있습니다.", self._ui_language)
+            + "\n\n" + details + "\n\n"
+            + translate_ui_text("그래도 저장할까요?", self._ui_language)
+        )
+        answer = QMessageBox.question(
+            parent or self,
+            translate_ui_text("프롬프트 변수 누락", self._ui_language),
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _accept_with_current_state(self):
+        if self.validate_before_save(self):
+            self.accept()
+
+    def get_prompt_state(self):
+        self._save_current_field()
+        return normalize_prompt_preset_store(self._presets), str(self._active_preset or BUILTIN_PROMPT_PRESET_NAME)
 
     def get_prompt_text(self):
-        return self.text_edit.toPlainText()
+        presets, active = self.get_prompt_state()
+        return str((presets.get(active) or {}).get("common_prompt") or "")
 
 
 class _LineNumberArea(QWidget):
@@ -3702,6 +4290,183 @@ def _glossary_display_width(text):
     return width
 
 
+
+def normalize_glossary_entry_dict(value):
+    """Return a clean insertion-ordered ``source -> target`` dictionary.
+
+    App options are JSON-backed and older builds may contain a dict, a list of
+    pairs, or a list of ``{"source", "target"}`` objects.  Empty/self-mapping
+    entries are ignored.  When the same source appears more than once, the last
+    value wins while the first insertion position is preserved by ``dict``.
+    """
+    out = {}
+    if isinstance(value, dict):
+        items = list(value.items())
+    elif isinstance(value, (list, tuple)):
+        items = []
+        for item in value:
+            if isinstance(item, dict):
+                items.append((item.get("source"), item.get("target")))
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                items.append((item[0], item[1]))
+    else:
+        items = []
+    for raw_source, raw_target in items:
+        source = str(raw_source or "").strip()
+        target = str(raw_target or "").strip()
+        if source and target and source != target:
+            out[source] = target
+    return out
+
+
+def parse_glossary_pair_line(line):
+    """Parse one user/legacy glossary line into ``(source, target)``.
+
+    A literal tab is the preferred file format because source or target terms
+    may contain spaces.  Arrow/equal separators are accepted for compatibility.
+    """
+    text = str(line or "").strip()
+    if not text or text.startswith("#"):
+        return None
+    separators = ("\t", "=>", "->", "=")
+    for separator in separators:
+        if separator in text:
+            left, right = text.split(separator, 1)
+            source = str(left or "").strip()
+            target = str(right or "").strip()
+            if source and target and source != target:
+                return source, target
+            return None
+    return None
+
+
+def split_legacy_glossary_cache(glossary_text):
+    """Split the old mixed cache into auto entries, user entries and notes."""
+    raw = str(glossary_text or "")
+    auto_entries = {}
+    user_entries = {}
+    notes = []
+    in_auto = False
+    for raw_line in raw.splitlines():
+        stripped = raw_line.strip()
+        if stripped == "# YSB_AUTO_DB_GLOSSARY_BEGIN":
+            in_auto = True
+            continue
+        if stripped == "# YSB_AUTO_DB_GLOSSARY_END":
+            in_auto = False
+            continue
+        parsed = parse_glossary_pair_line(raw_line)
+        if parsed:
+            source, target = parsed
+            if in_auto:
+                auto_entries[source] = target
+            else:
+                user_entries[source] = target
+        elif not in_auto:
+            notes.append(raw_line)
+    # Keep deliberate internal line breaks, but remove empty padding from the ends.
+    notes_text = "\n".join(notes).strip()
+    return auto_entries, user_entries, notes_text
+
+
+class GlossaryEntryTableModel(QAbstractTableModel):
+    """Small virtual table model used by both automatic and user glossaries."""
+
+    def __init__(self, entries=None, editable=False, ui_language=None, parent=None):
+        super().__init__(parent)
+        self._editable = bool(editable)
+        self._ui_language = normalize_ui_language(ui_language or current_ui_language())
+        self._rows = list(normalize_glossary_entry_dict(entries).items())
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else 2
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or not (0 <= index.row() < len(self._rows)):
+            return None
+        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
+            return self._rows[index.row()][index.column()]
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            return int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        return None
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        if orientation == Qt.Orientation.Horizontal:
+            return translate_ui_text("원문" if section == 0 else "번역문", self._ui_language)
+        return section + 1
+
+    def flags(self, index):
+        flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        if self._editable and index.isValid():
+            flags |= Qt.ItemFlag.ItemIsEditable
+        return flags
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
+        if not self._editable or role != Qt.ItemDataRole.EditRole or not index.isValid():
+            return False
+        row = index.row()
+        if not (0 <= row < len(self._rows)):
+            return False
+        source, target = self._rows[row]
+        text = str(value or "").strip()
+        if index.column() == 0:
+            source = text
+        else:
+            target = text
+        self._rows[row] = (source, target)
+        self.dataChanged.emit(index, index, [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole])
+        return True
+
+    def set_entries(self, entries):
+        self.beginResetModel()
+        self._rows = list(normalize_glossary_entry_dict(entries).items())
+        self.endResetModel()
+
+    def add_or_update(self, source, target):
+        source = str(source or "").strip()
+        target = str(target or "").strip()
+        if not source or not target or source == target:
+            return -1, False
+        for row, (old_source, _old_target) in enumerate(self._rows):
+            if old_source == source:
+                self._rows[row] = (source, target)
+                left = self.index(row, 0)
+                right = self.index(row, 1)
+                self.dataChanged.emit(left, right, [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole])
+                return row, False
+        row = len(self._rows)
+        self.beginInsertRows(QModelIndex(), row, row)
+        self._rows.append((source, target))
+        self.endInsertRows()
+        return row, True
+
+    def remove_rows(self, rows):
+        for row in sorted({int(r) for r in rows if 0 <= int(r) < len(self._rows)}, reverse=True):
+            self.beginRemoveRows(QModelIndex(), row, row)
+            del self._rows[row]
+            self.endRemoveRows()
+
+    def clear(self):
+        if not self._rows:
+            return
+        self.beginResetModel()
+        self._rows.clear()
+        self.endResetModel()
+
+    def as_dict(self):
+        result = {}
+        for source, target in self._rows:
+            source = str(source or "").strip()
+            target = str(target or "").strip()
+            if source and target and source != target:
+                result[source] = target
+        return result
+
 def _format_glossary_text_for_preview(text):
     """Render tab-separated glossary lines as aligned read-only columns.
 
@@ -3742,22 +4507,22 @@ def _format_glossary_text_for_preview(text):
 
 
 class GlossaryDialog(QDialog):
-    """번역 참고용 TXT 단어장 캐시 관리 창."""
+    """Separate database glossary and user-maintained glossary editor."""
 
-    def __init__(self, glossary_text="", glossary_path="", parent=None):
+    def __init__(self, auto_entries=None, user_entries=None, user_notes="", parent=None):
         super().__init__(parent)
         self._ui_language = normalize_ui_language(getattr(parent, "ui_language", current_ui_language()))
         self.setWindowTitle(translate_ui_text("단어장", self._ui_language))
-        self.resize(760, 520)
+        self.resize(900, 640)
         try:
             if parent is not None and hasattr(parent, "settings_dialog_style"):
                 self.setStyleSheet(parent.settings_dialog_style())
         except Exception:
             pass
 
-        self.glossary_text = str(glossary_text or "")
-        self.glossary_path = str(glossary_path or "")
-        self.changed = False
+        self.auto_entries = normalize_glossary_entry_dict(auto_entries)
+        self.user_entries = normalize_glossary_entry_dict(user_entries)
+        self.user_notes = str(user_notes or "")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -3768,149 +4533,227 @@ class GlossaryDialog(QDialog):
         layout.addWidget(title)
 
         info = QLabel(self.tr_msg(
-            "번역 참고 자료로 사용할 TXT 파일을 캐시에 저장합니다.\n"
-            "배경 설명, 단어 해설, 1대1 대체 규칙 등을 넣어둘 수 있습니다.\n"
-            "탭으로 구분된 단어장은 화면에서만 표처럼 정렬해 보여주며, 실제 저장 형식은 그대로 유지됩니다."
+            "데이터베이스 단어장에는 데이터베이스의 내용이 자동 반영됩니다.\n"
+            "사용자 단어장은 원문과 번역문을 직접 등록하며, 저장하면 딕셔너리로 변환되어 번역 대상에 실제 등장한 항목만 API에 전달됩니다."
         ))
         info.setObjectName("SettingsDescription")
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        self.status_label = QLabel()
-        self.status_label.setObjectName("SettingsDescription")
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs, 1)
+        self._build_auto_tab()
+        self._build_user_tab()
 
-        self.preview = LineNumberPlainTextEdit()
-        self.preview.setReadOnly(True)
-        try:
-            fixed_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
-            fixed_font.setPointSize(max(9, fixed_font.pointSize()))
-            self.preview.setFont(fixed_font)
-            self.preview.setTabStopDistance(self.preview.fontMetrics().horizontalAdvance(" ") * 4)
-        except Exception:
-            pass
-        self.preview.setPlaceholderText(self.tr_ui("아직 불러온 단어장이 없습니다."))
-        layout.addWidget(self.preview, 1)
-
-        top_buttons = QHBoxLayout()
-        self.btn_load = QPushButton(self.tr_ui("불러오기"))
-        self.btn_refresh = QPushButton(self.tr_ui("갱신"))
-        self.btn_reset = QPushButton(self.tr_ui("초기화"))
-        top_buttons.addWidget(self.btn_load)
-        top_buttons.addWidget(self.btn_refresh)
-        top_buttons.addWidget(self.btn_reset)
-        top_buttons.addStretch()
-        layout.addLayout(top_buttons)
-
-        bottom_buttons = QDialogButtonBox()
-        bottom_buttons.addButton(self.tr_ui("닫기"), QDialogButtonBox.ButtonRole.RejectRole)
-        bottom_buttons.rejected.connect(self.reject)
-        layout.addWidget(bottom_buttons)
-
-        self.btn_load.clicked.connect(self.load_glossary_file)
-        self.btn_refresh.clicked.connect(self.refresh_glossary_file)
-        self.btn_reset.clicked.connect(self.reset_glossary)
-
-        self.refresh_preview()
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText(self.tr_ui("저장"))
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(self.tr_ui("취소"))
+        buttons.accepted.connect(self.accept_changes)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
     def tr_ui(self, text):
         return translate_ui_text(text, self._ui_language)
 
-    def font_refresh_text(self, text):
-        """글꼴 갱신 버튼/알림용 간단한 KO/EN 문구."""
-        lang = str(getattr(self, "_ui_language", "ko") or "ko").lower()
-        if not lang.startswith("en"):
-            return translate_ui_text(text, self._ui_language)
-
-        en = {
-            "폰트 갱신": "Refresh Fonts",
-            "Windows에 설치되어 있지만 목록에 보이지 않는 글꼴을 다시 찾습니다.": "Search again for fonts installed in Windows but missing from the list.",
-            "폰트 갱신 확인": "Refresh Fonts",
-            "Windows 글꼴 폴더와 사용자 글꼴 폴더를 다시 검색합니다.\n\n일부 글꼴은 Qt 기본 목록에 바로 보이지 않을 수 있어, 이 작업은 누락된 글꼴을 추가로 등록합니다.\n\n글꼴이 많으면 잠시 걸릴 수 있습니다. 계속할까요?": "This will scan the Windows Fonts folder and your user Fonts folder again.\n\nSome fonts may not appear in Qt's default list, so this registers missing fonts as application fonts.\n\nIt may take a moment if you have many fonts. Continue?",
-            "폰트 갱신 완료": "Font refresh complete",
-            "폰트 목록을 갱신했습니다.\n새로 추가된 글꼴 패밀리: {count}개": "The font list has been refreshed.\nNew font families added: {count}",
-            "폰트 갱신 실패": "Font refresh failed",
-            "폰트 갱신 중 오류가 발생했습니다.": "An error occurred while refreshing fonts.",
-        }
-        return en.get(text, translate_ui_text(text, self._ui_language))
-
     def tr_msg(self, text):
         return translate_ui_dynamic_text(text, self._ui_language)
 
-    def refresh_preview(self):
-        text = self.glossary_text or ""
-        path = self.glossary_path or ""
-        if text:
-            path_text = path if path else self.tr_ui("캐시에만 저장됨")
-            current_vocab_label = self.tr_ui("현재 단어장")
-            char_count_label = self.tr_ui("글자 수")
-            self.status_label.setText(f"{current_vocab_label}: {path_text}\n{char_count_label}: {len(text):,}")
-            self.preview.setPlainText(_format_glossary_text_for_preview(text))
+    def _setup_table(self, table, model, editable=False):
+        table.setModel(model)
+        table.setAlternatingRowColors(True)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        table.setWordWrap(False)
+        table.verticalHeader().setDefaultSectionSize(26)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        if editable:
+            table.setEditTriggers(
+                QAbstractItemView.EditTrigger.DoubleClicked
+                | QAbstractItemView.EditTrigger.SelectedClicked
+                | QAbstractItemView.EditTrigger.EditKeyPressed
+            )
         else:
-            current_vocab_label = self.tr_ui("현재 단어장")
-            none_label = self.tr_ui("없음")
-            self.status_label.setText(f"{current_vocab_label}: {none_label}")
-            self.preview.clear()
+            table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
 
-    def load_glossary_file(self):
+    def _build_auto_tab(self):
+        tab = QWidget()
+        v = QVBoxLayout(tab)
+        v.setContentsMargins(10, 10, 10, 10)
+        v.setSpacing(8)
+        desc = QLabel(self.tr_msg(
+            "데이터베이스의 name 항목과 화자 번역 모드의 name 항목이 자동 반영됩니다."
+        ))
+        desc.setObjectName("SettingsDescription")
+        desc.setWordWrap(True)
+        v.addWidget(desc)
+        self.auto_count_label = QLabel()
+        self.auto_count_label.setObjectName("SettingsDescription")
+        v.addWidget(self.auto_count_label)
+        self.auto_model = GlossaryEntryTableModel(self.auto_entries, editable=False, ui_language=self._ui_language, parent=self)
+        self.auto_table = QTableView()
+        self._setup_table(self.auto_table, self.auto_model, editable=False)
+        v.addWidget(self.auto_table, 1)
+        self.tabs.addTab(tab, self.tr_ui("자동 단어장"))
+        self._refresh_counts()
+
+    def _build_user_tab(self):
+        tab = QWidget()
+        v = QVBoxLayout(tab)
+        v.setContentsMargins(10, 10, 10, 10)
+        v.setSpacing(8)
+
+        desc = QLabel(self.tr_msg(
+            "원문과 번역문을 한 쌍씩 추가합니다. 같은 원문을 다시 추가하면 기존 번역문을 갱신합니다. 같은 원문이 겹치면 사용자 단어장이 우선입니다."
+        ))
+        desc.setObjectName("SettingsDescription")
+        desc.setWordWrap(True)
+        v.addWidget(desc)
+
+        input_row = QHBoxLayout()
+        self.source_edit = QLineEdit()
+        self.source_edit.setPlaceholderText(self.tr_ui("원문"))
+        self.target_edit = QLineEdit()
+        self.target_edit.setPlaceholderText(self.tr_ui("번역문"))
+        self.add_button = QPushButton(self.tr_ui("추가 / 갱신"))
+        input_row.addWidget(self.source_edit, 1)
+        input_row.addWidget(self.target_edit, 1)
+        input_row.addWidget(self.add_button)
+        v.addLayout(input_row)
+
+        self.user_count_label = QLabel()
+        self.user_count_label.setObjectName("SettingsDescription")
+        v.addWidget(self.user_count_label)
+
+        self.user_model = GlossaryEntryTableModel(self.user_entries, editable=True, ui_language=self._ui_language, parent=self)
+        self.user_table = QTableView()
+        self._setup_table(self.user_table, self.user_model, editable=True)
+        v.addWidget(self.user_table, 1)
+
+        action_row = QHBoxLayout()
+        self.import_button = QPushButton(self.tr_ui("TXT 불러오기"))
+        self.delete_button = QPushButton(self.tr_ui("선택 삭제"))
+        self.clear_button = QPushButton(self.tr_ui("전체 초기화"))
+        action_row.addWidget(self.import_button)
+        action_row.addWidget(self.delete_button)
+        action_row.addWidget(self.clear_button)
+        action_row.addStretch()
+        v.addLayout(action_row)
+
+        notes_label = QLabel(self.tr_ui("추가 번역 메모 / 규칙"))
+        notes_label.setObjectName("SettingsDescription")
+        v.addWidget(notes_label)
+        self.notes_edit = QPlainTextEdit()
+        self.notes_edit.setPlaceholderText(self.tr_msg("단어 쌍이 아닌 배경 설명이나 말투 규칙이 필요할 때만 적습니다."))
+        self.notes_edit.setPlainText(self.user_notes)
+        self.notes_edit.setMaximumHeight(120)
+        v.addWidget(self.notes_edit)
+
+        self.add_button.clicked.connect(self.add_or_update_entry)
+        self.target_edit.returnPressed.connect(self.add_or_update_entry)
+        self.delete_button.clicked.connect(self.delete_selected_entries)
+        self.clear_button.clicked.connect(self.clear_user_entries)
+        self.import_button.clicked.connect(self.import_user_glossary)
+        self.user_model.rowsInserted.connect(lambda *_: self._refresh_counts())
+        self.user_model.rowsRemoved.connect(lambda *_: self._refresh_counts())
+        self.user_model.modelReset.connect(self._refresh_counts)
+
+        self.tabs.addTab(tab, self.tr_ui("사용자 단어장"))
+        self._refresh_counts()
+
+    def _refresh_counts(self):
+        try:
+            self.auto_count_label.setText(self.tr_ui("등록 항목: {count}개").format(count=self.auto_model.rowCount()))
+        except Exception:
+            pass
+        try:
+            self.user_count_label.setText(self.tr_ui("등록 항목: {count}개").format(count=self.user_model.rowCount()))
+        except Exception:
+            pass
+
+    def add_or_update_entry(self):
+        source = self.source_edit.text().strip()
+        target = self.target_edit.text().strip()
+        if not source or not target:
+            QMessageBox.information(self, self.tr_ui("입력 필요"), self.tr_ui("원문과 번역문을 모두 입력해주세요."))
+            return
+        if source == target:
+            QMessageBox.information(self, self.tr_ui("입력 확인"), self.tr_ui("원문과 번역문이 같습니다."))
+            return
+        row, _added = self.user_model.add_or_update(source, target)
+        self.source_edit.clear()
+        self.target_edit.clear()
+        self.source_edit.setFocus()
+        if row >= 0:
+            self.user_table.selectRow(row)
+            self.user_table.scrollTo(self.user_model.index(row, 0), QAbstractItemView.ScrollHint.PositionAtCenter)
+        self._refresh_counts()
+
+    def delete_selected_entries(self):
+        selection = self.user_table.selectionModel().selectedRows() if self.user_table.selectionModel() else []
+        rows = [index.row() for index in selection]
+        if not rows:
+            return
+        self.user_model.remove_rows(rows)
+        self._refresh_counts()
+
+    def clear_user_entries(self):
+        if self.user_model.rowCount() <= 0:
+            return
+        answer = QMessageBox.question(
+            self,
+            self.tr_ui("사용자 단어장 초기화"),
+            self.tr_ui("사용자 단어장의 모든 항목을 지울까요?"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.user_model.clear()
+            self._refresh_counts()
+
+    def import_user_glossary(self):
         path, _ = QFileDialog.getOpenFileName(
             self,
-            self.tr_ui("단어장 TXT 불러오기"),
-            self.glossary_path or "",
-            "Text Files (*.txt);;All Files (*)"
+            self.tr_ui("사용자 단어장 TXT 불러오기"),
+            "",
+            "Text Files (*.txt);;All Files (*)",
         )
         if not path:
             return
         try:
             text = read_text_file_for_cache(path)
-        except Exception as e:
-            msg_text = self.tr_ui("TXT 파일을 읽지 못했습니다:")
-            QMessageBox.critical(self, self.tr_ui("불러오기 실패"), f"{msg_text}\n{e}")
+        except Exception as exc:
+            QMessageBox.critical(self, self.tr_ui("불러오기 실패"), f"{self.tr_ui('TXT 파일을 읽지 못했습니다:')}\n{exc}")
             return
-        self.glossary_path = path
-        self.glossary_text = text
-        self.changed = True
-        self.refresh_preview()
-        QMessageBox.information(self, self.tr_ui("불러오기 완료"), self.tr_ui("단어장을 캐시에 반영했습니다. 닫기를 누르면 유지됩니다."))
-
-    def refresh_glossary_file(self):
-        if not self.glossary_path:
-            QMessageBox.information(self, self.tr_ui("갱신할 파일 없음"), self.tr_ui("먼저 불러오기로 TXT 파일을 선택해주세요."))
-            return
-        if not os.path.exists(self.glossary_path):
-            QMessageBox.warning(self, self.tr_ui("파일 없음"), self.tr_ui("기존 TXT 파일 경로를 찾을 수 없습니다. 다시 불러오기를 해주세요."))
-            return
-        try:
-            text = read_text_file_for_cache(self.glossary_path)
-        except Exception as e:
-            msg_text = self.tr_ui("TXT 파일을 다시 읽지 못했습니다:")
-            QMessageBox.critical(self, self.tr_ui("갱신 실패"), f"{msg_text}\n{e}")
-            return
-        self.glossary_text = text
-        self.changed = True
-        self.refresh_preview()
-        QMessageBox.information(self, self.tr_ui("갱신 완료"), self.tr_ui("기존 TXT 파일 내용으로 단어장 캐시를 갱신했습니다."))
-
-    def reset_glossary(self):
-        ans = QMessageBox.question(
+        imported = 0
+        skipped = 0
+        for line in str(text or "").splitlines():
+            parsed = parse_glossary_pair_line(line)
+            if not parsed:
+                if line.strip() and not line.lstrip().startswith("#"):
+                    skipped += 1
+                continue
+            source, target = parsed
+            self.user_model.add_or_update(source, target)
+            imported += 1
+        self._refresh_counts()
+        QMessageBox.information(
             self,
-            self.tr_ui("단어장 초기화"),
-            self.tr_ui("저장된 단어장 캐시를 지울까요?"),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+            self.tr_ui("불러오기 완료"),
+            self.tr_ui("사용자 단어장 {imported}개를 불러왔습니다. 인식하지 못한 줄: {skipped}개").format(
+                imported=imported,
+                skipped=skipped,
+            ),
         )
-        if ans != QMessageBox.StandardButton.Yes:
-            return
-        self.glossary_text = ""
-        self.glossary_path = ""
-        self.changed = True
-        self.refresh_preview()
+
+    def accept_changes(self):
+        self.user_entries = self.user_model.as_dict()
+        self.user_notes = self.notes_edit.toPlainText().strip()
+        self.accept()
 
     def get_glossary_state(self):
-        return self.glossary_text, self.glossary_path, self.changed
-
-
+        return dict(self.auto_entries), dict(self.user_entries), self.user_notes
 
 
 

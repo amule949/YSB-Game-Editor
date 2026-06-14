@@ -123,6 +123,7 @@ BOUNDARY_ACTIONS: dict[str, UndoActionPolicy] = {
     "reanalyze": _p("reanalyze", SCOPE_BOUNDARY, KIND_EXTERNAL_COMMIT, dirty=("mask",), redo=False, boundary="clear_page"),
     "translate": _p("translate", SCOPE_BOUNDARY, KIND_EXTERNAL_COMMIT, dirty=("text",), redo=False, boundary="clear_page"),
     "translation": _p("translation", SCOPE_BOUNDARY, KIND_EXTERNAL_COMMIT, dirty=("text",), redo=False, boundary="clear_page"),
+    "translation_import": _p("translation_import", SCOPE_BOUNDARY, KIND_EXTERNAL_COMMIT, dirty=("text",), redo=False, boundary="clear_all_pages"),
     "inpaint": _p("inpaint", SCOPE_BOUNDARY, KIND_EXTERNAL_COMMIT, dirty=("clean_background",), redo=False, boundary="clear_page"),
 
     # Batch / multi-page external commits

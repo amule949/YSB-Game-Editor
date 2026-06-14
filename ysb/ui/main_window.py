@@ -117,6 +117,18 @@ class MainWindow(MainWindowInteractionMixin, MainWindowSettingsThemeMixin, MainW
         self._page_image_cache_order = OrderedDict()
         self._page_mask_cache_order = OrderedDict()
 
+        # 쯔꾸르붕이: 편집과 저장을 분리한다.
+        # 수정 중에는 화면/메모리 데이터와 경량 복구 로그만 갱신하고,
+        # Ctrl+S / [프로젝트 저장] 때 프로젝트 저장 + 작업용 게임 JSON 반영을 함께 수행한다.
+        self._maker_game_writeback_dirty_pages = set()
+        self._maker_game_writeback_dirty_reasons = set()
+        self._maker_writeback_worker = None
+        self._maker_writeback_progress = None
+        self._maker_writeback_after_done = None
+        self._maker_preview_selection_timer = None
+        self._maker_control_previous_current_row = -1
+        self._maker_recovery_session_id = datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8]
+
         self.project_store = ProjectStore()
         self.project_dir = None
         self.workspace_root = str(get_workspace_root())
@@ -148,7 +160,7 @@ class MainWindow(MainWindowInteractionMixin, MainWindowSettingsThemeMixin, MainW
 
         # 저장본/작업 캐시 분리
         # v2.4 QA6: YSBG 패키지 구조에서는 실시간 자동저장을 폐지한다.
-        # 모든 일반 편집 변경은 복구용 작업 캐시에만 저장하고, 실제 .ysbg 반영은
+        # 모든 일반 편집 변경은 복구용 작업 캐시에만 저장하고, 실제 .ysbg 패키지 내보내기은
         # 사용자가 [프로젝트 내보내기]/[다른 이름으로 내보내기]을 눌렀을 때만 확정한다.
         self.auto_save_enabled = False
         self.app_options["auto_save_enabled"] = False
@@ -167,6 +179,15 @@ class MainWindow(MainWindowInteractionMixin, MainWindowSettingsThemeMixin, MainW
         self.show_paths_in_log = bool(self.app_options.get(SHOW_PATHS_IN_LOG_KEY, False))
         self.show_cache_paths_in_settings = bool(self.app_options.get(SHOW_CACHE_PATHS_IN_SETTINGS_KEY, False))
         self.interface_tooltips_enabled = bool(self.app_options.get("interface_tooltips_enabled", True))
+        # 일반 대사 프리뷰는 전역 사용자 옵션이다. OFF일 때는 화면만 숨기는 것이 아니라
+        # 프리뷰 생성/캐시 준비/선택 행 렌더 요청 자체를 시작하지 않는다.
+        self.maker_preview_enabled = bool(self.app_options.get("maker_preview_enabled", True))
+        # 번역 시 제어코드 자동 반영은 사용자 전역 옵션이다. 새 설치와
+        # 설정 키가 없는 구버전 프로젝트에서는 기본 ON으로 시작한다.
+        # 사용자가 직접 저장한 OFF 값은 그대로 존중한다.
+        self.maker_control_code_auto_apply_enabled = bool(
+            self.app_options.get("maker_control_code_auto_apply_enabled", True)
+        )
         # 텍스트 이펙트 미리보기는 페이지별 설정이다.
         # 기본값은 항상 ON이며, 후광/그림자/2중 획이 무거운 페이지에서만 사용자가 끈다.
         # 예전 전역 캐시값이 False로 남아 있더라도 새 페이지/기본값에는 영향을 주지 않게 한다.
@@ -210,7 +231,9 @@ class MainWindow(MainWindowInteractionMixin, MainWindowSettingsThemeMixin, MainW
             "deepseek": int(getattr(self.api_settings, "deepseek_chunk_size", 50) or 50),
             "google": int(getattr(self.api_settings, "google_translate_chunk_size", 50) or 50),
             "gemini": int(getattr(self.api_settings, "gemini_chunk_size", 50) or 50),
+            "gemini_deferred": int(getattr(self.api_settings, "gemini_delayed_chunk_size", 50) or 50),
             "custom": int(getattr(self.api_settings, "custom_translation_chunk_size", 50) or 50),
+            "lm_studio": int(getattr(self.api_settings, "lm_studio_chunk_size", 20) or 20),
         }
 
         self.default_text_color = "#000000"
